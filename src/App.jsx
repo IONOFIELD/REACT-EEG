@@ -332,6 +332,78 @@ function getEDFEpochData(edfData, channelIndex, epochStart, epochSec, targetSr) 
   return slice;
 }
 
+// ── EDF Writer ──
+function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSec = 1, patientId = "", recordingId = "" }) {
+  const ns = channelLabels.length;
+  const totalSamples = channelData[0].length;
+  const samplesPerRecord = sampleRate * recordDurationSec;
+  const numRecords = Math.ceil(totalSamples / samplesPerRecord);
+  const headerBytes = 256 + ns * 256;
+  const dataBytes = numRecords * ns * samplesPerRecord * 2;
+  const buffer = new ArrayBuffer(headerBytes + dataBytes);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+
+  const writeStr = (offset, length, str) => {
+    const padded = (str || "").padEnd(length).slice(0, length);
+    for (let i = 0; i < length; i++) bytes[offset + i] = padded.charCodeAt(i);
+  };
+
+  // Main header (256 bytes)
+  writeStr(0, 8, "0       ");
+  writeStr(8, 80, patientId);
+  writeStr(88, 80, recordingId);
+  const now = new Date();
+  writeStr(168, 8, `${String(now.getDate()).padStart(2,"0")}.${String(now.getMonth()+1).padStart(2,"0")}.${String(now.getFullYear()%100).padStart(2,"0")}`);
+  writeStr(176, 8, `${String(now.getHours()).padStart(2,"0")}.${String(now.getMinutes()).padStart(2,"0")}.${String(now.getSeconds()).padStart(2,"0")}`);
+  writeStr(184, 8, String(headerBytes));
+  writeStr(192, 44, "");
+  writeStr(236, 8, String(numRecords));
+  writeStr(244, 8, String(recordDurationSec));
+  writeStr(252, 4, String(ns));
+
+  // Per-signal headers
+  const b = 256;
+  const physMins = [], physMaxs = [];
+  for (let i = 0; i < ns; i++) {
+    let min = Infinity, max = -Infinity;
+    const d = channelData[i];
+    for (let j = 0; j < d.length; j++) { if (d[j] < min) min = d[j]; if (d[j] > max) max = d[j]; }
+    if (min === max) { min -= 1; max += 1; }
+    physMins.push(min);
+    physMaxs.push(max);
+  }
+  const digMin = -32768, digMax = 32767;
+
+  for (let i = 0; i < ns; i++) writeStr(b + i * 16, 16, channelLabels[i]);          // label
+  for (let i = 0; i < ns; i++) writeStr(b + ns*16 + i*80, 80, "");                  // transducer
+  for (let i = 0; i < ns; i++) writeStr(b + ns*96 + i*8, 8, "uV");                  // physDim
+  for (let i = 0; i < ns; i++) writeStr(b + ns*104 + i*8, 8, physMins[i].toFixed(1));// physMin
+  for (let i = 0; i < ns; i++) writeStr(b + ns*112 + i*8, 8, physMaxs[i].toFixed(1));// physMax
+  for (let i = 0; i < ns; i++) writeStr(b + ns*120 + i*8, 8, String(digMin));       // digMin
+  for (let i = 0; i < ns; i++) writeStr(b + ns*128 + i*8, 8, String(digMax));       // digMax
+  for (let i = 0; i < ns; i++) writeStr(b + ns*136 + i*80, 80, "");                 // prefiltering
+  for (let i = 0; i < ns; i++) writeStr(b + ns*216 + i*8, 8, String(samplesPerRecord)); // numSamples
+  for (let i = 0; i < ns; i++) writeStr(b + ns*224 + i*32, 32, "");                 // reserved
+
+  // Data records — each record: ns channels × samplesPerRecord × Int16LE
+  let offset = headerBytes;
+  for (let rec = 0; rec < numRecords; rec++) {
+    for (let ch = 0; ch < ns; ch++) {
+      const scale = (physMaxs[ch] - physMins[ch]) / (digMax - digMin);
+      for (let s = 0; s < samplesPerRecord; s++) {
+        const si = rec * samplesPerRecord + s;
+        const physVal = si < channelData[ch].length ? channelData[ch][si] : 0;
+        const digVal = Math.round((physVal - physMins[ch]) / scale + digMin);
+        view.setInt16(offset, Math.max(digMin, Math.min(digMax, digVal)), true);
+        offset += 2;
+      }
+    }
+  }
+
+  return buffer;
+}
+
 // ── Filters ──
 function applyHighPass(data, cutoff, sr) {
   if (cutoff <= 0) return data;
@@ -1763,7 +1835,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
         if (edfData && edfData.channelData) {
           raw = new Float32Array(sampleRate * epochSec);
         } else if (simSeedOverride !== null) {
-          raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137);
+          raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137 + currentEpoch * 7919);
         } else {
           raw = new Float32Array(sampleRate * epochSec);
         }
@@ -2003,7 +2075,7 @@ function LibraryTab({ records, setRecords, onOpenReview, updateRecordStatus, edf
                   <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.date}</td>
                   <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.channels}</td>
                   <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.sampleRate}</td>
-                  <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.duration}m</td>
+                  <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.durationSec && r.durationSec < 60 ? `${r.durationSec}s` : `${r.duration}m`}</td>
                   <td style={{padding:"10px 12px",color:"#888",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>{r.fileSize}MB</td>
                   <td style={{padding:"10px 12px"}}><StatusControl status={r.status} size="compact" onSetStatus={(s)=>updateRecordStatus(r.id,s)}/></td>
                   <td style={{padding:"10px 12px"}}>
@@ -2493,6 +2565,12 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   const [analysisPanelPos, setAnalysisPanelPos] = useState({ x: null, y: null });
   const [isPlaying, setIsPlaying] = useState(false);
   const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
+
+  // Multi-tab state
+  const [openTabs, setOpenTabs] = useState([]);
+  const [activeTabIdx, setActiveTabIdx] = useState(0);
+  const tabEpochCache = useRef({});
+
   const playIntervalRef = useRef(null);
   // Stable refs so interval callbacks never capture stale values
   const totalEpochsRef = useRef(eeg.totalEpochs);
@@ -2501,7 +2579,60 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   useEffect(() => { totalEpochsRef.current = eeg.totalEpochs; }, [eeg.totalEpochs]);
   useEffect(() => { epochSecRef.current = eeg.epochSec; }, [eeg.epochSec]);
   useEffect(() => { setCurrentEpochRef.current = eeg.setCurrentEpoch; }, [eeg.setCurrentEpoch]);
-  useEffect(() => { eeg.setCurrentEpoch(0); }, [record?.filename]);
+  // Reset or restore epoch when file changes
+  useEffect(() => {
+    const cached = tabEpochCache.current[record?.filename];
+    eeg.setCurrentEpoch(cached !== undefined ? cached : 0);
+  }, [record?.filename]);
+
+  // Sync tabs with current record
+  const prevFilenameRef = useRef(null);
+  useEffect(() => {
+    if (!record) return;
+    // Save epoch of the tab we're leaving (e.g. via file picker)
+    if (prevFilenameRef.current && prevFilenameRef.current !== record.filename) {
+      tabEpochCache.current[prevFilenameRef.current] = eeg.currentEpoch;
+    }
+    prevFilenameRef.current = record.filename;
+    setOpenTabs(prev => {
+      const existingIdx = prev.findIndex(t => t.filename === record.filename);
+      if (existingIdx >= 0) {
+        setActiveTabIdx(existingIdx);
+        return prev;
+      }
+      let next = [...prev, record];
+      if (next.length > 5) next = next.slice(next.length - 5);
+      setActiveTabIdx(next.length - 1);
+      return next;
+    });
+  }, [record?.filename]);
+
+  const switchToTab = (idx) => {
+    if (idx === activeTabIdx) return;
+    const leavingTab = openTabs[activeTabIdx];
+    if (leavingTab) tabEpochCache.current[leavingTab.filename] = eeg.currentEpoch;
+    setActiveTabIdx(idx);
+    const targetTab = openTabs[idx];
+    if (targetTab) onSelectRecord(targetTab);
+  };
+
+  const closeTab = (idx, e) => {
+    e.stopPropagation();
+    setOpenTabs(prev => {
+      const next = prev.filter((_, i) => i !== idx);
+      if (next.length === 0) return prev;
+      delete tabEpochCache.current[prev[idx].filename];
+      if (idx === activeTabIdx) {
+        const newIdx = Math.min(idx, next.length - 1);
+        setActiveTabIdx(newIdx);
+        onSelectRecord(next[newIdx]);
+      } else if (idx < activeTabIdx) {
+        setActiveTabIdx(activeTabIdx - 1);
+      }
+      return next;
+    });
+  };
+
   const annotations = annotationsMap[filename] || [];
   const setAnnotations = (newAnns) => {
     const resolved = typeof newAnns === "function" ? newAnns(annotations) : newAnns;
@@ -2610,6 +2741,38 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
 
   return (
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden"}}>
+      {/* Multi-file tabs — always visible */}
+      {openTabs.length > 1 && (
+        <div style={{display:"flex",alignItems:"center",gap:0,padding:"0 16px",borderBottom:"1px solid #1a1a1a",background:"#080808",overflow:"hidden",flexShrink:0}}>
+          {openTabs.map((tab, idx) => {
+            const isActive = idx === activeTabIdx;
+            const tabName = tab.filename || "Unknown";
+            const display = tabName.length > 30 ? tabName.slice(0, 27) + "..." : tabName;
+            return (
+              <div key={tab.filename || idx} onClick={()=>switchToTab(idx)}
+                onMouseEnter={e=>{if(!isActive)e.currentTarget.style.background="#111"}}
+                onMouseLeave={e=>{if(!isActive)e.currentTarget.style.background="transparent"}}
+                style={{display:"flex",alignItems:"center",gap:6,padding:"5px 12px",cursor:"pointer",
+                  background:isActive?"#1a2a30":"transparent",borderBottom:isActive?"2px solid #7ec8d9":"2px solid transparent",
+                  borderRight:"1px solid #1a1a1a",transition:"background 0.1s",maxWidth:220,minWidth:0}}>
+                <span style={{width:6,height:6,borderRadius:"50%",flexShrink:0,
+                  background:tab.isTest?"#22c55e":tab.isAcquired?"#3b82f6":"#eab308"}}/>
+                <span style={{fontSize:10,color:isActive?"#7ec8d9":"#666",fontWeight:isActive?700:400,
+                  overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={tabName}>{display}</span>
+                {openTabs.length > 1 && (
+                  <span onClick={e=>closeTab(idx,e)}
+                    onMouseEnter={e=>e.currentTarget.style.color="#EF4444"}
+                    onMouseLeave={e=>e.currentTarget.style.color="#444"}
+                    style={{fontSize:12,color:"#444",cursor:"pointer",display:"flex",alignItems:"center",padding:"0 2px",lineHeight:1}}
+                    title="Close tab">&times;</span>
+                )}
+              </div>
+            );
+          })}
+          <span style={{fontSize:9,color:"#333",padding:"0 8px",flexShrink:0}}>{openTabs.length}/5</span>
+        </div>
+      )}
+
       {!toolbarCollapsed ? (<>
       {/* File info bar */}
       <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",fontSize:10,color:"#555"}}>
@@ -3348,7 +3511,7 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
 // ══════════════════════════════════════════════════════════════
 // TAB: ACQUIRE (Live Recording) — with Device Manager
 // ══════════════════════════════════════════════════════════════
-function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStore, setEdfFileStore }) {
+function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStore, setEdfFileStore, openReview }) {
   // State declared before useEEGState so they can be passed as args
   const [selectedDevice, setSelectedDevice] = useState(DEVICE_CATALOG.find(d => d.id === "openbci-cyton-16") || null);
   const [isRecording, setIsRecording] = useState(false);
@@ -3360,6 +3523,8 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
   const [showAnnotations, setShowAnnotations] = useState(false);
   const [annotationPanelPos, setAnnotationPanelPos] = useState({ x: null, y: null });
   const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
+  const [showPostRecordPrompt, setShowPostRecordPrompt] = useState(false);
+  const [lastRecordedFile, setLastRecordedFile] = useState(null);
   const timerRef = useRef(null);
 
   // ── Sim epoch engine ──
@@ -3372,6 +3537,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
   const simAnimFrameRef = useRef(null);
   const simEpochStartRef = useRef(null);
   const simCurrentEpochRef = useRef(0);
+  const seedHistoryRef = useRef([]);
 
   const isSim = selectedDevice?.protocol === "simulated";
   const simSeed = isSim ? (isRecording ? simEpochSeed : 42) : null;
@@ -3463,16 +3629,18 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       simEpochStartRef.current = now;
       simClipRef.current = 0;
       const nextEpoch = curEpoch + 1;
+      const newSeed = Math.floor(Math.random() * 100000);
+      seedHistoryRef.current.push(newSeed);
       if (nextEpoch * SIM_EPOCH_SEC >= SIM_MAX_SEC) {
         simElapsedRef.current = 0;
         simCurrentEpochRef.current = 0;
         setElapsedSec(0);
         eegRef.current.setCurrentEpoch(0);
-        setSimEpochSeed(Math.floor(Math.random() * 100000));
+        setSimEpochSeed(newSeed);
       } else {
         simCurrentEpochRef.current = nextEpoch;
         eegRef.current.setCurrentEpoch(nextEpoch);
-        setSimEpochSeed(Math.floor(Math.random() * 100000));
+        setSimEpochSeed(newSeed);
       }
     }
   }, []);
@@ -3505,7 +3673,9 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
     simClipRef.current = 0;
     simEpochStartRef.current = null;
     simCurrentEpochRef.current = 0;
-    setSimEpochSeed(Math.floor(Math.random() * 100000));
+    const firstSeed = Math.floor(Math.random() * 100000);
+    seedHistoryRef.current = [firstSeed];
+    setSimEpochSeed(firstSeed);
     setIsRecording(true); setIsPaused(false); setElapsedSec(0); eeg.setCurrentEpoch(0);
   };
   const stopRecording = () => {
@@ -3513,12 +3683,46 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
     simClipRef.current = 1.0;
     cancelAnimationFrame(simAnimFrameRef.current);
     if (!subjectId || elapsedSec < 1) return;
-    // Auto-save acquired recording to library
+
     const today = new Date().toISOString().split("T")[0];
     const acqFile = generateFilename(subjectId, studyType, today);
-    const durationMin = Math.max(1, Math.round(elapsedSec / 60));
-    const chCount = selectedDevice?.channels || deviceConfig.channels || 19;
     const sr = deviceConfig.sampleRate || 256;
+    const actualDurationSec = elapsedSec;
+    const totalSamples = sr * actualDurationSec;
+
+    // Generate EDF from seed history — individual electrode signals
+    const electrodes = ELECTRODE_SETS[eeg.eegSystem] || ELECTRODE_SETS["10-20"];
+    const channelData = electrodes.map((elec, elecIdx) => {
+      const fullData = new Float32Array(totalSamples);
+      let offset = 0;
+      seedHistoryRef.current.forEach((seed) => {
+        const epochSamples = Math.min(SIM_EPOCH_SEC * sr, totalSamples - offset);
+        if (epochSamples <= 0) return;
+        const signal = generateEEGSignal(elecIdx, sr, SIM_EPOCH_SEC, seed + elecIdx * 137);
+        fullData.set(signal.subarray(0, epochSamples), offset);
+        offset += epochSamples;
+      });
+      return fullData;
+    });
+
+    // Build EDF binary and parse it back
+    const edfBuffer = buildEDFFile({
+      channelLabels: electrodes,
+      channelData,
+      sampleRate: sr,
+      recordDurationSec: 1,
+      patientId: hashSubjectId(subjectId),
+      recordingId: `REACT-${studyType}`,
+    });
+    const parsed = parseEDFFile(edfBuffer);
+
+    // Store in edfFileStore for review
+    if (setEdfFileStore && !parsed.error) {
+      setEdfFileStore(prev => ({ ...prev, [acqFile]: parsed }));
+    }
+
+    const chCount = electrodes.length;
+    const durationMin = Math.round(actualDurationSec / 60 * 10) / 10;
     const newRecord = {
       id: `ACQ-${Date.now()}`,
       subjectHash: hashSubjectId(subjectId),
@@ -3530,18 +3734,23 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       filename: acqFile,
       channels: chCount,
       duration: durationMin,
+      durationSec: actualDurationSec,
       sampleRate: sr,
-      fileSize: Math.round(chCount * sr * durationMin * 60 * 2 / 1024 / 1024 * 10) / 10,
-      montage: "10-20",
+      fileSize: Math.round(edfBuffer.byteLength / 1024 / 1024 * 10) / 10,
+      montage: eeg.eegSystem,
       status: "pending",
       isTest: false,
       isAcquired: true,
       notes: `Recorded via ${selectedDevice?.name || "simulated device"}`,
       uploadedAt: new Date().toISOString(),
       sourceFile: null,
-      hasEdfData: false,
+      hasEdfData: true,
     };
     if (setRecords) setRecords(prev => [newRecord, ...prev]);
+
+    // Trigger post-recording prompt (Patch D)
+    setLastRecordedFile({ record: newRecord, filename: acqFile });
+    setShowPostRecordPrompt(true);
   };
   const togglePause = () => {
     const next = !isPaused;
@@ -3770,6 +3979,30 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           auxWithData={eeg.auxWithData} AUX_CHANNELS={eeg.AUX_CHANNELS}
           onClose={()=>setShowPatternTable(false)}/>
       )}
+
+      {/* Post-recording prompt */}
+      {showPostRecordPrompt && lastRecordedFile && (
+        <div style={{position:"absolute",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200}}>
+          <div style={{background:"#111",border:"1px solid #2a2a2a",padding:"32px 40px",maxWidth:420,textAlign:"center"}}>
+            <div style={{color:"#7ec8d9",fontSize:14,fontWeight:700,marginBottom:8}}>Recording Saved</div>
+            <div style={{color:"#888",fontSize:12,fontFamily:"'IBM Plex Mono', monospace",marginBottom:6}}>{lastRecordedFile.filename}</div>
+            <div style={{color:"#555",fontSize:11,marginBottom:24}}>
+              {lastRecordedFile.record.durationSec}s recorded | {lastRecordedFile.record.channels} channels | {lastRecordedFile.record.sampleRate}Hz
+            </div>
+            <div style={{color:"#ccc",fontSize:13,marginBottom:24}}>Do you wish to load current recording to Review?</div>
+            <div style={{display:"flex",gap:12,justifyContent:"center"}}>
+              <button onClick={()=>setShowPostRecordPrompt(false)} style={{
+                padding:"8px 20px",background:"transparent",border:"1px solid #333",borderRadius:0,
+                color:"#888",cursor:"pointer",fontSize:12
+              }}>No</button>
+              <button onClick={()=>{setShowPostRecordPrompt(false);if(openReview&&lastRecordedFile.record)openReview(lastRecordedFile.record);}} style={{
+                padding:"8px 20px",background:"#1a4a54",border:"1px solid #4a9bab50",borderRadius:0,
+                color:"#7ec8d9",cursor:"pointer",fontSize:12,fontWeight:700
+              }}>Yes, Open in Review</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -3947,7 +4180,7 @@ export default function ReactEEGApp() {
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab records={records} setRecords={setRecords} onOpenReview={openReview} updateRecordStatus={updateRecordStatus} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
         {activeTab === "review" && <ReviewTab record={reviewRecord} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore}/>}
-        {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
+        {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore} openReview={openReview}/>}
       </div>
     </div>
   );
