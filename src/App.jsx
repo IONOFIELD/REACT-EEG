@@ -2607,7 +2607,11 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
                 color:"#ccc",fontFamily:"'IBM Plex Mono', monospace",fontSize:11,
               }} onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
                  onMouseLeave={e=>e.currentTarget.style.background=r.id===record?.id?"#1a2a30":"transparent"}>
-                <span style={{color:"#7ec8d9"}}>{r.filename}</span>
+                <span style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span title={r.isTest ? "Test" : r.isAcquired ? "Acquired" : "Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
+                    background:r.isTest ? "#22c55e" : r.isAcquired ? "#3b82f6" : "#eab308"}}/>
+                  <span style={{color:"#7ec8d9"}}>{r.filename}</span>
+                </span>
                 <div style={{display:"flex",gap:8,alignItems:"center"}}>
                   <StatusBadge status={r.status}/>
                   <span style={{color:"#555"}}>{r.date}</span>
