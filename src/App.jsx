@@ -1213,6 +1213,254 @@ function computeCrossCorrelation(a, b) {
   return den > 0 ? num / den : 0;
 }
 
+// Weighted Phase Lag Index (WPLI) — volume-conduction-resistant phase synchrony
+// Vinck et al. 2011, NeuroImage. Uses only the imaginary part of cross-spectral
+// density, which is zero for volume-conducted (zero-lag) signals.
+// Returns value in [0, 1]: 1 = perfectly synchronous, 0 = no consistent phase relationship
+function computeWPLI(a, b, sr, fLow = 1, fHigh = 15) {
+  if (!a || !b || a.length < 16 || b.length < 16) return null;
+  const N = Math.min(a.length, b.length);
+  const freqRes = sr / N;
+  const kLow = Math.max(1, Math.round(fLow / freqRes));
+  const kHigh = Math.min(Math.floor(N / 2), Math.round(fHigh / freqRes));
+  if (kHigh <= kLow) return null;
+
+  // Hanning window
+  const wA = new Float32Array(N), wB = new Float32Array(N);
+  for (let n = 0; n < N; n++) {
+    const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));
+    wA[n] = a[n] * w;
+    wB[n] = b[n] * w;
+  }
+
+  // Compute CSD imaginary part for each frequency bin in the EOG range
+  // CSD[k] = FFT_a[k] * conj(FFT_b[k]), we only need Im(CSD)
+  let sumImCSD = 0, sumAbsImCSD = 0;
+  for (let k = kLow; k <= kHigh; k++) {
+    let reA = 0, imA = 0, reB = 0, imB = 0;
+    for (let n = 0; n < N; n++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      const cos = Math.cos(angle), sin = Math.sin(angle);
+      reA += wA[n] * cos; imA -= wA[n] * sin;
+      reB += wB[n] * cos; imB -= wB[n] * sin;
+    }
+    // CSD = (reA + j*imA) * (reB - j*imB) = (reA*reB + imA*imB) + j*(imA*reB - reA*imB)
+    const imCSD = imA * reB - reA * imB;
+    sumImCSD += imCSD;
+    sumAbsImCSD += Math.abs(imCSD);
+  }
+
+  return sumAbsImCSD > 0 ? Math.abs(sumImCSD) / sumAbsImCSD : 0;
+}
+
+// Z-score artifact detection — sliding RMS windows, flag |z| > threshold
+// Returns { mask: boolean[], artifactPct: number } where mask[i]=true means artifact
+function detectArtifacts(data, sr, windowMs = 250, zThreshold = 4.0) {
+  if (!data || data.length < 4) return { mask: new Array(data?.length || 0).fill(false), artifactPct: 0 };
+  const N = data.length;
+  const winSamples = Math.max(4, Math.round((windowMs / 1000) * sr));
+  const nWindows = Math.floor(N / winSamples);
+  if (nWindows < 3) return { mask: new Array(N).fill(false), artifactPct: 0 };
+
+  // Compute RMS per window
+  const rmsVals = new Float32Array(nWindows);
+  for (let w = 0; w < nWindows; w++) {
+    let sum2 = 0;
+    const start = w * winSamples;
+    for (let j = 0; j < winSamples; j++) { const v = data[start + j]; sum2 += v * v; }
+    rmsVals[w] = Math.sqrt(sum2 / winSamples);
+  }
+
+  // Z-score each window
+  let mean = 0;
+  for (let w = 0; w < nWindows; w++) mean += rmsVals[w];
+  mean /= nWindows;
+  let variance = 0;
+  for (let w = 0; w < nWindows; w++) { const d = rmsVals[w] - mean; variance += d * d; }
+  const std = Math.sqrt(variance / nWindows);
+
+  const mask = new Array(N).fill(false);
+  let artifactSamples = 0;
+  if (std > 0) {
+    for (let w = 0; w < nWindows; w++) {
+      const z = Math.abs((rmsVals[w] - mean) / std);
+      if (z > zThreshold) {
+        const start = w * winSamples;
+        for (let j = 0; j < winSamples && (start + j) < N; j++) {
+          mask[start + j] = true;
+          artifactSamples++;
+        }
+      }
+    }
+  }
+  return { mask, artifactPct: (artifactSamples / N) * 100 };
+}
+
+// Spectral interpolation for line noise removal (60 Hz default)
+// Replaces magnitude at lineFreq ± bandwidth with average of flanking bins, preserves phase
+// Returns cleaned Float32Array — no spectral distortion unlike IIR notch
+function removeLineNoiseSpectral(data, sr, lineFreq = 60, bandwidth = 2) {
+  if (!data || data.length < 16 || sr < lineFreq * 2) return data;
+  const N = data.length;
+  const freqRes = sr / N;
+
+  // Full DFT
+  const reArr = new Float32Array(N), imArr = new Float32Array(N);
+  for (let k = 0; k <= Math.floor(N / 2); k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      re += data[n] * Math.cos(angle);
+      im -= data[n] * Math.sin(angle);
+    }
+    reArr[k] = re; imArr[k] = im;
+    // Mirror for negative frequencies
+    if (k > 0 && k < Math.floor(N / 2)) {
+      reArr[N - k] = re; imArr[N - k] = -im;
+    }
+  }
+
+  // Identify bins to interpolate: lineFreq ± bandwidth
+  const kCenter = Math.round(lineFreq / freqRes);
+  const kBand = Math.ceil(bandwidth / freqRes);
+  const kLow = Math.max(1, kCenter - kBand);
+  const kHigh = Math.min(Math.floor(N / 2) - 1, kCenter + kBand);
+
+  // Flanking regions for magnitude interpolation
+  const flankWidth = Math.max(2, kBand);
+  const flankLow = Math.max(1, kLow - flankWidth);
+  const flankHigh = Math.min(Math.floor(N / 2), kHigh + flankWidth);
+
+  let flankMagSum = 0, flankCount = 0;
+  for (let k = flankLow; k < kLow; k++) {
+    flankMagSum += Math.sqrt(reArr[k] * reArr[k] + imArr[k] * imArr[k]);
+    flankCount++;
+  }
+  for (let k = kHigh + 1; k <= flankHigh; k++) {
+    flankMagSum += Math.sqrt(reArr[k] * reArr[k] + imArr[k] * imArr[k]);
+    flankCount++;
+  }
+  const avgFlankMag = flankCount > 0 ? flankMagSum / flankCount : 0;
+
+  // Replace target bins: keep phase, set magnitude to flanking average
+  for (let k = kLow; k <= kHigh; k++) {
+    const mag = Math.sqrt(reArr[k] * reArr[k] + imArr[k] * imArr[k]);
+    if (mag > 0) {
+      const scale = avgFlankMag / mag;
+      reArr[k] *= scale; imArr[k] *= scale;
+      if (k > 0 && k < Math.floor(N / 2)) {
+        reArr[N - k] = reArr[k]; imArr[N - k] = -imArr[k];
+      }
+    }
+  }
+
+  // Inverse DFT
+  const cleaned = new Float32Array(N);
+  for (let n = 0; n < N; n++) {
+    let sum = 0;
+    for (let k = 0; k < N; k++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      sum += reArr[k] * Math.cos(angle) + imArr[k] * Math.sin(angle);
+    }
+    cleaned[n] = sum / N;
+  }
+  return cleaned;
+}
+
+// IRASA — Irregular-Resampling Auto-Spectral Analysis (Wen & Liu, 2016)
+// Separates aperiodic (1/f) component from oscillatory peaks by resampling at
+// irrational ratios. Returns the aperiodic spectral slope (log-log fit, 1-40 Hz).
+// Steeper slope (more negative) indicates more pathological slowing.
+function computeAperiodicSlope(data, sr) {
+  if (!data || data.length < 64) return null;
+  const N = data.length;
+
+  // Linear interpolation resampler
+  const resample = (signal, ratio) => {
+    const outLen = Math.floor(signal.length * ratio);
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = i / ratio;
+      const lo = Math.floor(srcIdx);
+      const hi = Math.min(lo + 1, signal.length - 1);
+      const frac = srcIdx - lo;
+      out[i] = signal[lo] * (1 - frac) + signal[hi] * frac;
+    }
+    return out;
+  };
+
+  // Power spectrum via DFT (Hanning windowed)
+  const powerSpectrum = (sig) => {
+    const M = sig.length;
+    const half = Math.floor(M / 2);
+    const spec = new Float32Array(half + 1);
+    for (let k = 0; k <= half; k++) {
+      let re = 0, im = 0;
+      for (let n = 0; n < M; n++) {
+        const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (M - 1)));
+        const angle = (2 * Math.PI * k * n) / M;
+        re += sig[n] * w * Math.cos(angle);
+        im -= sig[n] * w * Math.sin(angle);
+      }
+      spec[k] = (re * re + im * im) / (M * M);
+    }
+    return spec;
+  };
+
+  const ratios = [1.1, 1.3, 1.5, 1.7, 1.9];
+  // For each ratio, compute geometric mean of up/down resampled spectra
+  // Use the minimum common frequency range (determined by downsampled version)
+  const minLen = Math.floor(N / 1.9); // smallest downsampled length
+  const minHalf = Math.floor(minLen / 2);
+  if (minHalf < 4) return null;
+
+  const aperiodicBins = new Float32Array(minHalf + 1).fill(1); // product for geometric mean
+  let nRatios = 0;
+
+  for (const h of ratios) {
+    const up = resample(data, h);
+    const down = resample(data, 1 / h);
+    const specUp = powerSpectrum(up);
+    const specDown = powerSpectrum(down);
+
+    // Map both spectra to common frequency grid (original sr, minHalf bins)
+    for (let k = 0; k <= minHalf; k++) {
+      // Frequency this bin represents in original units
+      const f = (k * sr) / N;
+      // Corresponding bin in upsampled spectrum (sr stays same, length changes)
+      const kUp = Math.min(Math.round((f * up.length) / sr), specUp.length - 1);
+      const kDown = Math.min(Math.round((f * down.length) / sr), specDown.length - 1);
+      const geoMean = Math.sqrt(Math.max(1e-30, specUp[kUp]) * Math.max(1e-30, specDown[kDown]));
+      aperiodicBins[k] *= geoMean;
+    }
+    nRatios++;
+  }
+
+  // Take nth root for geometric mean across ratios
+  for (let k = 0; k <= minHalf; k++) {
+    aperiodicBins[k] = Math.pow(aperiodicBins[k], 1 / nRatios);
+  }
+
+  // Fit log-log line in 1-40 Hz range: log(P) = slope * log(f) + intercept
+  const freqRes = sr / N;
+  const kLow = Math.max(1, Math.round(1 / freqRes));
+  const kHigh = Math.min(minHalf, Math.round(40 / freqRes));
+  if (kHigh <= kLow + 2) return null;
+
+  let sumX = 0, sumY = 0, sumXX = 0, sumXY = 0, nPts = 0;
+  for (let k = kLow; k <= kHigh; k++) {
+    const f = k * freqRes;
+    if (f < 0.5 || aperiodicBins[k] <= 0) continue;
+    const logF = Math.log10(f);
+    const logP = Math.log10(aperiodicBins[k]);
+    sumX += logF; sumY += logP; sumXX += logF * logF; sumXY += logF * logP;
+    nPts++;
+  }
+  if (nPts < 3) return null;
+  const slope = (nPts * sumXY - sumX * sumY) / (nPts * sumXX - sumX * sumX);
+  return Math.round(slope * 100) / 100; // e.g. -1.73
+}
+
 // ══════════════════════════════════════════════════════════════
 // QUANTITATIVE EEG ANALYSIS PANEL — floating overlay
 // ══════════════════════════════════════════════════════════════
@@ -1245,12 +1493,22 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
   }, [dragging, dragOffset]);
 
   // Compute spectral power per channel using simple FFT approximation
+  // Hanning-windowed DFT for band power — reduces spectral leakage vs raw rectangular window
   const computeBandPower = (data, sr) => {
     if (!data || data.length === 0) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
     const N = data.length;
     const freqRes = sr / N;
 
-    // Simple DFT magnitude for band ranges
+    // Apply Hanning window: w[n] = 0.5 * (1 - cos(2πn/(N-1)))
+    const windowed = new Float32Array(N);
+    let winEnergy = 0;
+    for (let n = 0; n < N; n++) {
+      const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));
+      windowed[n] = data[n] * w;
+      winEnergy += w * w;
+    }
+    const winNorm = winEnergy / N; // window energy correction factor
+
     const bandRanges = { delta: [0.5, 4], theta: [4, 8], alpha: [8, 13], beta: [13, 30], gamma: [30, 50] };
     const powers = {};
     let total = 0;
@@ -1263,10 +1521,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
         let re = 0, im = 0;
         for (let n = 0; n < N; n++) {
           const angle = (2 * Math.PI * k * n) / N;
-          re += data[n] * Math.cos(angle);
-          im -= data[n] * Math.sin(angle);
+          re += windowed[n] * Math.cos(angle);
+          im -= windowed[n] * Math.sin(angle);
         }
-        bandPow += (re * re + im * im) / (N * N);
+        bandPow += (re * re + im * im) / (N * N * winNorm);
       }
       powers[band] = bandPow;
       total += bandPow;
@@ -1282,17 +1540,42 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
     // Subsample for performance (use first 512 samples max for FFT)
     const maxSamples = Math.min(512, waveformData[0]?.length || 0);
 
+    // Artifact detection across all EEG channels — aggregate worst-case artifact %
+    const AUX_EXCLUDE = new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]);
+    let totalArtifactPct = 0, nArtChannels = 0;
+    const channelArtifacts = {};
+
     const channelData = channels.map((ch, i) => {
       const raw = waveformData[i];
       if (!raw) return { channel: ch, bands: { delta:0, theta:0, alpha:0, beta:0, gamma:0, total:0 } };
-      const sub = raw.slice(0, maxSamples);
+      let sub = raw.slice(0, maxSamples);
+
+      // Z-score artifact detection on EEG channels
+      if (!AUX_EXCLUDE.has(ch)) {
+        const { mask, artifactPct } = detectArtifacts(sub, sampleRate);
+        channelArtifacts[ch] = artifactPct;
+        totalArtifactPct += artifactPct;
+        nArtChannels++;
+        // Zero out artifact samples before spectral analysis
+        if (artifactPct > 0) {
+          sub = new Float32Array(sub);
+          for (let j = 0; j < sub.length; j++) { if (mask[j]) sub[j] = 0; }
+        }
+      }
+
+      // Spectral interpolation for 60 Hz line noise (cleaner than IIR notch)
+      if (!AUX_EXCLUDE.has(ch) && sampleRate > 120) {
+        sub = removeLineNoiseSpectral(sub, sampleRate, 60, 2);
+      }
+
       const bands = computeBandPower(sub, sampleRate);
       return { channel: ch, bands };
     });
 
+    const avgArtifactPct = nArtChannels > 0 ? totalArtifactPct / nArtChannels : 0;
+
     // Compute averages (exclude EKG and eye leads — not brain EEG)
     const avgBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
-    const AUX_EXCLUDE = new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]);
     const eegChannels = channelData.filter(c => !AUX_EXCLUDE.has(c.channel));
     eegChannels.forEach(c => {
       Object.keys(avgBands).forEach(b => { avgBands[b] += c.bands[b]; });
@@ -1301,25 +1584,48 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       Object.keys(avgBands).forEach(b => { avgBands[b] /= eegChannels.length; });
     }
 
-    // Alpha peak frequency (find max power in 7-14Hz range)
+    // Alpha peak frequency — averaged across posterior channels with zero-padded 0.1 Hz resolution
     let peakAlphaFreq = 10;
     if (eegChannels.length > 0) {
-      const testData = waveformData[Math.floor(channels.length / 2)]?.slice(0, maxSamples);
-      if (testData) {
-        const N = testData.length;
-        const freqRes = sampleRate / N;
-        let maxPow = 0;
-        for (let f = 7; f <= 14; f += 0.25) {
-          const k = Math.round(f / freqRes);
-          let re = 0, im = 0;
-          for (let n = 0; n < N; n++) {
-            const angle = (2 * Math.PI * k * n) / N;
-            re += testData[n] * Math.cos(angle);
-            im -= testData[n] * Math.sin(angle);
-          }
-          const pow = re * re + im * im;
-          if (pow > maxPow) { maxPow = pow; peakAlphaFreq = f; }
+      const posteriorNames = new Set(["P3","P4","Pz","O1","O2"]);
+      const posteriorIdxs = channels.map((ch, i) => posteriorNames.has(ch.split("-")[0]) ? i : -1).filter(i => i >= 0);
+      // Fall back to mid-channel if no posterior channels found
+      const useIdxs = posteriorIdxs.length > 0 ? posteriorIdxs : [Math.floor(channels.length / 2)];
+      // Average power spectrum across posterior channels for robust peak detection
+      const Norig = Math.min(maxSamples, waveformData[0]?.length || 0);
+      const Npad = Norig * 2; // zero-pad to 2x for finer freq resolution
+      const freqRes = sampleRate / Npad;
+      const kLow = Math.max(1, Math.round(7 / freqRes));
+      const kHigh = Math.min(Math.floor(Npad / 2), Math.round(14 / freqRes));
+      const avgSpectrum = new Float32Array(kHigh - kLow + 1);
+      let nContrib = 0;
+      for (const idx of useIdxs) {
+        const raw = waveformData[idx]?.slice(0, Norig);
+        if (!raw) continue;
+        // Hanning window + zero-pad
+        const padded = new Float32Array(Npad);
+        for (let n = 0; n < Norig; n++) {
+          padded[n] = raw[n] * 0.5 * (1 - Math.cos((2 * Math.PI * n) / (Norig - 1)));
         }
+        for (let ki = 0; ki <= kHigh - kLow; ki++) {
+          const k = kLow + ki;
+          let re = 0, im = 0;
+          for (let n = 0; n < Npad; n++) {
+            const angle = (2 * Math.PI * k * n) / Npad;
+            re += padded[n] * Math.cos(angle);
+            im -= padded[n] * Math.sin(angle);
+          }
+          avgSpectrum[ki] += re * re + im * im;
+        }
+        nContrib++;
+      }
+      if (nContrib > 0) {
+        let maxPow = 0;
+        for (let ki = 0; ki < avgSpectrum.length; ki++) {
+          const p = avgSpectrum[ki] / nContrib;
+          if (p > maxPow) { maxPow = p; peakAlphaFreq = (kLow + ki) * freqRes; }
+        }
+        peakAlphaFreq = Math.round(peakAlphaFreq * 10) / 10; // round to 0.1 Hz
       }
     }
 
@@ -1358,7 +1664,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       else if (ftSlowPct > 40) flags.push({ channel: "F/T", type: "Mild FT Slowing", value: `${ftSlowPct.toFixed(0)}% slow (δ+θ)`, severity: "med" });
     }
 
-    // Eye Movement Synchronicity Analysis
+    // Eye Movement Synchronicity Analysis — dual method: WPLI (primary) + Pearson (secondary)
     const loc1Idx = channels.indexOf("LOC1");
     const roc1Idx = channels.indexOf("ROC1");
     const loc2Idx = channels.indexOf("LOC2");
@@ -1370,44 +1676,70 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
 
     if (hasVertical || hasHorizontal) {
       const maxS = Math.min(512, waveformData[0]?.length || 0);
+      const loc1Data = hasVertical ? waveformData[loc1Idx]?.slice(0, maxS) : null;
+      const roc1Data = hasVertical ? waveformData[roc1Idx]?.slice(0, maxS) : null;
+      const loc2Data = hasHorizontal ? waveformData[loc2Idx]?.slice(0, maxS) : null;
+      const roc2Data = hasHorizontal ? waveformData[roc2Idx]?.slice(0, maxS) : null;
 
-      // Vertical sync (LOC1 ↔ ROC1): should be highly correlated for conjugate gaze
-      const vertCorr = hasVertical
-        ? computeCrossCorrelation(waveformData[loc1Idx]?.slice(0, maxS), waveformData[roc1Idx]?.slice(0, maxS))
-        : null;
+      // WPLI (Vinck 2011) — volume-conduction resistant, primary sync metric
+      const wpliVert = hasVertical ? computeWPLI(loc1Data, roc1Data, sampleRate, 1, 15) : null;
+      const wpliHoriz = hasHorizontal ? computeWPLI(loc2Data, roc2Data, sampleRate, 1, 15) : null;
 
-      // Horizontal sync (LOC2 ↔ ROC2): should be positively correlated for conjugate gaze
-      const horizCorr = hasHorizontal
-        ? computeCrossCorrelation(waveformData[loc2Idx]?.slice(0, maxS), waveformData[roc2Idx]?.slice(0, maxS))
-        : null;
+      // Pearson correlation — secondary/legacy metric
+      const vertCorr = hasVertical ? computeCrossCorrelation(loc1Data, roc1Data) : null;
+      const horizCorr = hasHorizontal ? computeCrossCorrelation(loc2Data, roc2Data) : null;
 
       // Blink amplitude symmetry: compare RMS of vertical channels
       let blinkSymmetry = null;
-      if (hasVertical) {
-        const loc1Data = waveformData[loc1Idx]?.slice(0, maxS);
-        const roc1Data = waveformData[roc1Idx]?.slice(0, maxS);
-        if (loc1Data && roc1Data) {
-          let rmsL = 0, rmsR = 0;
-          for (let i = 0; i < maxS; i++) { rmsL += loc1Data[i] * loc1Data[i]; rmsR += roc1Data[i] * roc1Data[i]; }
-          rmsL = Math.sqrt(rmsL / maxS); rmsR = Math.sqrt(rmsR / maxS);
-          const maxRms = Math.max(rmsL, rmsR, 1);
-          blinkSymmetry = 1 - Math.abs(rmsL - rmsR) / maxRms;
-        }
+      if (hasVertical && loc1Data && roc1Data) {
+        let rmsL = 0, rmsR = 0;
+        for (let i = 0; i < maxS; i++) { rmsL += loc1Data[i] * loc1Data[i]; rmsR += roc1Data[i] * roc1Data[i]; }
+        rmsL = Math.sqrt(rmsL / maxS); rmsR = Math.sqrt(rmsR / maxS);
+        const maxRms = Math.max(rmsL, rmsR, 1);
+        blinkSymmetry = 1 - Math.abs(rmsL - rmsR) / maxRms;
       }
 
-      // Combined synchronicity score (0-100%)
-      // Both vertical (LOC1↔ROC1) and horizontal (LOC2↔ROC2) should be positively correlated
-      // for normal conjugate gaze — low correlation indicates desynchrony
+      // Combined synchronicity score — WPLI-weighted (favors volume-conduction-resistant measure)
       const scores = [];
-      if (vertCorr !== null) scores.push(Math.max(0, vertCorr));
-      if (horizCorr !== null) scores.push(Math.max(0, horizCorr));
+      if (wpliVert !== null) scores.push(wpliVert);
+      if (wpliHoriz !== null) scores.push(wpliHoriz);
       if (blinkSymmetry !== null) scores.push(blinkSymmetry);
       const syncScore = scores.length > 0 ? (scores.reduce((a, b) => a + b, 0) / scores.length) * 100 : null;
 
-      eyeSync = { vertCorr, horizCorr, blinkSymmetry, syncScore };
+      eyeSync = { wpliVert, wpliHoriz, vertCorr, horizCorr, blinkSymmetry, syncScore };
     }
 
-    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, flags, eyeSync };
+    // IRASA aperiodic slope — computed on averaged EEG data for efficiency
+    let aperiodicSlope = null;
+    if (eegChannels.length > 0) {
+      // Average a few representative channels for slope estimate
+      const slopeChNames = new Set(["Fz","Cz","Pz","F3","F4","C3","C4"]);
+      const slopeIdxs = channels.map((ch, i) => slopeChNames.has(ch.split("-")[0]) ? i : -1).filter(i => i >= 0);
+      const useIdxs = slopeIdxs.length > 0 ? slopeIdxs : [Math.floor(channels.length / 2)];
+      // Average signal across selected channels
+      const avgSig = new Float32Array(maxSamples);
+      let nSig = 0;
+      for (const idx of useIdxs) {
+        const raw = waveformData[idx]?.slice(0, maxSamples);
+        if (!raw) continue;
+        for (let j = 0; j < maxSamples; j++) avgSig[j] += raw[j];
+        nSig++;
+      }
+      if (nSig > 0) {
+        for (let j = 0; j < maxSamples; j++) avgSig[j] /= nSig;
+        aperiodicSlope = computeAperiodicSlope(avgSig, sampleRate);
+      }
+    }
+
+    // Artifact flags
+    if (avgArtifactPct > 20) flags.push({ channel: "ALL", type: "High Artifact", value: `${avgArtifactPct.toFixed(0)}% contaminated`, severity: "high" });
+    else if (avgArtifactPct > 10) flags.push({ channel: "ALL", type: "Moderate Artifact", value: `${avgArtifactPct.toFixed(0)}% contaminated`, severity: "med" });
+
+    // Aperiodic slope flag
+    if (aperiodicSlope !== null && aperiodicSlope < -2.5) flags.push({ channel: "ALL", type: "Steep 1/f Slope", value: `${aperiodicSlope} (pathological)`, severity: "high" });
+    else if (aperiodicSlope !== null && aperiodicSlope < -2.2) flags.push({ channel: "ALL", type: "Mild 1/f Steepening", value: `${aperiodicSlope}`, severity: "med" });
+
+    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, flags, eyeSync, avgArtifactPct, aperiodicSlope };
   }, [waveformData, channels, sampleRate]);
 
   if (!analysis) return null;
@@ -1476,16 +1808,18 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
               return <PowerBar key={band} value={val} max={total * 0.6} color={color} label={band.charAt(0).toUpperCase() + band.slice(1, 3)} pct={pct}/>;
             })}
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:4,marginTop:8}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr",gap:3,marginTop:8}}>
             {[
-              {label:"α PEAK",value:`${analysis.peakAlphaFreq.toFixed(1)}`,unit:"Hz",color:"#10B981"},
-              {label:"θ/β",value:analysis.thetaBetaRatio.toFixed(2),unit:"",color:analysis.thetaBetaRatio>3?"#F59E0B":"#7ec8d9"},
+              {label:"α PEAK",value:`${analysis.peakAlphaFreq.toFixed(1)}`,unit:"Hz",color:analysis.peakAlphaFreq<8.5?"#F59E0B":"#10B981"},
+              {label:"θ/β",value:analysis.thetaBetaRatio.toFixed(2),unit:"",color:analysis.thetaBetaRatio>3.5?"#f87171":analysis.thetaBetaRatio>2.5?"#F59E0B":"#10B981"},
               {label:"ASYM",value:`${analysis.asymmetryIndex>0?"+":""}${analysis.asymmetryIndex.toFixed(1)}`,unit:"%",color:Math.abs(analysis.asymmetryIndex)>15?"#F59E0B":"#7ec8d9"},
+              {label:"1/f",value:analysis.aperiodicSlope!==null?analysis.aperiodicSlope.toFixed(1):"—",unit:"",color:analysis.aperiodicSlope!==null?(analysis.aperiodicSlope<-2.5?"#f87171":analysis.aperiodicSlope<-2.2?"#F59E0B":"#10B981"):"#555"},
+              {label:"ART%",value:analysis.avgArtifactPct!==undefined?analysis.avgArtifactPct.toFixed(0):"0",unit:"%",color:analysis.avgArtifactPct>20?"#f87171":analysis.avgArtifactPct>10?"#F59E0B":"#10B981"},
               {label:"CH",value:channels.filter(c=>!new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]).has(c)).length,unit:"",color:"#888"},
             ].map((m,i)=>(
-              <div key={i} style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"4px 6px",textAlign:"center"}}>
-                <div style={{fontSize:7,color:"#555",letterSpacing:"0.06em"}}>{m.label}</div>
-                <div style={{fontSize:12,fontWeight:700,color:m.color,fontFamily:"'IBM Plex Mono', monospace"}}>{m.value}<span style={{fontSize:8,fontWeight:400}}>{m.unit}</span></div>
+              <div key={i} style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"3px 4px",textAlign:"center"}}>
+                <div style={{fontSize:6,color:"#555",letterSpacing:"0.06em"}}>{m.label}</div>
+                <div style={{fontSize:11,fontWeight:700,color:m.color,fontFamily:"'IBM Plex Mono', monospace"}}>{m.value}<span style={{fontSize:7,fontWeight:400}}>{m.unit}</span></div>
               </div>
             ))}
           </div>
@@ -1508,33 +1842,58 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
                 <div style={{height:3,background:"#111",borderRadius:2,marginBottom:6}}>
                   <div style={{height:"100%",background:scoreColor,width:`${Math.min(100, score)}%`,borderRadius:2,transition:"width 0.3s"}}/>
                 </div>
-                {/* Detail rows — compact */}
-                {s.vertCorr !== null && (
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
-                    <span style={{fontSize:8,color:"#555"}}>Vert (LOC1↔ROC1)</span>
-                    <span style={{fontSize:10,fontWeight:700,color:s.vertCorr>0.7?"#10B981":s.vertCorr>0.4?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
-                      r={s.vertCorr.toFixed(3)}
-                    </span>
+                {/* WPLI — primary sync metric (volume-conduction resistant) */}
+                {(s.wpliVert !== null || s.wpliHoriz !== null) && (
+                  <div style={{display:"flex",gap:8,marginBottom:3}}>
+                    {s.wpliVert !== null && (
+                      <div style={{flex:1,display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
+                        <span style={{fontSize:7,color:"#555"}}>WPLI Vert</span>
+                        <span style={{fontSize:10,fontWeight:700,color:s.wpliVert>0.6?"#10B981":s.wpliVert>0.3?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                          {s.wpliVert.toFixed(3)}
+                        </span>
+                      </div>
+                    )}
+                    {s.wpliHoriz !== null && (
+                      <div style={{flex:1,display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
+                        <span style={{fontSize:7,color:"#555"}}>WPLI Horiz</span>
+                        <span style={{fontSize:10,fontWeight:700,color:s.wpliHoriz>0.6?"#10B981":s.wpliHoriz>0.3?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                          {s.wpliHoriz.toFixed(3)}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
-                {s.horizCorr !== null && (
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
-                    <span style={{fontSize:8,color:"#555"}}>Horiz (LOC2↔ROC2)</span>
-                    <span style={{fontSize:10,fontWeight:700,color:s.horizCorr>0.7?"#10B981":s.horizCorr>0.4?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
-                      r={s.horizCorr.toFixed(3)}
-                    </span>
+                {/* Pearson — secondary metric */}
+                {(s.vertCorr !== null || s.horizCorr !== null) && (
+                  <div style={{display:"flex",gap:8,marginBottom:3}}>
+                    {s.vertCorr !== null && (
+                      <div style={{flex:1,display:"flex",justifyContent:"space-between",alignItems:"center",padding:"1px 0"}}>
+                        <span style={{fontSize:7,color:"#444"}}>r Vert</span>
+                        <span style={{fontSize:9,fontWeight:600,color:s.vertCorr>0.7?"#10B98180":s.vertCorr>0.4?"#F59E0B80":"#f8717180",fontFamily:"'IBM Plex Mono', monospace"}}>
+                          {s.vertCorr.toFixed(3)}
+                        </span>
+                      </div>
+                    )}
+                    {s.horizCorr !== null && (
+                      <div style={{flex:1,display:"flex",justifyContent:"space-between",alignItems:"center",padding:"1px 0"}}>
+                        <span style={{fontSize:7,color:"#444"}}>r Horiz</span>
+                        <span style={{fontSize:9,fontWeight:600,color:s.horizCorr>0.7?"#10B98180":s.horizCorr>0.4?"#F59E0B80":"#f8717180",fontFamily:"'IBM Plex Mono', monospace"}}>
+                          {s.horizCorr.toFixed(3)}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
                 {s.blinkSymmetry !== null && (
-                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
-                    <span style={{fontSize:8,color:"#555"}}>Blink Symmetry</span>
-                    <span style={{fontSize:10,fontWeight:700,color:s.blinkSymmetry>0.8?"#10B981":s.blinkSymmetry>0.5?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"1px 0"}}>
+                    <span style={{fontSize:7,color:"#444"}}>Blink Sym</span>
+                    <span style={{fontSize:9,fontWeight:600,color:s.blinkSymmetry>0.8?"#10B98180":s.blinkSymmetry>0.5?"#F59E0B80":"#f8717180",fontFamily:"'IBM Plex Mono', monospace"}}>
                       {(s.blinkSymmetry * 100).toFixed(1)}%
                     </span>
                   </div>
                 )}
-                <div style={{fontSize:8,color:"#333",marginTop:8,lineHeight:1.4}}>
-                  Monitors bilateral eye movement correlation. Low synchronicity may indicate subtle oculomotor desynchrony.
+                <div style={{fontSize:7,color:"#333",marginTop:4,lineHeight:1.3}}>
+                  WPLI: phase synchrony resistant to volume conduction. Pearson: amplitude correlation. Low values may indicate oculomotor desynchrony.
                 </div>
               </div>
             );
