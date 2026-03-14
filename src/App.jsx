@@ -43,6 +43,7 @@ const ELECTRODE_SETS = {
     "FC1","FC2","FC5","FC6","CP1","CP2","CP5","CP6","FT9","FT10","TP9","TP10","AF3","AF4","AF7","AF8","PO3","PO4","POz","Oz","Iz",
     "F1","F2","F5","F6","C1","C2","C5","C6","P1","P2","P5","P6","CPz","FCz","FPz","TP7","TP8","PO7","PO8","P9","P10",
     "F9","F10","FT7","FT8","CP3","CP4","T9","T10","P7","P8","O9","O10"],
+  "custom": ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6","Fz","Cz","Pz","A1","A2"],
 };
 
 // ── OpenBCI hardware channel-to-electrode mappings ──
@@ -91,9 +92,24 @@ const MONTAGE_DEFS = {
 };
 
 // Helper: get channels for a montage + system combination
-function getMontageChannels(montage, eegSystem) {
+function getMontageChannels(montage, eegSystem, customElectrodes = null) {
   const def = MONTAGE_DEFS[montage];
   if (!def) return [];
+  if (eegSystem === "custom" && customElectrodes) {
+    const base = def["10-20"] || [];
+    const sel = customElectrodes;
+    return base.filter(ch => {
+      if (ch === "EKG") return false;
+      if (ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2") return sel.has(ch);
+      if (ch.includes("-")) {
+        const parts = ch.split("-");
+        const ref = parts[parts.length - 1];
+        if (ref === "Avg" || ref === "Cz") return sel.has(parts[0]);
+        return sel.has(parts[0]) && sel.has(ref);
+      }
+      return sel.has(ch);
+    });
+  }
   return def[eegSystem] || def["10-20"] || [];
 }
 
@@ -101,7 +117,7 @@ function getMontageChannels(montage, eegSystem) {
 // A 10-20 recording CAN view in 10-20. It CANNOT view in hd-40 or 10-10.
 // An hd-40 recording CAN view in 10-20 and hd-40. It CANNOT view in 10-10.
 // A 10-10 recording CAN view in anything.
-const SYSTEM_HIERARCHY = { "10-20": 1, "hd-40": 2, "10-10": 3 };
+const SYSTEM_HIERARCHY = { "10-20": 1, "hd-40": 2, "10-10": 3, "custom": 1 };
 function canViewInSystem(recordingSystem, viewSystem) {
   return (SYSTEM_HIERARCHY[recordingSystem] || 1) >= (SYSTEM_HIERARCHY[viewSystem] || 1);
 }
@@ -459,6 +475,8 @@ const I = {
   Activity: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>,
   Ohm: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M8 17v-2a4 4 0 1 1 8 0v2"/><line x1="6" y1="17" x2="10" y2="17"/><line x1="14" y1="17" x2="18" y2="17"/></svg>,
   Eye: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
+  EyeOff: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="22" y2="22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>,
+  EyeDots: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/><circle cx="9" cy="4" r="1.2" fill="#F59E0B" stroke="none"/><circle cx="15" cy="4" r="1.2" fill="#F59E0B" stroke="none"/><circle cx="9" cy="20" r="1.2" fill="#F59E0B" stroke="none"/><circle cx="15" cy="20" r="1.2" fill="#F59E0B" stroke="none"/></svg>,
   Radio: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49"/><path d="M7.76 16.24a6 6 0 0 1 0-8.49"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>,
   MoreVert: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="5" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="19" r="1.5" fill="currentColor"/></svg>,
   Folder: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>,
@@ -971,21 +989,134 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
 }
 
 // ══════════════════════════════════════════════════════════════
+// CUSTOM ELECTRODE PICKER — modal for "Custom" EEG system
+// ══════════════════════════════════════════════════════════════
+const ELECTRODE_REGIONS = [
+  { label: "Frontal", electrodes: ["Fp1","Fp2","F3","F4","F7","F8","Fz"] },
+  { label: "Central", electrodes: ["C3","C4","Cz"] },
+  { label: "Parietal", electrodes: ["P3","P4","Pz"] },
+  { label: "Occipital", electrodes: ["O1","O2"] },
+  { label: "Temporal", electrodes: ["T3","T4","T5","T6"] },
+  { label: "Auricular", electrodes: ["A1","A2"] },
+];
+const EYE_LEAD_DEFS = [
+  { ch: "LOC1", ref: "Fp1", label: "LOC1 (ref: Fp1)" },
+  { ch: "ROC1", ref: "Fp2", label: "ROC1 (ref: Fp2)" },
+  { ch: "LOC2", ref: "F7", label: "LOC2 (ref: F7)" },
+  { ch: "ROC2", ref: "F8", label: "ROC2 (ref: F8)" },
+];
+
+function CustomElectrodePicker({ customElectrodes, setCustomElectrodes, onClose }) {
+  const toggle = (el) => setCustomElectrodes(prev => {
+    const next = new Set(prev);
+    if (next.has(el)) next.delete(el); else next.add(el);
+    return next;
+  });
+  const selectAll = () => setCustomElectrodes(new Set([...ELECTRODE_SETS["10-20"], "LOC1","LOC2","ROC1","ROC2"]));
+  const clearAll = () => setCustomElectrodes(new Set());
+  const eegCount = ELECTRODE_SETS["10-20"].filter(e => customElectrodes.has(e)).length;
+  const eyeCount = EYE_LEAD_DEFS.filter(e => customElectrodes.has(e.ch)).length;
+
+  const cbStyle = (checked) => ({
+    display:"flex",alignItems:"center",gap:5,padding:"3px 8px",
+    background:checked?"#1a2a30":"#111",border:`1px solid ${checked?"#4a9bab":"#222"}`,
+    borderRadius:2,cursor:"pointer",fontSize:10,color:checked?"#7ec8d9":"#555",
+    fontWeight:checked?700:400,fontFamily:"'IBM Plex Mono', monospace",transition:"all 0.15s",
+    minWidth:52,justifyContent:"center",
+  });
+  const eyeStyle = (checked) => ({
+    ...cbStyle(checked),
+    color:checked?"#F59E0B":"#555",border:`1px solid ${checked?"#F59E0B40":"#222"}`,
+    background:checked?"#1a1a10":"#111",minWidth:130,justifyContent:"flex-start",
+  });
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,
+      display:"flex",alignItems:"center",justifyContent:"center"}}
+      onClick={(e)=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{background:"#0c0c0c",border:"1px solid #222",padding:"20px 24px",
+        minWidth:420,maxWidth:520,borderRadius:2}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:16}}>
+          <span style={{fontSize:13,fontWeight:700,color:"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace"}}>
+            Custom Electrode Selection
+          </span>
+          <span style={{fontSize:10,color:"#555"}}>{eegCount} EEG + {eyeCount} Eye = {eegCount+eyeCount} leads</span>
+        </div>
+
+        {ELECTRODE_REGIONS.map(region => (
+          <div key={region.label} style={{marginBottom:10}}>
+            <div style={{fontSize:9,color:"#444",fontWeight:700,marginBottom:4,textTransform:"uppercase",letterSpacing:1}}>
+              {region.label}
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+              {region.electrodes.map(el => (
+                <div key={el} onClick={()=>toggle(el)} style={cbStyle(customElectrodes.has(el))}>
+                  <span style={{width:8,height:8,borderRadius:"50%",
+                    background:customElectrodes.has(el)?"#7ec8d9":"#333",flexShrink:0}}/>
+                  {el}
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+
+        <div style={{marginTop:12,marginBottom:10,borderTop:"1px solid #1a1a1a",paddingTop:12}}>
+          <div style={{fontSize:9,color:"#F59E0B",fontWeight:700,marginBottom:4,textTransform:"uppercase",letterSpacing:1}}>
+            Eye Leads
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4}}>
+            {EYE_LEAD_DEFS.map(({ch, label}) => (
+              <div key={ch} onClick={()=>toggle(ch)} style={eyeStyle(customElectrodes.has(ch))}>
+                <span style={{width:8,height:8,borderRadius:"50%",
+                  background:customElectrodes.has(ch)?"#F59E0B":"#333",flexShrink:0}}/>
+                {label}
+              </div>
+            ))}
+          </div>
+          <div style={{fontSize:9,color:"#444",marginTop:6,fontStyle:"italic"}}>
+            LOC1/LOC2 track vertical eye movement via Fp1/Fp2. ROC1/ROC2 track horizontal via F7/F8.
+          </div>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginTop:16,justifyContent:"space-between"}}>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={selectAll} style={{...controlBtn(),fontSize:10}}>Select All</button>
+            <button onClick={clearAll} style={{...controlBtn(),fontSize:10}}>Clear</button>
+          </div>
+          <button onClick={onClose} style={{...controlBtn(),color:"#7ec8d9",border:"1px solid #4a9bab",fontSize:10,padding:"4px 16px"}}>
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
 // EEG CONTROLS BAR — shared between REVIEW and ACQUIRE
 // ══════════════════════════════════════════════════════════════
 function EEGControls({ montage, setMontage, eegSystem, setEegSystem, recordingSystem, hpf, setHpf, lpf, setLpf, notch, setNotch,
-  epochSec, setEpochSec, sensitivity, setSensitivity, rightContent }) {
+  epochSec, setEpochSec, sensitivity, setSensitivity, rightContent, onOpenCustomPicker }) {
   return (
     <div style={{ display:"flex",alignItems:"flex-end",gap:16,padding:"8px 16px",
       borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexWrap:"wrap",flexShrink:0 }}>
       {eegSystem !== undefined && setEegSystem && (
         <div><div style={microLabel}>EEG System</div>
-          <select value={eegSystem} onChange={e=>setEegSystem(e.target.value)} style={{...selectStyle,width:140}}>
+          <div style={{display:"flex",gap:4,alignItems:"center"}}>
+          <select value={eegSystem} onChange={e=>setEegSystem(e.target.value)} style={{...selectStyle,width:eegSystem==="custom"?120:140}}>
             {Object.entries(EEG_SYSTEMS).map(([k,v])=>{
               const disabled = recordingSystem && !canViewInSystem(recordingSystem, k);
               return <option key={k} value={k} disabled={disabled}>{v.label}{disabled?" (insufficient data)":""}</option>;
             })}
-          </select></div>
+          </select>
+          {eegSystem === "custom" && onOpenCustomPicker && (
+            <button onClick={onOpenCustomPicker} title="Configure custom leads"
+              style={{padding:"3px 6px",background:"#111",border:"1px solid #4a9bab",borderRadius:2,
+                color:"#7ec8d9",cursor:"pointer",fontSize:10,fontWeight:700,display:"flex",alignItems:"center",gap:3}}>
+              {I.Edit(10)}
+            </button>
+          )}
+          </div></div>
       )}
       <div><div style={microLabel}>Montage</div>
         <select value={montage} onChange={e=>setMontage(e.target.value)} style={{...selectStyle,width:220}}>
@@ -1483,7 +1614,7 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
 // ══════════════════════════════════════════════════════════════
 // EPOCH NAV BAR — shared
 // ══════════════════════════════════════════════════════════════
-function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, isPlaying, onPlayPause, leftContent, rightContent }) {
+function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, totalDuration, isPlaying, onPlayPause, leftContent, rightContent }) {
   return (
     <div style={{ display:"flex",alignItems:"center",justifyContent:"center",gap:10,
       padding:"8px 16px",borderTop:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0 }}>
@@ -1502,20 +1633,21 @@ function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epoc
       )}
       <button onClick={()=>setCurrentEpoch(0)} style={controlBtn()}>|◀</button>
       <button onClick={()=>setCurrentEpoch(Math.max(0,currentEpoch-1))} style={controlBtn()}>{I.ChevLeft()}</button>
-      <div style={{display:"flex",alignItems:"center",gap:8}}>
+      <div style={{display:"flex",alignItems:"center",gap:6}}>
         <span style={{fontSize:11,color:"#888"}}>
           Epoch <span style={{color:"#7ec8d9",fontWeight:700}}>{currentEpoch+1}</span>
           <span style={{color:"#444"}}> / {totalEpochs}</span>
         </span>
         <span style={{color:"#333"}}>|</span>
-        <span style={{fontSize:11,color:"#555"}}>
+        <span style={{fontSize:11,color:"#7ec8d9",fontWeight:600}}>
           {Math.floor(epochStart/60)}:{String(Math.floor(epochStart%60)).padStart(2,"0")}
-          {" — "}
-          {Math.floor(epochEnd/60)}:{String(Math.floor(epochEnd%60)).padStart(2,"0")}
         </span>
       </div>
       <input type="range" min={0} max={totalEpochs-1} value={currentEpoch}
         onChange={e=>setCurrentEpoch(parseInt(e.target.value))} style={{width:180,accentColor:"#7ec8d9"}}/>
+      <span style={{fontSize:11,color:"#555"}}>
+        {totalDuration != null ? `${Math.floor(totalDuration/60)}:${String(Math.floor(totalDuration%60)).padStart(2,"0")}` : ""}
+      </span>
       <button onClick={()=>setCurrentEpoch(Math.min(totalEpochs-1,currentEpoch+1))} style={controlBtn()}>{I.ChevRight()}</button>
       <button onClick={()=>setCurrentEpoch(totalEpochs-1)} style={controlBtn()}>▶|</button>
       <span style={{color:"#333"}}>|</span>
@@ -1568,6 +1700,7 @@ const EEG_SYSTEMS = {
   "10-20": { label: "10-20 (Standard)", electrodes: ELECTRODE_SETS["10-20"].length },
   "hd-40": { label: "HD-40 (High Density)", electrodes: ELECTRODE_SETS["hd-40"].length },
   "10-10": { label: "10-10 (Extended)", electrodes: ELECTRODE_SETS["10-10"].length },
+  "custom": { label: "Custom (Select Leads)", electrodes: 0 },
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -1653,8 +1786,16 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measurePoints, setMeasurePoints] = useState([]);
 
-  const allChannels = getMontageChannels(montage, eegSystem);
+  const [customElectrodes, setCustomElectrodes] = useState(
+    () => new Set([...ELECTRODE_SETS["10-20"], "LOC1","LOC2","ROC1","ROC2"])
+  );
+  const [showCustomPicker, setShowCustomPicker] = useState(false);
+
+  const allChannels = useMemo(() => getMontageChannels(montage, eegSystem, eegSystem === "custom" ? customElectrodes : null),
+    [montage, eegSystem, customElectrodes]);
   const AUX_CHANNELS = new Set(["LOC1","LOC2","ROC1","ROC2","EKG"]);
+  const EYE_CHANNELS = new Set(["LOC1","LOC2","ROC1","ROC2"]);
+  const [visibilityState, setVisibilityState] = useState(0); // 0=default, 1=EEG shown (eyes hidden), 2=all shown
 
   // Normalize EDF label for matching (shared across hook)
   const normEdf = (l) => l.toUpperCase().replace(/^(EEG|ECG|EOG|EMG)\s+/,"").replace(/[\s\-\.]/g,"");
@@ -1740,6 +1881,34 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
       }
       return next;
     });
+    setVisibilityState(0); // reset cycle when user manually toggles
+  };
+
+  const cycleVisibility = () => {
+    // Clear user-forced overrides so auto-hide doesn't fight cycle
+    setUserForcedVisible(new Set());
+    setUserForcedHidden(new Set());
+    if (visibilityState === 0) {
+      // → State 1: Show all EEG, keep eyes + EKG hidden
+      setHiddenChannels(() => {
+        const next = new Set();
+        allChannels.forEach(ch => { if (EYE_CHANNELS.has(ch) || ch === "EKG") next.add(ch); });
+        return next;
+      });
+      setVisibilityState(1);
+    } else if (visibilityState === 1) {
+      // → State 2: Show eyes too (only EKG hidden)
+      setHiddenChannels(() => {
+        const next = new Set();
+        allChannels.forEach(ch => { if (ch === "EKG") next.add(ch); });
+        return next;
+      });
+      setVisibilityState(2);
+    } else {
+      // → State 0: Hide ALL
+      setHiddenChannels(() => new Set(allChannels));
+      setVisibilityState(0);
+    }
   };
 
   // Batch-hide channels not available on hardware
@@ -1925,15 +2094,17 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
 
   return {
     canvasRef, containerRef, montage, setMontage, eegSystem, setEegSystem,
+    customElectrodes, setCustomElectrodes, showCustomPicker, setShowCustomPicker,
     hpf, setHpf, lpf, setLpf, notch, setNotch,
     epochSec, setEpochSec: (v) => { setEpochSec(v); setCurrentEpoch(0); },
     currentEpoch, setCurrentEpoch, sensitivity, setSensitivity, sampleRate,
-    channels, allChannels, totalEpochs, epochStart, epochEnd, waveformData,
+    channels, allChannels, totalEpochs, epochStart, epochEnd, totalDuration, waveformData,
     annotations, setAnnotations, selectedAnnotationType, setSelectedAnnotationType,
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
     annotationText, setAnnotationText,
-    hiddenChannels, toggleChannelVisibility, setAvailableElectrodes, channelSensitivity, adjustChannelSensitivity,
+    hiddenChannels, toggleChannelVisibility, setAvailableElectrodes, visibilityState, cycleVisibility,
+    channelSensitivity, adjustChannelSensitivity,
     channelHpf, setChannelHpf, channelLpf, setChannelLpf,
     auxWithData, AUX_CHANNELS, channelsWithData,
     contextMenu, setContextMenu, handleContextMenu,
@@ -2832,15 +3003,19 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
       )}
         <EEGControls montage={eeg.montage} setMontage={eeg.setMontage}
           eegSystem={eeg.eegSystem} setEegSystem={eeg.setEegSystem} recordingSystem={record?.eegSystem || "10-20"}
+          onOpenCustomPicker={()=>eeg.setShowCustomPicker(true)}
           hpf={eeg.hpf} setHpf={eeg.setHpf}
           lpf={eeg.lpf} setLpf={eeg.setLpf} notch={eeg.notch} setNotch={eeg.setNotch}
           epochSec={eeg.epochSec} setEpochSec={eeg.setEpochSec} sensitivity={eeg.sensitivity} setSensitivity={eeg.setSensitivity}
           rightContent={<>
-            {eeg.hiddenChannels.size > 0 && (
-              <button onClick={(e)=>{e.stopPropagation();eeg.allChannels.forEach(ch=>{if(eeg.hiddenChannels.has(ch))eeg.toggleChannelVisibility(ch);});}} style={{...controlBtn(),color:"#F59E0B",border:"1px solid #F59E0B40"}}>
-                <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Eye(12)} Show All ({eeg.hiddenChannels.size})</span>
-              </button>
-            )}
+            <button onClick={(e)=>{e.stopPropagation();eeg.cycleVisibility();}} style={{...controlBtn(),
+              color:eeg.visibilityState===2?"#666":"#F59E0B",border:`1px solid ${eeg.visibilityState===2?"#22222280":"#F59E0B40"}`}}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>
+                {eeg.visibilityState===0 && <>{I.Eye(12)} Show All ({eeg.hiddenChannels.size})</>}
+                {eeg.visibilityState===1 && <>{I.EyeDots(12)} Show Eyes</>}
+                {eeg.visibilityState===2 && <>{I.EyeOff(12)} Hide</>}
+              </span>
+            </button>
             <button onClick={(e)=>{e.stopPropagation();setShowPatternTable(true);}} style={controlBtn(showPatternTable)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List()} Pattern Table</span>
             </button>
@@ -2886,6 +3061,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
       </div>
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
         totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalDuration={eeg.totalDuration}
         isPlaying={isPlaying} onPlayPause={()=>setIsPlaying(p=>!p)}/>
 
       {/* Floating annotation panel */}
@@ -2905,6 +3081,12 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
           sampleRate={eeg.sampleRate} epochSec={eeg.epochSec} epochStart={eeg.epochStart}
           onClose={()=>setShowAnalysis(false)}
           panelPos={analysisPanelPos} setPanelPos={setAnalysisPanelPos}/>
+      )}
+
+      {eeg.showCustomPicker && (
+        <CustomElectrodePicker customElectrodes={eeg.customElectrodes}
+          setCustomElectrodes={eeg.setCustomElectrodes}
+          onClose={()=>eeg.setShowCustomPicker(false)}/>
       )}
 
       {/* Channel context menu */}
@@ -3816,15 +3998,19 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       </div>
         <EEGControls montage={eeg.montage} setMontage={eeg.setMontage}
           eegSystem={eeg.eegSystem} setEegSystem={eeg.setEegSystem}
+          onOpenCustomPicker={()=>eeg.setShowCustomPicker(true)}
           hpf={eeg.hpf} setHpf={eeg.setHpf}
           lpf={eeg.lpf} setLpf={eeg.setLpf} notch={eeg.notch} setNotch={eeg.setNotch}
           epochSec={eeg.epochSec} setEpochSec={eeg.setEpochSec} sensitivity={eeg.sensitivity} setSensitivity={eeg.setSensitivity}
           rightContent={<>
-            {eeg.hiddenChannels.size > 0 && (
-              <button onClick={(e)=>{e.stopPropagation();eeg.allChannels.forEach(ch=>{if(eeg.hiddenChannels.has(ch))eeg.toggleChannelVisibility(ch);});}} style={{...controlBtn(),color:"#F59E0B",border:"1px solid #F59E0B40"}}>
-                <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Eye(12)} Show All ({eeg.hiddenChannels.size})</span>
-              </button>
-            )}
+            <button onClick={(e)=>{e.stopPropagation();eeg.cycleVisibility();}} style={{...controlBtn(),
+              color:eeg.visibilityState===2?"#666":"#F59E0B",border:`1px solid ${eeg.visibilityState===2?"#22222280":"#F59E0B40"}`}}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>
+                {eeg.visibilityState===0 && <>{I.Eye(12)} Show All ({eeg.hiddenChannels.size})</>}
+                {eeg.visibilityState===1 && <>{I.EyeDots(12)} Show Eyes</>}
+                {eeg.visibilityState===2 && <>{I.EyeOff(12)} Hide</>}
+              </span>
+            </button>
             <button onClick={(e)=>{e.stopPropagation();setShowPatternTable(true);}} style={controlBtn(showPatternTable)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List()} Pattern Table</span>
             </button>
@@ -3918,6 +4104,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
 
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
         totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalDuration={eeg.totalDuration}
         isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
         leftContent={connectionState >= CONN.ready && !isRecording ? (
           <button onClick={()=>{setShowImpedance(true);setImpedances(isSim ? generateImpedances(selectedDevice?.channels||19) : generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
@@ -3978,6 +4165,12 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           globalHpf={eeg.hpf} globalLpf={eeg.lpf}
           auxWithData={eeg.auxWithData} AUX_CHANNELS={eeg.AUX_CHANNELS}
           onClose={()=>setShowPatternTable(false)}/>
+      )}
+
+      {eeg.showCustomPicker && (
+        <CustomElectrodePicker customElectrodes={eeg.customElectrodes}
+          setCustomElectrodes={eeg.setCustomElectrodes}
+          onClose={()=>eeg.setShowCustomPicker(false)}/>
       )}
 
       {/* Post-recording prompt */}
