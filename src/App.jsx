@@ -2440,7 +2440,13 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   const filename = record?.filename || "REACT-BL-A7F3-20260308-001.edf";
   const edfData = edfFileStore?.[filename] || null;
   const totalDur = edfData ? edfData.totalDuration : 600;
-  const eeg = useEEGState(totalDur, edfData);
+  const recordSeed = useMemo(() => {
+    const fn = record?.filename || "";
+    let h = 0;
+    for (let i = 0; i < fn.length; i++) h = ((h << 5) - h + fn.charCodeAt(i)) | 0;
+    return Math.abs(h);
+  }, [record?.filename]);
+  const eeg = useEEGState(totalDur, edfData, recordSeed);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [showPatternTable, setShowPatternTable] = useState(false);
   const [showAnnotations, setShowAnnotations] = useState(false);
@@ -2457,6 +2463,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   useEffect(() => { totalEpochsRef.current = eeg.totalEpochs; }, [eeg.totalEpochs]);
   useEffect(() => { epochSecRef.current = eeg.epochSec; }, [eeg.epochSec]);
   useEffect(() => { setCurrentEpochRef.current = eeg.setCurrentEpoch; }, [eeg.setCurrentEpoch]);
+  useEffect(() => { eeg.setCurrentEpoch(0); }, [record?.filename]);
   const annotations = annotationsMap[filename] || [];
   const setAnnotations = (newAnns) => {
     const resolved = typeof newAnns === "function" ? newAnns(annotations) : newAnns;
@@ -2565,6 +2572,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
 
   return (
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden"}}>
+      {!toolbarCollapsed ? (<>
       {/* File info bar */}
       <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",fontSize:10,color:"#555"}}>
         {/* File type dot */}
@@ -2621,8 +2629,6 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
           </div>
         </div>
       )}
-
-      {!toolbarCollapsed ? (<>
         <EEGControls montage={eeg.montage} setMontage={eeg.setMontage}
           eegSystem={eeg.eegSystem} setEegSystem={eeg.setEegSystem} recordingSystem={record?.eegSystem || "10-20"}
           hpf={eeg.hpf} setHpf={eeg.setHpf}
@@ -3564,6 +3570,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden",position:"relative"}}>
       <style>{`@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }`}</style>
 
+      {!toolbarCollapsed ? (<>
       {/* Device Selector */}
       <DeviceSelector selectedDevice={selectedDevice} setSelectedDevice={setSelectedDevice}
         connectionState={connectionState} onConnect={handleConnect} onDisconnect={handleDisconnect}
@@ -3628,8 +3635,6 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           }}>{I.Square()} STOP</button>
         </>)}
       </div>
-
-      {!toolbarCollapsed ? (<>
         <EEGControls montage={eeg.montage} setMontage={eeg.setMontage}
           eegSystem={eeg.eegSystem} setEegSystem={eeg.setEegSystem}
           hpf={eeg.hpf} setHpf={eeg.setHpf}
