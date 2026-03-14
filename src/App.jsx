@@ -5,6 +5,51 @@ import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 // LIBRARY | REVIEW | ACQUIRE
 // ══════════════════════════════════════════════════════════════
 
+// ── IndexedDB persistence for imported EDF files ──
+const EDF_DB_NAME = "ReactEEG_EdfStore";
+const EDF_DB_STORE = "edfFiles";
+
+function openEdfDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(EDF_DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(EDF_DB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveEdfToDB(filename, arrayBuffer) {
+  try {
+    const db = await openEdfDB();
+    const tx = db.transaction(EDF_DB_STORE, "readwrite");
+    tx.objectStore(EDF_DB_STORE).put(arrayBuffer, filename);
+    await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+  } catch (e) { console.warn("Failed to save EDF to IndexedDB:", e); }
+}
+
+async function loadAllEdfsFromDB() {
+  try {
+    const db = await openEdfDB();
+    const tx = db.transaction(EDF_DB_STORE, "readonly");
+    const store = tx.objectStore(EDF_DB_STORE);
+    return new Promise((resolve) => {
+      const results = {};
+      const req = store.openCursor();
+      req.onsuccess = (e) => {
+        const cursor = e.target.result;
+        if (cursor) {
+          const parsed = parseEDFFile(cursor.value);
+          if (parsed && !parsed.error) results[cursor.key] = parsed;
+          cursor.continue();
+        } else {
+          resolve(results);
+        }
+      };
+      req.onerror = () => resolve({});
+    });
+  } catch (e) { return {}; }
+}
+
 // ── Utility: deterministic hash for de-identification ──
 function hashSubjectId(id, salt = "REACT-EEG-2026") {
   let h = 0;
@@ -170,41 +215,78 @@ function generateEEGSignal(channelIndex, sampleRate, durationSec, seed = 0, chan
     const t = i / sampleRate;
     if (isEye) {
       // Physiologically realistic EOG — corneal-retinal dipole model
-      // Blink timing uses seed-only derivation so all eye channels blink simultaneously
-      const blinkRate = 0.25 + rand(seed + 1) * 0.15; // 0.25-0.40 Hz
+      // LOC1/LOC2 = left eye (above/lateral) — should track together
+      // ROC1/ROC2 = right eye (above/lateral) — should track together
+      // Normal conjugate gaze: both eyes move together
+      // Occasional desynchrony events inserted for clinical interest
+      const isLeft = channelName === "LOC1" || channelName === "LOC2";
+
+      // ── Blinks — bilateral, simultaneous (seed-locked timing) ──
+      const blinkRate = 0.25 + rand(seed + 1) * 0.15;
       const blinkPhase = (t * blinkRate) % 1;
       const blinkDur = 0.12;
       let blink = 0;
       if (blinkPhase < blinkDur) {
         const shape = Math.sin(blinkPhase * Math.PI / blinkDur);
-        blink = isVertical ? 400 * shape : -150 * shape; // +400μV above eye, -150μV below
+        // Both channels on same eye see the blink: vertical larger, horizontal smaller
+        blink = isVertical ? 400 * shape : 180 * shape;
       }
-      // Horizontal saccades — LOC2/ROC2 opposite polarity
+
+      // ── Conjugate horizontal saccades — both eyes move together ──
       const saccRate = 0.5 + rand(seed + 3) * 0.3;
+      const saccCycle = Math.floor(t * saccRate);
       const saccPhase = (t * saccRate) % 1;
-      let saccade = 0;
+      let hSaccade = 0;
       if (saccPhase < 0.03) {
         const step = Math.sin(saccPhase * Math.PI / 0.03);
-        const amp = 100 + rand(Math.floor(t * saccRate) * 13 + seed) * 100;
-        if (channelName === "LOC2") saccade = amp * step;
-        else if (channelName === "ROC2") saccade = -amp * step;
-        else saccade = amp * 0.1 * step; // minimal leak to vertical channels
+        const amp = 100 + rand(saccCycle * 13 + seed) * 100;
+        const dir = rand(saccCycle * 37 + seed) > 0.5 ? 1 : -1;
+        // Horizontal channels get full amplitude; vertical channels get volume-conducted leak
+        const hAmp = isVertical ? amp * 0.12 : amp;
+        // Both eyes move same direction — left and right see same-sign horizontal deflection
+        hSaccade = dir * hAmp * step;
       }
-      // Vertical saccades — LOC1/ROC1 large, horizontal channels small leak
+
+      // ── Conjugate vertical saccades — both eyes, same polarity ──
       const vRate = 0.15 + rand(seed + 7) * 0.1;
+      const vCycle = Math.floor(t * vRate);
       const vPhase = (t * vRate + 0.3) % 1;
-      let vSacc = 0;
+      let vSaccade = 0;
       if (vPhase < 0.04) {
         const vStep = Math.sin(vPhase * Math.PI / 0.04);
-        const vAmp = 120 + rand(Math.floor(t * vRate) * 17 + seed) * 130;
-        vSacc = isVertical ? vAmp * vStep : vAmp * 0.15 * vStep;
+        const vAmp = 120 + rand(vCycle * 17 + seed) * 130;
+        // Vertical channels get full amplitude; horizontal channels get leak
+        vSaccade = isVertical ? vAmp * vStep : vAmp * 0.18 * vStep;
       }
-      // Slow rolling eye movements (0.2-0.5Hz)
-      const slowF = 0.3 + rand(seed + channelIndex) * 0.2;
-      const slow = 25 * Math.sin(2 * Math.PI * slowF * t + rand(channelIndex * 17) * Math.PI * 2);
-      // Baseline drift + noise — NO EKG contamination
-      const drift = 12 * Math.sin(2 * Math.PI * 0.05 * t + channelIndex * 0.7);
-      data[i] = blink + saccade + vSacc + slow + drift + (rand(i) - 0.5) * 10;
+
+      // ── Slow rolling eye movements — conjugate, both eyes together ──
+      const slowF = 0.3 + rand(seed + 11) * 0.2;
+      const slow = 25 * Math.sin(2 * Math.PI * slowF * t + rand(seed * 17) * Math.PI * 2);
+
+      // ── Desynchrony events — occasional non-conjugate movement ──
+      // ~1 event every 8-15 seconds: one eye moves independently
+      const desyncRate = 0.08 + rand(seed + 19) * 0.05;
+      const desyncCycle = Math.floor(t * desyncRate);
+      const desyncPhase = (t * desyncRate) % 1;
+      let desync = 0;
+      if (desyncPhase < 0.06) {
+        const dStep = Math.sin(desyncPhase * Math.PI / 0.06);
+        const dAmp = 60 + rand(desyncCycle * 23 + seed) * 80;
+        // Only affects one eye per event — alternates which eye
+        const affectsLeft = rand(desyncCycle * 41 + seed) > 0.5;
+        if (affectsLeft === isLeft) {
+          desync = dAmp * dStep * (isVertical ? 1 : 0.7);
+        }
+        // Other eye stays still — creates visible desynchrony
+      }
+
+      // ── Per-channel micro-variation (NOT independent signals, just noise) ──
+      const drift = 8 * Math.sin(2 * Math.PI * 0.05 * t + (isLeft ? 0.3 : 0.9));
+      const noise = (rand(i) - 0.5) * 8;
+      // Small per-electrode uniqueness so LOC1≠LOC2 exactly, but highly correlated
+      const electrodeOffset = isVertical ? 0 : 3 * Math.sin(2 * Math.PI * 0.15 * t + (isLeft ? 1.2 : 2.4));
+
+      data[i] = blink + hSaccade + vSaccade + slow + desync + drift + noise + electrodeOffset;
     } else if (isEKG) {
       const beatPhase = (t * 72 / 60) % 1;
       const qrs = beatPhase < 0.02 ? -30 : beatPhase < 0.04 ? 120 : beatPhase < 0.06 ? -20 : 0;
@@ -516,49 +598,7 @@ const I = {
   Ruler: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 2l20 20"/><path d="M5.5 5.5l3-3"/><path d="M9.5 9.5l3-3"/><path d="M13.5 13.5l3-3"/><path d="M17.5 17.5l3-3"/></svg>,
 };
 
-// ── Seed data — 5 test records ──
-
-const EDF_EMBEDDED = [
-  // De-identified EDF records — data loaded via Import in Library tab
-  // Source files: Subject00_1.edf, Subject00_2.edf, Subject01_1.edf,
-  //               Subject01_2.edf, Subject02_1.edf, Subject02_2.edf
-  { filename:"REACT-BL-5F240936-20260101-001.edf", subjectId:"FB-001", subjectHash:"5F240936",
-    studyType:"BL", date:"2026-01-01", sport:"Football", position:"QB",
-    sourceFile:"Subject00_1.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:182.0 },
-  { filename:"REACT-FU-5F240936-20260115-001.edf", subjectId:"FB-001", subjectHash:"5F240936",
-    studyType:"FU", date:"2026-01-15", sport:"Football", position:"QB",
-    sourceFile:"Subject00_2.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:62.0 },
-  { filename:"REACT-BL-5F240937-20260201-001.edf", subjectId:"FB-002", subjectHash:"5F240937",
-    studyType:"BL", date:"2026-02-01", sport:"Football", position:"RB",
-    sourceFile:"Subject01_1.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:182.0 },
-  { filename:"REACT-FU-5F240937-20260210-001.edf", subjectId:"FB-002", subjectHash:"5F240937",
-    studyType:"FU", date:"2026-02-10", sport:"Football", position:"RB",
-    sourceFile:"Subject01_2.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:62.0 },
-  { filename:"REACT-BL-5F240938-20260215-001.edf", subjectId:"FB-003", subjectHash:"5F240938",
-    studyType:"BL", date:"2026-02-15", sport:"Football", position:"WR",
-    sourceFile:"Subject02_1.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:182.0 },
-  { filename:"REACT-FU-5F240938-20260222-001.edf", subjectId:"FB-003", subjectHash:"5F240938",
-    studyType:"FU", date:"2026-02-22", sport:"Football", position:"WR",
-    sourceFile:"Subject02_2.edf", labels:["EEG Fp1","EEG Fp2","EEG F3","EEG F4","EEG F7","EEG F8","EEG T3","EEG T4","EEG C3","EEG C4","EEG T5","EEG T6","EEG P3","EEG P4","EEG O1","EEG O2","EEG Fz","EEG Cz","EEG Pz","EEG A2-A1","ECG ECG"],
-    sr:500, nCh:21, totalDur:62.0 },
-];
-
-// ── Decode embedded EDF Int16 data into Float32 channel arrays ──
-function decodeEmbeddedEDF(entry) {
-  // EDF data is not embedded — records load from imported files via Library > Import
-  return null;
-}
-
-// Pre-decode all embedded EDFs at module load time
-const DECODED_EDF_STORE = {};
-for (const entry of EDF_EMBEDDED) {
-  DECODED_EDF_STORE[entry.filename] = decodeEmbeddedEDF(entry);
-}
+// ── Seed data — single simulated test record ──
 
 function generateSeedData() {
   const simRecord = {
@@ -571,9 +611,9 @@ function generateSeedData() {
     date: "2026-03-01",
     filename: generateFilename("SIM-001", "BL", "2026-03-01"),
     channels: 21,
-    duration: 10,
+    duration: 5,
     sampleRate: 256,
-    fileSize: 0.6,
+    fileSize: 0.3,
     montage: "10-20",
     status: "pending",
     isTest: true,
@@ -582,30 +622,7 @@ function generateSeedData() {
     uploadedAt: "2026-03-01T09:00:00.000Z",
   };
 
-  const edfRecords = EDF_EMBEDDED.map((entry, i) => ({
-    id: "EDF-" + (i + 1),
-    subjectHash: entry.subjectHash,
-    subjectId: entry.subjectId,
-    sport: entry.sport,
-    position: entry.position,
-    studyType: entry.studyType,
-    date: entry.date,
-    filename: entry.filename,
-    channels: entry.nCh,
-    duration: Math.round(entry.totalDur / 60 * 10) / 10,
-    sampleRate: entry.sr,
-    fileSize: Math.round(entry.totalDur * entry.nCh * entry.sr * 2 / 1024 / 1024 * 10) / 10,
-    montage: "10-20",
-    status: "pending",
-    isTest: false,
-    isImported: true,
-    sourceFile: entry.sourceFile,
-    hasEdfData: false,
-    notes: "Import " + entry.sourceFile + " via Library to load EDF data",
-    uploadedAt: new Date(entry.date + "T09:00:00").toISOString(),
-  }));
-
-  return [simRecord, ...edfRecords];
+  return [simRecord];
 }
 
 // ── Shared styles ──
@@ -1180,6 +1197,22 @@ function EEGControls({ montage, setMontage, eegSystem, setEegSystem, recordingSy
   );
 }
 
+// Cross-correlation (Pearson coefficient) for eye movement synchronicity analysis
+function computeCrossCorrelation(a, b) {
+  if (!a || !b || a.length === 0 || b.length === 0) return 0;
+  const N = Math.min(a.length, b.length);
+  let sumA = 0, sumB = 0;
+  for (let i = 0; i < N; i++) { sumA += a[i]; sumB += b[i]; }
+  const meanA = sumA / N, meanB = sumB / N;
+  let num = 0, denA = 0, denB = 0;
+  for (let i = 0; i < N; i++) {
+    const da = a[i] - meanA, db = b[i] - meanB;
+    num += da * db; denA += da * da; denB += db * db;
+  }
+  const den = Math.sqrt(denA * denB);
+  return den > 0 ? num / den : 0;
+}
+
 // ══════════════════════════════════════════════════════════════
 // QUANTITATIVE EEG ANALYSIS PANEL — floating overlay
 // ══════════════════════════════════════════════════════════════
@@ -1257,9 +1290,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       return { channel: ch, bands };
     });
 
-    // Compute averages
+    // Compute averages (exclude EKG and eye leads — not brain EEG)
     const avgBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
-    const eegChannels = channelData.filter(c => c.channel !== "EKG");
+    const AUX_EXCLUDE = new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]);
+    const eegChannels = channelData.filter(c => !AUX_EXCLUDE.has(c.channel));
     eegChannels.forEach(c => {
       Object.keys(avgBands).forEach(b => { avgBands[b] += c.bands[b]; });
     });
@@ -1305,7 +1339,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
     // Flag epochs with excessive slow activity
     const flags = [];
     channelData.forEach(c => {
-      if (c.channel === "EKG") return;
+      if (AUX_EXCLUDE.has(c.channel)) return;
       const total = c.bands.total || 1;
       const deltaPct = (c.bands.delta / total) * 100;
       const thetaPct = (c.bands.theta / total) * 100;
@@ -1314,7 +1348,66 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       if (thetaPct > 40) flags.push({ channel: c.channel, type: "Elevated Theta", value: `${thetaPct.toFixed(0)}%`, severity: "high" });
     });
 
-    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, flags };
+    // Frontotemporal slowing composite — key concussion biomarker
+    const ftChannels = channelData.filter(c => /^(Fp1|Fp2|F3|F4|F7|F8|T3|T4|Fz)/.test(c.channel.split("-")[0]));
+    if (ftChannels.length > 0) {
+      const ftSlowPower = ftChannels.reduce((s, c) => s + c.bands.delta + c.bands.theta, 0) / ftChannels.length;
+      const ftTotalPower = ftChannels.reduce((s, c) => s + (c.bands.total || 1), 0) / ftChannels.length;
+      const ftSlowPct = (ftSlowPower / ftTotalPower) * 100;
+      if (ftSlowPct > 55) flags.push({ channel: "F/T", type: "Frontotemporal Slowing", value: `${ftSlowPct.toFixed(0)}% slow (δ+θ)`, severity: "high" });
+      else if (ftSlowPct > 40) flags.push({ channel: "F/T", type: "Mild FT Slowing", value: `${ftSlowPct.toFixed(0)}% slow (δ+θ)`, severity: "med" });
+    }
+
+    // Eye Movement Synchronicity Analysis
+    const loc1Idx = channels.indexOf("LOC1");
+    const roc1Idx = channels.indexOf("ROC1");
+    const loc2Idx = channels.indexOf("LOC2");
+    const roc2Idx = channels.indexOf("ROC2");
+
+    let eyeSync = null;
+    const hasVertical = loc1Idx >= 0 && roc1Idx >= 0;
+    const hasHorizontal = loc2Idx >= 0 && roc2Idx >= 0;
+
+    if (hasVertical || hasHorizontal) {
+      const maxS = Math.min(512, waveformData[0]?.length || 0);
+
+      // Vertical sync (LOC1 ↔ ROC1): should be highly correlated for conjugate gaze
+      const vertCorr = hasVertical
+        ? computeCrossCorrelation(waveformData[loc1Idx]?.slice(0, maxS), waveformData[roc1Idx]?.slice(0, maxS))
+        : null;
+
+      // Horizontal sync (LOC2 ↔ ROC2): should be positively correlated for conjugate gaze
+      const horizCorr = hasHorizontal
+        ? computeCrossCorrelation(waveformData[loc2Idx]?.slice(0, maxS), waveformData[roc2Idx]?.slice(0, maxS))
+        : null;
+
+      // Blink amplitude symmetry: compare RMS of vertical channels
+      let blinkSymmetry = null;
+      if (hasVertical) {
+        const loc1Data = waveformData[loc1Idx]?.slice(0, maxS);
+        const roc1Data = waveformData[roc1Idx]?.slice(0, maxS);
+        if (loc1Data && roc1Data) {
+          let rmsL = 0, rmsR = 0;
+          for (let i = 0; i < maxS; i++) { rmsL += loc1Data[i] * loc1Data[i]; rmsR += roc1Data[i] * roc1Data[i]; }
+          rmsL = Math.sqrt(rmsL / maxS); rmsR = Math.sqrt(rmsR / maxS);
+          const maxRms = Math.max(rmsL, rmsR, 1);
+          blinkSymmetry = 1 - Math.abs(rmsL - rmsR) / maxRms;
+        }
+      }
+
+      // Combined synchronicity score (0-100%)
+      // Both vertical (LOC1↔ROC1) and horizontal (LOC2↔ROC2) should be positively correlated
+      // for normal conjugate gaze — low correlation indicates desynchrony
+      const scores = [];
+      if (vertCorr !== null) scores.push(Math.max(0, vertCorr));
+      if (horizCorr !== null) scores.push(Math.max(0, horizCorr));
+      if (blinkSymmetry !== null) scores.push(blinkSymmetry);
+      const syncScore = scores.length > 0 ? (scores.reduce((a, b) => a + b, 0) / scores.length) * 100 : null;
+
+      eyeSync = { vertCorr, horizCorr, blinkSymmetry, syncScore };
+    }
+
+    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, flags, eyeSync };
   }, [waveformData, channels, sampleRate]);
 
   if (!analysis) return null;
@@ -1383,31 +1476,76 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
               return <PowerBar key={band} value={val} max={total * 0.6} color={color} label={band.charAt(0).toUpperCase() + band.slice(1, 3)} pct={pct}/>;
             })}
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:12}}>
-            <div style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"8px 10px"}}>
-              <div style={{fontSize:8,color:"#555",letterSpacing:"0.08em"}}>PEAK ALPHA</div>
-              <div style={{fontSize:16,fontWeight:700,color:"#10B981",fontFamily:"'IBM Plex Mono', monospace"}}>{analysis.peakAlphaFreq.toFixed(1)} Hz</div>
-            </div>
-            <div style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"8px 10px"}}>
-              <div style={{fontSize:8,color:"#555",letterSpacing:"0.08em"}}>THETA/BETA</div>
-              <div style={{fontSize:16,fontWeight:700,color:analysis.thetaBetaRatio>3?"#F59E0B":"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace"}}>{analysis.thetaBetaRatio.toFixed(2)}</div>
-            </div>
-            <div style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"8px 10px"}}>
-              <div style={{fontSize:8,color:"#555",letterSpacing:"0.08em"}}>ASYMMETRY (R-L)</div>
-              <div style={{fontSize:16,fontWeight:700,color:Math.abs(analysis.asymmetryIndex)>15?"#F59E0B":"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace"}}>{analysis.asymmetryIndex>0?"+":""}{analysis.asymmetryIndex.toFixed(1)}%</div>
-            </div>
-            <div style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"8px 10px"}}>
-              <div style={{fontSize:8,color:"#555",letterSpacing:"0.08em"}}>CHANNELS</div>
-              <div style={{fontSize:16,fontWeight:700,color:"#888",fontFamily:"'IBM Plex Mono', monospace"}}>{channels.filter(c=>c!=="EKG").length}</div>
-            </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:4,marginTop:8}}>
+            {[
+              {label:"α PEAK",value:`${analysis.peakAlphaFreq.toFixed(1)}`,unit:"Hz",color:"#10B981"},
+              {label:"θ/β",value:analysis.thetaBetaRatio.toFixed(2),unit:"",color:analysis.thetaBetaRatio>3?"#F59E0B":"#7ec8d9"},
+              {label:"ASYM",value:`${analysis.asymmetryIndex>0?"+":""}${analysis.asymmetryIndex.toFixed(1)}`,unit:"%",color:Math.abs(analysis.asymmetryIndex)>15?"#F59E0B":"#7ec8d9"},
+              {label:"CH",value:channels.filter(c=>!new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]).has(c)).length,unit:"",color:"#888"},
+            ].map((m,i)=>(
+              <div key={i} style={{background:"#0a0a0a",border:"1px solid #1a1a1a",padding:"4px 6px",textAlign:"center"}}>
+                <div style={{fontSize:7,color:"#555",letterSpacing:"0.06em"}}>{m.label}</div>
+                <div style={{fontSize:12,fontWeight:700,color:m.color,fontFamily:"'IBM Plex Mono', monospace"}}>{m.value}<span style={{fontSize:8,fontWeight:400}}>{m.unit}</span></div>
+              </div>
+            ))}
           </div>
+
+          {/* Eye Movement Synchronicity */}
+          {analysis.eyeSync && (() => {
+            const s = analysis.eyeSync;
+            const score = s.syncScore;
+            const scoreColor = score >= 75 ? "#10B981" : score >= 50 ? "#F59E0B" : "#f87171";
+            const statusLabel = score >= 75 ? "SYNC" : score >= 50 ? "MILD DESYNC" : "DESYNC";
+            return (
+              <div style={{marginTop:8,borderTop:"1px solid #1a1a1a",paddingTop:8}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+                  <span style={{fontSize:8,color:"#F59E0B",fontWeight:700,letterSpacing:"0.06em"}}>EYE SYNCHRONICITY</span>
+                  <div style={{display:"flex",alignItems:"baseline",gap:4}}>
+                    <span style={{fontSize:7,color:scoreColor,letterSpacing:"0.04em"}}>{statusLabel}</span>
+                    <span style={{fontSize:14,fontWeight:700,color:scoreColor,fontFamily:"'IBM Plex Mono', monospace"}}>{score.toFixed(0)}%</span>
+                  </div>
+                </div>
+                <div style={{height:3,background:"#111",borderRadius:2,marginBottom:6}}>
+                  <div style={{height:"100%",background:scoreColor,width:`${Math.min(100, score)}%`,borderRadius:2,transition:"width 0.3s"}}/>
+                </div>
+                {/* Detail rows — compact */}
+                {s.vertCorr !== null && (
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
+                    <span style={{fontSize:8,color:"#555"}}>Vert (LOC1↔ROC1)</span>
+                    <span style={{fontSize:10,fontWeight:700,color:s.vertCorr>0.7?"#10B981":s.vertCorr>0.4?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                      r={s.vertCorr.toFixed(3)}
+                    </span>
+                  </div>
+                )}
+                {s.horizCorr !== null && (
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
+                    <span style={{fontSize:8,color:"#555"}}>Horiz (LOC2↔ROC2)</span>
+                    <span style={{fontSize:10,fontWeight:700,color:s.horizCorr>0.7?"#10B981":s.horizCorr>0.4?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                      r={s.horizCorr.toFixed(3)}
+                    </span>
+                  </div>
+                )}
+                {s.blinkSymmetry !== null && (
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"2px 0"}}>
+                    <span style={{fontSize:8,color:"#555"}}>Blink Symmetry</span>
+                    <span style={{fontSize:10,fontWeight:700,color:s.blinkSymmetry>0.8?"#10B981":s.blinkSymmetry>0.5?"#F59E0B":"#f87171",fontFamily:"'IBM Plex Mono', monospace"}}>
+                      {(s.blinkSymmetry * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                )}
+                <div style={{fontSize:8,color:"#333",marginTop:8,lineHeight:1.4}}>
+                  Monitors bilateral eye movement correlation. Low synchronicity may indicate subtle oculomotor desynchrony.
+                </div>
+              </div>
+            );
+          })()}
         </>)}
 
         {/* Per-Channel View */}
         {activeView === "channels" && (
           <div>
             <div style={{fontSize:9,color:"#555",fontWeight:700,letterSpacing:"0.08em",marginBottom:8}}>BAND POWER BY CHANNEL</div>
-            {analysis.channelData.filter(c => c.channel !== "EKG").map(c => {
+            {analysis.channelData.filter(c => !new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]).has(c.channel)).map(c => {
               const total = c.bands.total || 1;
               return (
                 <div key={c.channel} style={{marginBottom:8}}>
@@ -1471,6 +1609,52 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
               ))}
             </div>
 
+            {/* Eye Movement Analysis */}
+            {analysis.eyeSync && (() => {
+              const es = analysis.eyeSync;
+              const sc = es.syncScore;
+              const sCol = sc >= 75 ? "#10B981" : sc >= 50 ? "#F59E0B" : "#f87171";
+              const metrics = [];
+              if (es.vertCorr !== null) metrics.push({
+                label: "Vertical Correlation (LOC1↔ROC1)",
+                value: `r = ${es.vertCorr.toFixed(4)}`,
+                note: "Conjugate vertical gaze: expect r > 0.7 for normal bilateral tracking",
+                color: es.vertCorr > 0.7 ? "#10B981" : es.vertCorr > 0.4 ? "#F59E0B" : "#f87171"
+              });
+              if (es.horizCorr !== null) metrics.push({
+                label: "Horizontal Correlation (LOC2↔ROC2)",
+                value: `r = ${es.horizCorr.toFixed(4)}`,
+                note: "Conjugate horizontal gaze: expect r > 0.7 for normal bilateral tracking. Low correlation suggests desynchrony.",
+                color: es.horizCorr > 0.7 ? "#10B981" : es.horizCorr > 0.4 ? "#F59E0B" : "#f87171"
+              });
+              if (es.blinkSymmetry !== null) metrics.push({
+                label: "Blink Amplitude Symmetry",
+                value: `${(es.blinkSymmetry * 100).toFixed(2)}%`,
+                note: "RMS amplitude ratio of vertical channels: >80% indicates symmetric blink reflex",
+                color: es.blinkSymmetry > 0.8 ? "#10B981" : es.blinkSymmetry > 0.5 ? "#F59E0B" : "#f87171"
+              });
+              metrics.push({
+                label: "Combined Synchronicity Score",
+                value: `${sc.toFixed(1)}%`,
+                note: sc >= 75 ? "Normal bilateral eye movement coordination" : sc >= 50 ? "Mild oculomotor desynchrony — may warrant further evaluation" : "Significant desynchrony — consider oculomotor assessment",
+                color: sCol
+              });
+              return (
+                <div style={{marginBottom:16}}>
+                  <div style={{fontSize:10,color:"#F59E0B",marginBottom:6,fontWeight:700}}>Eye Movement Analysis</div>
+                  {metrics.map((m, i) => (
+                    <div key={i} style={{padding:"6px 0",borderBottom:"1px solid #111"}}>
+                      <div style={{display:"flex",justifyContent:"space-between"}}>
+                        <span style={{fontSize:10,color:"#888"}}>{m.label}</span>
+                        <span style={{fontSize:11,fontWeight:700,color:m.color,fontFamily:"'IBM Plex Mono', monospace"}}>{m.value}</span>
+                      </div>
+                      <div style={{fontSize:8,color:"#444",marginTop:2}}>{m.note}</div>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
             <div style={{fontSize:8,color:"#333",padding:"8px 0",borderTop:"1px solid #1a1a1a",lineHeight:1.5}}>
               Quantitative values are computed from the current epoch. These are mathematical observations, not clinical interpretations. All metrics should be reviewed by a qualified professional.
             </div>
@@ -1519,6 +1703,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
             thetaBetaRatio: analysis.thetaBetaRatio,
             asymmetryIndex: analysis.asymmetryIndex,
             flags: analysis.flags,
+            eyeSync: analysis.eyeSync,
             perChannel: analysis.channelData.map(c => ({ channel: c.channel, ...c.bands })),
           };
           const blob = new Blob([JSON.stringify(report, null, 2)], {type:"application/json"});
@@ -1880,7 +2065,14 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
 
   // Whenever edfData or montage changes, auto-hide channels with no real data
   // (unless user has explicitly forced them visible)
+  // For simulated records (simSeedOverride !== null), all channels have data — show all
   useEffect(() => {
+    if (simSeedOverride !== null) {
+      // Simulation: show all channels, set visibility to "all shown"
+      setHiddenChannels(new Set());
+      setVisibilityState(2);
+      return;
+    }
     setHiddenChannels(() => {
       const next = new Set();
       allChannels.forEach(ch => {
@@ -1892,7 +2084,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
       return next;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [channelsWithData]);
+  }, [channelsWithData, simSeedOverride]);
 
   const channels = allChannels.filter(ch => !hiddenChannels.has(ch));
   const totalEpochs = Math.ceil(totalDuration / epochSec);
@@ -2034,19 +2226,11 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
         }
       }
 
-      // Fall back: real EDF → bio-cal for missing eye leads, flat line for others;
-      // simulation explicitly requested → generate; otherwise flat line (hardware not streaming)
+      // Fall back: real EDF loaded but channel not matched — flat line; sim mode → generate
       if (!raw) {
         if (edfData && edfData.channelData) {
-          const isEyeLeadCh = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
-          if (isEyeLeadCh) {
-            // Bio-cal: 50μV square wave at 1Hz for missing eye leads
-            const len = sampleRate * epochSec;
-            raw = new Float32Array(len);
-            for (let bi = 0; bi < len; bi++) raw[bi] = ((bi / sampleRate) % 1) < 0.5 ? 50 : -50;
-          } else {
-            raw = new Float32Array(sampleRate * epochSec);
-          }
+          // Real EDF loaded but this channel not found — flat line (no simulated data)
+          raw = new Float32Array(sampleRate * epochSec);
         } else if (simSeedOverride !== null) {
           raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137 + currentEpoch * 7919, ch);
         } else {
@@ -2276,8 +2460,8 @@ function LibraryTab({ records, setRecords, onOpenReview, updateRecordStatus, edf
             </tr></thead>
             <tbody>{filtered.map(r=>{
               const st=STUDY_TYPES[r.studyType]||{label:"?",color:"#666"};
-              const dotColor = r.isTest ? "#22c55e" : r.isAcquired ? "#3b82f6" : "#eab308";
-              const dotTitle = r.isTest ? "Test" : r.isAcquired ? "Acquired" : "Imported";
+              const dotColor = !edfFileStore?.[r.filename] && !r.isSimulated ? "#ef4444" : r.isTest ? "#3b82f6" : r.isAcquired ? "#22c55e" : "#eab308";
+              const dotTitle = !edfFileStore?.[r.filename] && !r.isSimulated ? "No EDF data" : r.isTest ? "Test" : r.isAcquired ? "Recorded" : "Imported";
               return (
                 <tr key={r.id} style={{borderBottom:"1px solid #111",cursor:"pointer",transition:"background 0.1s"}}
                   onMouseEnter={e=>e.currentTarget.style.background="#111"}
@@ -2310,8 +2494,8 @@ function LibraryTab({ records, setRecords, onOpenReview, updateRecordStatus, edf
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12,padding:"20px 28px"}}>
             {filtered.map(r=>{
               const st=STUDY_TYPES[r.studyType]||{label:"?",color:"#666"};
-              const dotColor = r.isTest ? "#22c55e" : r.isAcquired ? "#3b82f6" : "#eab308";
-              const dotTitle = r.isTest ? "Test" : r.isAcquired ? "Acquired" : "Imported";
+              const dotColor = !edfFileStore?.[r.filename] && !r.isSimulated ? "#ef4444" : r.isTest ? "#3b82f6" : r.isAcquired ? "#22c55e" : "#eab308";
+              const dotTitle = !edfFileStore?.[r.filename] && !r.isSimulated ? "No EDF data" : r.isTest ? "Test" : r.isAcquired ? "Recorded" : "Imported";
               return (
                 <div key={r.id} style={{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:0,padding:16,cursor:"pointer",transition:"border-color 0.15s"}}
                   onMouseEnter={e=>e.currentTarget.style.borderColor="#333"} onMouseLeave={e=>e.currentTarget.style.borderColor="#1a1a1a"}
@@ -2628,10 +2812,21 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
             setForm(prev => ({...prev, duration: totalMin}));
             setFileInfo(prev => ({...prev, detectedDuration: totalMin}));
           }
-          // Detect sample rate from first signal's samples-per-record / record-duration
-          // bytes after header for per-signal info: 256 + nSignals*16 + ... we read sampleRate from full parse later
-          // For now, estimate from total size vs expected
-          // (Full parse happens in handleSubmit; just auto-set 256 as default but parse will correct it)
+        }
+        // Detect sample rate: read per-signal header
+        // "nr of samples in each data record" starts at byte 256 + nSignals*216, 8 bytes per signal
+        if (nSignals > 0 && nSignals < 200 && recordDuration > 0) {
+          const srOffset = 256 + nSignals * 216;
+          const srEnd = srOffset + 8;
+          const hdrBytes = new Uint8Array(ev.target.result);
+          if (hdrBytes.length >= srEnd) {
+            const samplesPerRecord = parseInt(decoder.decode(hdrBytes.slice(srOffset, srEnd)).trim());
+            if (samplesPerRecord > 0) {
+              const detectedSr = Math.round(samplesPerRecord / recordDuration);
+              setForm(prev => ({...prev, sampleRate: detectedSr}));
+              setFileInfo(prev => ({...prev, detectedSampleRate: detectedSr}));
+            }
+          }
         }
         // Patient ID from bytes 8-88
         const patientId = decoder.decode(header.slice(8, 88)).trim();
@@ -2647,7 +2842,8 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
         // Not a valid EDF, that's fine
       }
     };
-    reader.readAsArrayBuffer(file.slice(0, 512));
+    // Read enough header bytes for per-signal fields (up to ~60 signals)
+    reader.readAsArrayBuffer(file.slice(0, 16384));
   };
 
   const handleSubmit = () => {
@@ -2672,6 +2868,8 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
         const parsed = parseEDFFile(ev.target.result);
         if (!parsed.error) {
           setEdfFileStore(prev => ({ ...prev, [deIdFilename]: parsed }));
+          // Persist raw EDF to IndexedDB so it survives page reloads
+          saveEdfToDB(deIdFilename, ev.target.result);
           // Back-update record with real sampleRate from EDF
           const realSr = parsed.sampleRate || 256;
           if (realSr !== form.sampleRate) {
@@ -2730,25 +2928,24 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
       <div><label style={formLabel}>Internal Subject ID</label><SubjectIdInput value={form.subjectId} onChange={v=>setForm({...form,subjectId:v})}/></div>
       <div><label style={formLabel}>Study Type</label><select style={inputStyle} value={form.studyType} onChange={e=>setForm({...form,studyType:e.target.value})}>{Object.entries(STUDY_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}</select></div>
       <div><label style={formLabel}>Recording Date</label><input style={inputStyle} type="date" value={form.date} onChange={e=>setForm({...form,date:e.target.value})}/></div>
-      <div><label style={formLabel}>Montage</label><select style={inputStyle} value={form.montage} onChange={e=>setForm({...form,montage:e.target.value})} disabled={!!(selectedFile&&fileInfo?.detectedChannels)}><option value="10-20">10-20</option><option value="10-10">10-10</option><option value="hd-40">HD-40</option><option value="Custom">Custom</option></select></div>
-      {/* Only show these if NOT auto-detected from EDF */}
-      {!(selectedFile && fileInfo?.detectedChannels) && (
-        <div><label style={formLabel}>Channels</label><input style={inputStyle} type="number" value={form.channels} onChange={e=>setForm({...form,channels:parseInt(e.target.value)||0})}/></div>
-      )}
-      {!(selectedFile && fileInfo?.detectedChannels) && (
-        <div><label style={formLabel}>Sample Rate (Hz)</label><select style={inputStyle} value={form.sampleRate} onChange={e=>setForm({...form,sampleRate:parseInt(e.target.value)})}><option value={128}>128 Hz</option><option value={256}>256 Hz</option><option value={512}>512 Hz</option><option value={1024}>1024 Hz</option><option value={2048}>2048 Hz</option></select></div>
-      )}
-      {!(selectedFile && fileInfo?.detectedDuration) && (
-        <div><label style={formLabel}>Duration (min)</label><input style={inputStyle} type="number" value={form.duration} onChange={e=>setForm({...form,duration:parseInt(e.target.value)||0})}/></div>
-      )}
-      {selectedFile && fileInfo?.detectedChannels && (
-        <div style={{gridColumn:"1/-1",background:"#0a1a0a",border:"1px solid #1a4a1a40",padding:"8px 12px",fontSize:10,color:"#10B981"}}>
-          <span style={{fontWeight:700}}>AUTO-DETECTED FROM EDF:</span> {fileInfo.detectedChannels} ch &nbsp;|&nbsp; {form.sampleRate}Hz &nbsp;|&nbsp; {form.duration} min
-          {fileInfo.detectedMontage && <span> &nbsp;|&nbsp; {fileInfo.detectedMontage} montage</span>}
-        </div>
-      )}
       <div style={{gridColumn:"1/-1"}}><label style={formLabel}>Notes</label><input style={inputStyle} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder="Optional notes"/></div>
     </div>
+
+    {/* Read-only file metadata — shown after EDF file selection */}
+    {selectedFile && fileInfo && (
+      <div style={{background:"#0a0a0a",border:"1px solid #1a3040",borderRadius:0,padding:"12px 16px",marginBottom:16}}>
+        <div style={{fontSize:10,color:"#555",fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase",marginBottom:8}}>FILE METADATA</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px 24px",fontFamily:"'IBM Plex Mono', monospace",fontSize:12}}>
+          <div><span style={{color:"#666"}}>Montage: </span><span style={{color:"#7ec8d9"}}>{fileInfo.detectedMontage || form.montage}</span></div>
+          <div><span style={{color:"#666"}}>Channels: </span><span style={{color:"#7ec8d9"}}>{fileInfo.detectedChannels || form.channels}</span></div>
+          <div><span style={{color:"#666"}}>Sample Rate: </span><span style={{color:"#7ec8d9"}}>{fileInfo.detectedSampleRate || form.sampleRate} Hz</span></div>
+          <div><span style={{color:"#666"}}>Duration: </span><span style={{color:"#7ec8d9"}}>{fileInfo.detectedDuration || form.duration} min</span></div>
+          <div><span style={{color:"#666"}}>File Size: </span><span style={{color:"#7ec8d9"}}>{fileInfo.size} MB</span></div>
+          <div><span style={{color:"#666"}}>Format: </span><span style={{color:"#7ec8d9"}}>{fileInfo.isEdf ? "EDF/EDF+" : "Unknown"}</span></div>
+          {fileInfo.startDate && <div><span style={{color:"#666"}}>Start Date: </span><span style={{color:"#7ec8d9"}}>{fileInfo.startDate}</span></div>}
+        </div>
+      </div>
+    )}
     <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
       <button onClick={onClose} style={{padding:"8px 16px",background:"transparent",border:"1px solid #333",borderRadius:0,color:"#888",cursor:"pointer",fontSize:13}}>Cancel</button>
       <button onClick={handleSubmit} disabled={!form.subjectId} style={{padding:"8px 20px",background:form.subjectId?"#1a4a54":"#1a1a1a",border:"1px solid "+(form.subjectId?"#4a9bab":"#333"),borderRadius:0,color:form.subjectId?"#7ec8d9":"#555",cursor:form.subjectId?"pointer":"default",fontSize:13,fontWeight:600}}>
@@ -2762,7 +2959,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
 // TAB: REVIEW
 // ══════════════════════════════════════════════════════════════
 function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, edfFileStore }) {
-  const filename = record?.filename || "REACT-BL-A7F3-20260308-001.edf";
+  const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   const totalDur = edfData ? edfData.totalDuration : 600;
   const recordSeed = useMemo(() => {
@@ -2771,7 +2968,9 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
     for (let i = 0; i < fn.length; i++) h = ((h << 5) - h + fn.charCodeAt(i)) | 0;
     return Math.abs(h);
   }, [record?.filename]);
-  const eeg = useEEGState(totalDur, edfData, recordSeed);
+  // Only use simulated signals for the explicit simulation record — never for real EDF records
+  const isSimRecord = record?.isSimulated === true;
+  const eeg = useEEGState(totalDur, edfData, isSimRecord ? recordSeed : null);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [showPatternTable, setShowPatternTable] = useState(false);
   const [showAnnotations, setShowAnnotations] = useState(false);
@@ -2971,7 +3170,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
                   background:isActive?"#1a2a30":"transparent",borderBottom:isActive?"2px solid #7ec8d9":"2px solid transparent",
                   borderRight:"1px solid #1a1a1a",transition:"background 0.1s",maxWidth:220,minWidth:0}}>
                 <span style={{width:6,height:6,borderRadius:"50%",flexShrink:0,
-                  background:tab.isTest?"#22c55e":tab.isAcquired?"#3b82f6":"#eab308"}}/>
+                  background:!edfFileStore?.[tab.filename]&&!tab.isSimulated?"#ef4444":tab.isTest?"#3b82f6":tab.isAcquired?"#22c55e":"#eab308"}}/>
                 <span style={{fontSize:10,color:isActive?"#7ec8d9":"#666",fontWeight:isActive?700:400,
                   overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={tabName}>{display}</span>
                 {openTabs.length > 1 && (
@@ -2992,9 +3191,9 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
       {/* File info bar */}
       <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",fontSize:10,color:"#555"}}>
         {/* File type dot */}
-        {record && <span title={record.isTest ? "Test" : record.isAcquired ? "Acquired" : "Imported"}
+        {record && <span title={!edfData&&!record.isSimulated?"No EDF data":record.isTest?"Test":record.isAcquired?"Recorded":"Imported"}
           style={{display:"inline-block",width:9,height:9,borderRadius:"50%",flexShrink:0,
-            background:record.isTest ? "#22c55e" : record.isAcquired ? "#3b82f6" : "#eab308"}}/>}
+            background:!edfData&&!record.isSimulated?"#ef4444":record.isTest?"#3b82f6":record.isAcquired?"#22c55e":"#eab308"}}/>}
         <span onClick={()=>setShowFilePicker(!showFilePicker)} style={{
           color:"#7ec8d9",fontWeight:700,cursor:"pointer",textDecoration:"underline",textDecorationStyle:"dotted",
           textUnderlineOffset:3,transition:"color 0.15s",
@@ -3032,8 +3231,8 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
               }} onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
                  onMouseLeave={e=>e.currentTarget.style.background=r.id===record?.id?"#1a2a30":"transparent"}>
                 <span style={{display:"flex",alignItems:"center",gap:6}}>
-                  <span title={r.isTest ? "Test" : r.isAcquired ? "Acquired" : "Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
-                    background:r.isTest ? "#22c55e" : r.isAcquired ? "#3b82f6" : "#eab308"}}/>
+                  <span title={!edfFileStore?.[r.filename]&&!r.isSimulated?"No EDF data":r.isTest?"Test":r.isAcquired?"Recorded":"Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
+                    background:!edfFileStore?.[r.filename]&&!r.isSimulated?"#ef4444":r.isTest?"#3b82f6":r.isAcquired?"#22c55e":"#eab308"}}/>
                   <span style={{color:"#7ec8d9"}}>{r.filename}</span>
                 </span>
                 <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -3193,9 +3392,9 @@ function generateImpedances(channelCount) {
     "FC1","FC2","FC5","FC6","CP1","CP2","CP5","CP6","TP7","TP8","FT9","FT10","PO3","PO4","POz","Oz","Iz","AF3","AF4","AF7","AF8",
     "F1","F2","F5","F6","C1","C2","C5","C6","P1","P2","P5","P6","CPz","FCz","FPz","TP9","TP10","PO7","PO8","P9","P10","Ref","Gnd"];
   return electrodes.slice(0, channelCount).map(name => ({
-    name, value: Math.round((1.5 + Math.random() * 7.9) * 10) / 10,
-    status: null,
-  })).map(e => ({ ...e, status: e.value < 5 ? "good" : "fair" }));
+    name, value: Math.round((0.5 + Math.random() * 4.0) * 10) / 10,
+    status: "good",
+  }));
 }
 function generateNoConnectionImpedances(channelCount) {
   const electrodes = ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6","Fz","Cz","Pz","A1","A2"];
@@ -3942,9 +4141,10 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
     });
     const parsed = parseEDFFile(edfBuffer);
 
-    // Store in edfFileStore for review
+    // Store in edfFileStore for review and persist to IndexedDB
     if (setEdfFileStore && !parsed.error) {
       setEdfFileStore(prev => ({ ...prev, [acqFile]: parsed }));
+      saveEdfToDB(acqFile, edfBuffer);
     }
 
     const chCount = electrodes.length;
@@ -4252,7 +4452,7 @@ export default function ReactEEGApp() {
   const [records, setRecords] = useState([]);
   const [reviewRecord, setReviewRecord] = useState(null);
   const [annotationsMap, setAnnotationsMap] = useState({});
-  const [edfFileStore, setEdfFileStore] = useState(DECODED_EDF_STORE);
+  const [edfFileStore, setEdfFileStore] = useState({});
   const [initialized, setInitialized] = useState(false);
   const [dataDir, setDataDir] = useState("");
 
@@ -4275,6 +4475,13 @@ export default function ReactEEGApp() {
       }
       setRecords(seedRecords);
       setInitialized(true);
+
+      // Load persisted EDF files from IndexedDB (imported files survive reloads)
+      loadAllEdfsFromDB().then(stored => {
+        if (Object.keys(stored).length > 0) {
+          setEdfFileStore(prev => ({ ...prev, ...stored }));
+        }
+      });
     })();
 
     // Listen for EDF file open events (double-click .edf in Explorer)
@@ -4355,7 +4562,8 @@ export default function ReactEEGApp() {
           position:"absolute",bottom:32,
           fontSize:11,color:"#444",fontWeight:400,letterSpacing:"0.06em",
           animation: "splashFadeIn 1s ease 0.4s both, splashFadeOut 0.6s ease 2.2s forwards",
-        }}>REACT EEG, LLC &mdash; 2026</div>
+          display:"flex",alignItems:"center",gap:12,
+        }}>REACT EEG, LLC &mdash; 2026 <span style={{color:"#4a9bab80",fontFamily:"'IBM Plex Mono', monospace",fontSize:10,fontWeight:600,letterSpacing:"0.1em"}}>v11.0</span></div>
       </div>
     );
   }
@@ -4380,8 +4588,9 @@ export default function ReactEEGApp() {
               {I.Brain()}
             </div>
             <div>
-              <div style={{fontSize:18,fontWeight:700,letterSpacing:"0.04em",color:"#e0e0e0",fontFamily:"'Rajdhani', sans-serif"}}>
+              <div style={{fontSize:18,fontWeight:700,letterSpacing:"0.04em",color:"#e0e0e0",fontFamily:"'Rajdhani', sans-serif",display:"flex",alignItems:"baseline",gap:8}}>
                 REACT <span style={{color:"#7ec8d9"}}>EEG</span>
+                <span style={{fontSize:9,fontWeight:600,color:"#4a9bab80",letterSpacing:"0.08em",fontFamily:"'IBM Plex Mono', monospace"}}>v11.0</span>
               </div>
               <div style={{fontSize:9,color:"#555",letterSpacing:"0.12em",fontWeight:600,fontFamily:"'Rajdhani', sans-serif",textTransform:"uppercase"}}>BIOMETRIC DATA ACQUISITION & STORAGE</div>
             </div>
@@ -4416,7 +4625,7 @@ export default function ReactEEGApp() {
       {/* ══ Tab Content ══ */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab records={records} setRecords={setRecords} onOpenReview={openReview} updateRecordStatus={updateRecordStatus} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
-        {activeTab === "review" && <ReviewTab record={reviewRecord} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore}/>}
+        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore}/>}
         {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore} openReview={openReview}/>}
       </div>
     </div>
