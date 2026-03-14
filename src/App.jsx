@@ -146,15 +146,15 @@ const ANNOTATION_COLORS = [
 // Temporal (T3/4/5/6,F7/8): slower beta 13-18Hz
 // Parietal (P3/4,Pz,C3/4,Cz): high-freq alpha 9-12Hz
 // Occipital (O1/2,Oz): fast alpha 8-11Hz + PDR 8-11Hz eyes-closed
-function generateEEGSignal(channelIndex, sampleRate, durationSec, seed = 0) {
+function generateEEGSignal(channelIndex, sampleRate, durationSec, seed = 0, channelName = "") {
   const samples = sampleRate * durationSec;
   const data = new Float32Array(samples);
   const s = channelIndex * 1000 + seed;
   const rand = (n) => { const x = Math.sin(n * 9301 + s * 4973) * 49297; return x - Math.floor(x); };
 
-  const isEKG = channelIndex >= 18;
-  // Eye channels (indices 19-22 if present) - low-freq, large
-  const isEye = channelIndex >= 19 && channelIndex <= 22;
+  const isEKG = channelName === "EKG";
+  const isEye = channelName === "LOC1" || channelName === "LOC2" || channelName === "ROC1" || channelName === "ROC2";
+  const isVertical = channelName === "LOC1" || channelName === "ROC1"; // above-eye electrodes
 
   // Lobe classification by channel index (10-20 standard order)
   // 0=Fp1-F3, 1=F3-C3, 2=C3-P3, 3=P3-O1, 4=Fp2-F4, 5=F4-C4, 6=C4-P4, 7=P4-O2
@@ -168,19 +168,49 @@ function generateEEGSignal(channelIndex, sampleRate, durationSec, seed = 0) {
 
   for (let i = 0; i < samples; i++) {
     const t = i / sampleRate;
-    if (isEKG) {
+    if (isEye) {
+      // Physiologically realistic EOG — corneal-retinal dipole model
+      // Blink timing uses seed-only derivation so all eye channels blink simultaneously
+      const blinkRate = 0.25 + rand(seed + 1) * 0.15; // 0.25-0.40 Hz
+      const blinkPhase = (t * blinkRate) % 1;
+      const blinkDur = 0.12;
+      let blink = 0;
+      if (blinkPhase < blinkDur) {
+        const shape = Math.sin(blinkPhase * Math.PI / blinkDur);
+        blink = isVertical ? 400 * shape : -150 * shape; // +400μV above eye, -150μV below
+      }
+      // Horizontal saccades — LOC2/ROC2 opposite polarity
+      const saccRate = 0.5 + rand(seed + 3) * 0.3;
+      const saccPhase = (t * saccRate) % 1;
+      let saccade = 0;
+      if (saccPhase < 0.03) {
+        const step = Math.sin(saccPhase * Math.PI / 0.03);
+        const amp = 100 + rand(Math.floor(t * saccRate) * 13 + seed) * 100;
+        if (channelName === "LOC2") saccade = amp * step;
+        else if (channelName === "ROC2") saccade = -amp * step;
+        else saccade = amp * 0.1 * step; // minimal leak to vertical channels
+      }
+      // Vertical saccades — LOC1/ROC1 large, horizontal channels small leak
+      const vRate = 0.15 + rand(seed + 7) * 0.1;
+      const vPhase = (t * vRate + 0.3) % 1;
+      let vSacc = 0;
+      if (vPhase < 0.04) {
+        const vStep = Math.sin(vPhase * Math.PI / 0.04);
+        const vAmp = 120 + rand(Math.floor(t * vRate) * 17 + seed) * 130;
+        vSacc = isVertical ? vAmp * vStep : vAmp * 0.15 * vStep;
+      }
+      // Slow rolling eye movements (0.2-0.5Hz)
+      const slowF = 0.3 + rand(seed + channelIndex) * 0.2;
+      const slow = 25 * Math.sin(2 * Math.PI * slowF * t + rand(channelIndex * 17) * Math.PI * 2);
+      // Baseline drift + noise — NO EKG contamination
+      const drift = 12 * Math.sin(2 * Math.PI * 0.05 * t + channelIndex * 0.7);
+      data[i] = blink + saccade + vSacc + slow + drift + (rand(i) - 0.5) * 10;
+    } else if (isEKG) {
       const beatPhase = (t * 72 / 60) % 1;
       const qrs = beatPhase < 0.02 ? -30 : beatPhase < 0.04 ? 120 : beatPhase < 0.06 ? -20 : 0;
       const pWave = beatPhase > 0.85 ? 8 * Math.sin((beatPhase - 0.85) * Math.PI / 0.15) : 0;
       const tWave = beatPhase > 0.12 && beatPhase < 0.35 ? 15 * Math.sin((beatPhase - 0.12) * Math.PI / 0.23) : 0;
       data[i] = qrs + pWave + tWave + (rand(i) - 0.5) * 5;
-    } else if (isEye) {
-      // Eye movement channel: slow drift + blink artifacts
-      const blinkPhase = (t * 0.3) % 1;
-      const blink = blinkPhase < 0.05 ? 150 * Math.sin(blinkPhase * Math.PI / 0.05) : 0;
-      const slowDrift = 20 * Math.sin(2 * Math.PI * 0.15 * t + channelIndex * 1.2);
-      const sacDrift = 10 * Math.sin(2 * Math.PI * 0.8 * t + rand(channelIndex * 3) * Math.PI);
-      data[i] = blink + slowDrift + sacDrift + (rand(i) - 0.5) * 8;
     } else if (isFrontal) {
       // Frontal: dominant beta 18-25Hz, minimal alpha, muscle noise
       const beta1 = 18 * Math.sin(2 * Math.PI * (20 + rand(4) * 5) * t + rand(channelIndex * 23) * Math.PI * 2);
@@ -1795,6 +1825,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     [montage, eegSystem, customElectrodes]);
   const AUX_CHANNELS = new Set(["LOC1","LOC2","ROC1","ROC2","EKG"]);
   const EYE_CHANNELS = new Set(["LOC1","LOC2","ROC1","ROC2"]);
+  // EDF eye lead aliases: some systems use PG1/PG2 or E1/E2 for EOG channels
+  const EYE_LEAD_ALIASES = { "PG1":"LOC1", "PG2":"ROC1", "E1":"LOC1", "E2":"ROC1", "EOGL":"LOC1", "EOGR":"ROC1" };
   const [visibilityState, setVisibilityState] = useState(0); // 0=default, 1=EEG shown (eyes hidden), 2=all shown
 
   // Normalize EDF label for matching (shared across hook)
@@ -1814,7 +1846,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
         return;
       }
       if (isEyeLead) {
-        if (normed.some(n => n === normCh(ch))) covered.add(ch);
+        if (normed.some(n => n === normCh(ch))) { covered.add(ch); return; }
+        if (normed.some(n => EYE_LEAD_ALIASES[n] === ch)) covered.add(ch);
         return;
       }
       // Bipolar: need both electrodes
@@ -1969,7 +2002,10 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
           const searchLabel = isEKG ? "ECG" : ch;
           const edfIdx = edfData.channelLabels.findIndex(l => {
             const n = normEdf(l);
-            return n === normCh(searchLabel) || (isEKG && n === "ECG") || n === normCh(ch);
+            if (n === normCh(searchLabel) || n === normCh(ch)) return true;
+            if (isEKG && (n === "ECG" || n === "EKG")) return true;
+            if (isEyeLead && EYE_LEAD_ALIASES[n] === ch) return true;
+            return false;
           });
           if (edfIdx >= 0) raw = getEDFEpochData(edfData, edfIdx, epochStart, epochSec, sampleRate);
         } else {
@@ -1998,13 +2034,21 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
         }
       }
 
-      // Fall back: real EDF → flat line for missing channels;
+      // Fall back: real EDF → bio-cal for missing eye leads, flat line for others;
       // simulation explicitly requested → generate; otherwise flat line (hardware not streaming)
       if (!raw) {
         if (edfData && edfData.channelData) {
-          raw = new Float32Array(sampleRate * epochSec);
+          const isEyeLeadCh = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
+          if (isEyeLeadCh) {
+            // Bio-cal: 50μV square wave at 1Hz for missing eye leads
+            const len = sampleRate * epochSec;
+            raw = new Float32Array(len);
+            for (let bi = 0; bi < len; bi++) raw[bi] = ((bi / sampleRate) % 1) < 0.5 ? 50 : -50;
+          } else {
+            raw = new Float32Array(sampleRate * epochSec);
+          }
         } else if (simSeedOverride !== null) {
-          raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137 + currentEpoch * 7919);
+          raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137 + currentEpoch * 7919, ch);
         } else {
           raw = new Float32Array(sampleRate * epochSec);
         }
@@ -3880,7 +3924,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       seedHistoryRef.current.forEach((seed) => {
         const epochSamples = Math.min(SIM_EPOCH_SEC * sr, totalSamples - offset);
         if (epochSamples <= 0) return;
-        const signal = generateEEGSignal(elecIdx, sr, SIM_EPOCH_SEC, seed + elecIdx * 137);
+        const signal = generateEEGSignal(elecIdx, sr, SIM_EPOCH_SEC, seed + elecIdx * 137, elec);
         fullData.set(signal.subarray(0, epochSamples), offset);
         offset += epochSamples;
       });
