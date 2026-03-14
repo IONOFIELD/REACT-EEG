@@ -45,6 +45,12 @@ const ELECTRODE_SETS = {
     "F9","F10","FT7","FT8","CP3","CP4","T9","T10","P7","P8","O9","O10"],
 };
 
+// ── OpenBCI hardware channel-to-electrode mappings ──
+const OPENBCI_CHANNEL_MAP = {
+  "openbci-cyton-8":  ["Fp1","Fp2","C3","C4","P3","P4","O1","O2"],
+  "openbci-cyton-16": ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6"],
+};
+
 // ── Montage definitions per EEG system ──
 const MONTAGE_DEFS = {
   "bipolar-longitudinal": {
@@ -379,6 +385,7 @@ const I = {
   Square: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/></svg>,
   Pause: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></svg>,
   Activity: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>,
+  Ohm: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M8 17v-2a4 4 0 1 1 8 0v2"/><line x1="6" y1="17" x2="10" y2="17"/><line x1="14" y1="17" x2="18" y2="17"/></svg>,
   Eye: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>,
   Radio: (s=16) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49"/><path d="M7.76 16.24a6 6 0 0 1 0-8.49"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>,
   MoreVert: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="5" r="1.5" fill="currentColor"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><circle cx="12" cy="19" r="1.5" fill="currentColor"/></svg>,
@@ -1404,10 +1411,11 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
 // ══════════════════════════════════════════════════════════════
 // EPOCH NAV BAR — shared
 // ══════════════════════════════════════════════════════════════
-function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, isPlaying, onPlayPause }) {
+function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, isPlaying, onPlayPause, leftContent, rightContent }) {
   return (
     <div style={{ display:"flex",alignItems:"center",justifyContent:"center",gap:10,
       padding:"8px 16px",borderTop:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0 }}>
+      {leftContent}
       {/* Play button — only shown when callback provided */}
       {onPlayPause && (
         <button onClick={onPlayPause} title="Play / Pause (Space)" style={{
@@ -1440,6 +1448,7 @@ function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epoc
       <button onClick={()=>setCurrentEpoch(totalEpochs-1)} style={controlBtn()}>▶|</button>
       <span style={{color:"#333"}}>|</span>
       <span style={{fontSize:9,color:"#333"}}>Space play/pause &nbsp; ← → / hold &nbsp; Enter annotate &nbsp; +/- sens</span>
+      {rightContent}
     </div>
   );
 }
@@ -1661,6 +1670,31 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     });
   };
 
+  // Batch-hide channels not available on hardware
+  const setAvailableElectrodes = useCallback((electrodeSet) => {
+    if (!electrodeSet) return;
+    const hwSet = new Set([...electrodeSet].map(e => e.toUpperCase()));
+    setHiddenChannels(() => {
+      const next = new Set();
+      allChannels.forEach(ch => {
+        if (userForcedVisible.has(ch)) return;
+        if (userForcedHidden.has(ch)) { next.add(ch); return; }
+        const isAux = AUX_CHANNELS.has(ch);
+        if (isAux) { next.add(ch); return; }
+        if (ch.includes("-")) {
+          const parts = ch.split("-");
+          const hasFirst = hwSet.has(parts[0].toUpperCase());
+          const ref = parts[parts.length - 1];
+          const hasSecond = ref === "Avg" || ref === "Cz" || hwSet.has(ref.toUpperCase());
+          if (!hasFirst || !hasSecond) next.add(ch);
+        } else {
+          if (!hwSet.has(ch.toUpperCase())) next.add(ch);
+        }
+      });
+      return next;
+    });
+  }, [allChannels, userForcedVisible, userForcedHidden]);
+
   const adjustChannelSensitivity = (ch, delta) => {
     setChannelSensitivity(prev => ({ ...prev, [ch]: (prev[ch] || 0) + delta }));
   };
@@ -1723,12 +1757,16 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
         }
       }
 
-      // Fall back to simulated if no EDF data for this channel
+      // Fall back: real EDF → flat line for missing channels;
+      // simulation explicitly requested → generate; otherwise flat line (hardware not streaming)
       if (!raw) {
-        const seed = simSeedOverride !== null
-          ? simSeedOverride + fullIdx * 137
-          : Math.floor(epochStart * 7) + fullIdx * 137;
-        raw = generateEEGSignal(fullIdx, sampleRate, epochSec, seed);
+        if (edfData && edfData.channelData) {
+          raw = new Float32Array(sampleRate * epochSec);
+        } else if (simSeedOverride !== null) {
+          raw = generateEEGSignal(fullIdx, sampleRate, epochSec, simSeedOverride + fullIdx * 137);
+        } else {
+          raw = new Float32Array(sampleRate * epochSec);
+        }
       }
 
       const chHpf = channelHpf[ch] !== undefined ? channelHpf[ch] : hpf;
@@ -1823,7 +1861,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
     annotationText, setAnnotationText,
-    hiddenChannels, toggleChannelVisibility, channelSensitivity, adjustChannelSensitivity,
+    hiddenChannels, toggleChannelVisibility, setAvailableElectrodes, channelSensitivity, adjustChannelSensitivity,
     channelHpf, setChannelHpf, channelLpf, setChannelLpf,
     auxWithData, AUX_CHANNELS, channelsWithData,
     contextMenu, setContextMenu, handleContextMenu,
@@ -2737,42 +2775,22 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
 // DEVICE REGISTRY — All supported hardware & protocols
 // ══════════════════════════════════════════════════════════════
 const DEVICE_PROTOCOLS = {
-  brainflow: { label: "BrainFlow", color: "#3B82F6", desc: "Direct board API" },
-  lsl: { label: "LSL", color: "#8B5CF6", desc: "Lab Streaming Layer" },
-  file: { label: "File Import", color: "#10B981", desc: "EDF/BDF file" },
+  brainflow: { label: "OpenBCI", color: "#3B82F6", desc: "Direct board API" },
   simulated: { label: "Simulated", color: "#F59E0B", desc: "Test signals" },
 };
 
 const DEVICE_CATALOG = [
-  // BrainFlow devices
-  { id: "openbci-cyton-8", name: "OpenBCI Cyton", protocol: "brainflow", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, clinical: false, boardId: 0, port: "COM3" },
-  { id: "openbci-cyton-16", name: "OpenBCI Cyton + Daisy", protocol: "brainflow", channels: 16, maxSr: 125, resolution: "24-bit", wireless: false, clinical: false, boardId: 2, port: "COM3" },
-  { id: "openbci-ganglion", name: "OpenBCI Ganglion", protocol: "brainflow", channels: 4, maxSr: 200, resolution: "24-bit", wireless: true, clinical: false, boardId: 1, port: "" },
-  { id: "ant-eego", name: "ANT Neuro eego", protocol: "brainflow", channels: 64, maxSr: 2048, resolution: "24-bit", wireless: false, clinical: true, boardId: 24, port: "" },
-  { id: "gtec-unicorn", name: "g.tec Unicorn Hybrid Black", protocol: "brainflow", channels: 8, maxSr: 250, resolution: "24-bit", wireless: true, clinical: false, boardId: 8, port: "" },
-  { id: "neurosity-crown", name: "Neurosity Crown", protocol: "brainflow", channels: 8, maxSr: 256, resolution: "24-bit", wireless: true, clinical: false, boardId: 25, port: "" },
-  { id: "muse-2", name: "Muse 2", protocol: "brainflow", channels: 4, maxSr: 256, resolution: "12-bit", wireless: true, clinical: false, boardId: 22, port: "" },
-  { id: "brainbit", name: "BrainBit", protocol: "brainflow", channels: 4, maxSr: 250, resolution: "16-bit", wireless: true, clinical: false, boardId: 7, port: "" },
-  { id: "enophone", name: "Enophone", protocol: "brainflow", channels: 4, maxSr: 250, resolution: "24-bit", wireless: true, clinical: false, boardId: 26, port: "" },
-  // LSL devices (discovered on network)
-  { id: "lsl-generic", name: "LSL Stream (Auto-Discover)", protocol: "lsl", channels: 0, maxSr: 0, resolution: "—", wireless: false, clinical: false },
-  { id: "lsl-natus", name: "Natus Xltek (via LSL Bridge)", protocol: "lsl", channels: 32, maxSr: 1024, resolution: "24-bit", wireless: false, clinical: true },
-  { id: "lsl-nk", name: "Nihon Kohden (via LSL Bridge)", protocol: "lsl", channels: 32, maxSr: 1024, resolution: "24-bit", wireless: false, clinical: true },
-  { id: "lsl-biosemi", name: "BioSemi ActiveTwo (via LSL)", protocol: "lsl", channels: 64, maxSr: 2048, resolution: "24-bit", wireless: false, clinical: true },
-  // File import
-  { id: "file-edf", name: "Import EDF/EDF+ File", protocol: "file", channels: 0, maxSr: 0, resolution: "—", wireless: false, clinical: false },
-  { id: "file-bdf", name: "Import BDF/BDF+ File", protocol: "file", channels: 0, maxSr: 0, resolution: "—", wireless: false, clinical: false },
-  // Simulated
-  { id: "sim-19ch", name: "Simulated 19ch (10-20)", protocol: "simulated", channels: 19, maxSr: 256, resolution: "N/A", wireless: false, clinical: false },
-  { id: "sim-32ch", name: "Simulated 32ch (10-10)", protocol: "simulated", channels: 32, maxSr: 512, resolution: "N/A", wireless: false, clinical: false },
+  // OpenBCI hardware (BrainFlow)
+  { id: "openbci-cyton-8", name: "OpenBCI Cyton", protocol: "brainflow", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, boardId: 0, port: "COM3" },
+  { id: "openbci-cyton-16", name: "OpenBCI Cyton + Daisy", protocol: "brainflow", channels: 16, maxSr: 125, resolution: "24-bit", wireless: false, boardId: 2, port: "COM3" },
+  // Simulator
+  { id: "sim-19ch", name: "Simulator (10-20)", protocol: "simulated", channels: 19, maxSr: 256, resolution: "N/A", wireless: false },
 ];
 
 // ── Connection states ──
-const CONN = { disconnected: 0, scanning: 1, found: 2, connecting: 3, connected: 4, impedance: 5, ready: 6, error: -1 };
+const CONN = { disconnected: 0, connecting: 1, connected: 2, impedance: 3, ready: 4, error: -1 };
 const CONN_LABELS = {
-  [CONN.disconnected]: { text: "Disconnected", color: "#555" },
-  [CONN.scanning]: { text: "Scanning...", color: "#F59E0B" },
-  [CONN.found]: { text: "Device Found", color: "#3B82F6" },
+  [CONN.disconnected]: { text: "Not Connected", color: "#555" },
   [CONN.connecting]: { text: "Connecting...", color: "#F59E0B" },
   [CONN.connected]: { text: "Connected", color: "#7ec8d9" },
   [CONN.impedance]: { text: "Impedance Check", color: "#8B5CF6" },
@@ -2790,33 +2808,29 @@ function generateImpedances(channelCount) {
     status: null,
   })).map(e => ({ ...e, status: e.value < 5 ? "good" : "fair" }));
 }
+function generateNoConnectionImpedances(channelCount) {
+  const electrodes = ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6","Fz","Cz","Pz","A1","A2"];
+  return electrodes.slice(0, channelCount).map(name => ({ name, value: null, status: "poor" }));
+}
 
 // ══════════════════════════════════════════════════════════════
 // DEVICE SELECTOR PANEL
 // ══════════════════════════════════════════════════════════════
-function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, onConnect, onDisconnect, onScan, deviceConfig, setDeviceConfig }) {
-  const [filterProtocol, setFilterProtocol] = useState("all");
-  const [showAll, setShowAll] = useState(false);
-
-  const filtered = DEVICE_CATALOG.filter(d => filterProtocol === "all" || d.protocol === filterProtocol);
-  const grouped = {};
-  filtered.forEach(d => { if (!grouped[d.protocol]) grouped[d.protocol] = []; grouped[d.protocol].push(d); });
-
+function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, onConnect, onDisconnect, deviceConfig, setDeviceConfig }) {
   const isConnected = connectionState >= CONN.connected;
   const connInfo = CONN_LABELS[connectionState] || CONN_LABELS[CONN.disconnected];
 
   return (
     <div style={{borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0}}>
-      {/* Source selector row */}
       <div style={{display:"flex",alignItems:"center",gap:12,padding:"10px 16px"}}>
         {/* Connection status indicator */}
         <div style={{display:"flex",alignItems:"center",gap:6,minWidth:140}}>
           <div style={{width:8,height:8,borderRadius:"50%",background:connInfo.color,
-            animation: connectionState===CONN.scanning||connectionState===CONN.connecting ? "pulse 1.5s ease infinite" : "none"}}/>
+            animation: connectionState===CONN.connecting ? "pulse 1.5s ease infinite" : "none"}}/>
           <span style={{fontSize:11,fontWeight:700,color:connInfo.color,letterSpacing:"0.05em"}}>{connInfo.text}</span>
         </div>
 
-        {/* Device dropdown — the "sound output" style selector */}
+        {/* Device dropdown — flat select */}
         <div style={{flex:1,position:"relative"}}>
           <div style={microLabel}>Input Source</div>
           <select value={selectedDevice?.id||""} onChange={e=>{
@@ -2828,52 +2842,31 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
               port: dev?.port || "",
             }));
           }} style={{...selectStyle,width:"100%",maxWidth:400,padding:"6px 8px",fontSize:12}}>
-            <option value="">— Select Input Source —</option>
-            {Object.entries(grouped).map(([proto, devices]) => (
-              <optgroup key={proto} label={`${DEVICE_PROTOCOLS[proto].label} — ${DEVICE_PROTOCOLS[proto].desc}`}>
-                {devices.map(d => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} {d.channels>0?`(${d.channels}ch, ${d.maxSr}Hz)`:""} {d.clinical?"[Clinical]":""}
-                  </option>
-                ))}
-              </optgroup>
+            {DEVICE_CATALOG.map(d => (
+              <option key={d.id} value={d.id}>
+                {d.name} ({d.channels}ch, {d.maxSr}Hz)
+              </option>
             ))}
           </select>
         </div>
 
-        {/* Device config */}
-        {selectedDevice && selectedDevice.protocol !== "file" && (<>
-          {selectedDevice.protocol === "brainflow" && !selectedDevice.wireless && (
-            <div><div style={microLabel}>Port</div>
-              <input value={deviceConfig.port} onChange={e=>setDeviceConfig({...deviceConfig,port:e.target.value})}
-                placeholder="COM3" style={{...selectStyle,width:80,padding:"5px 8px"}}/></div>
-          )}
-          {selectedDevice.maxSr > 0 && (
-            <div><div style={microLabel}>Sample Rate</div>
-              <select value={deviceConfig.sampleRate} onChange={e=>setDeviceConfig({...deviceConfig,sampleRate:parseInt(e.target.value)})} style={selectStyle}>
-                {[128,250,256,500,512,1000,1024,2048].filter(sr=>sr<=selectedDevice.maxSr).map(sr=>(
-                  <option key={sr} value={sr}>{sr} Hz</option>
-                ))}
-              </select></div>
-          )}
-        </>)}
+        {/* Port config for brainflow devices */}
+        {selectedDevice && selectedDevice.protocol === "brainflow" && !selectedDevice.wireless && (
+          <div><div style={microLabel}>Port</div>
+            <input value={deviceConfig.port} onChange={e=>setDeviceConfig({...deviceConfig,port:e.target.value})}
+              placeholder="COM3" style={{...selectStyle,width:80,padding:"5px 8px"}}/></div>
+        )}
 
         {/* Action buttons */}
         <div style={{display:"flex",gap:6,alignItems:"flex-end"}}>
-          {!isConnected ? (<>
-            {selectedDevice && selectedDevice.protocol === "lsl" && (
-              <button onClick={onScan} disabled={connectionState===CONN.scanning} style={{
-                padding:"6px 14px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
-                color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-              }}>{I.Radio()} SCAN</button>
-            )}
+          {!isConnected ? (
             <button onClick={onConnect} disabled={!selectedDevice||connectionState===CONN.connecting} style={{
               padding:"6px 14px",background:selectedDevice?"#0a2a0a":"#1a1a1a",
               border:`1px solid ${selectedDevice?"#4a9bab40":"#333"}`,borderRadius:0,
               color:selectedDevice?"#7ec8d9":"#555",cursor:selectedDevice?"pointer":"default",
               fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
             }}>{I.Zap()} CONNECT</button>
-          </>) : (
+          ) : (
             <button onClick={onDisconnect} style={{
               padding:"6px 14px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
               color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
@@ -2895,10 +2888,6 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
           <span style={{color:"#888"}}>{selectedDevice.channels || deviceConfig.channels}ch</span>
           <span style={{color:"#444"}}>|</span>
           <span style={{color:"#888"}}>{selectedDevice.resolution}</span>
-          {selectedDevice.clinical && (<>
-            <span style={{color:"#444"}}>|</span>
-            <span style={{color:"#7ec8d9",fontWeight:700}}>FDA-CLEARED DEVICE</span>
-          </>)}
         </div>
       )}
     </div>
@@ -3330,8 +3319,8 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
             }}>
               <span style={{fontSize:11,fontWeight:600,color:"#ccc",fontFamily:"'IBM Plex Mono', monospace"}}>{e.name}</span>
               <span style={{fontSize:12,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",
-                color:e.status==="good"?"#7ec8d9":e.status==="fair"?"#facc15":"#f87171"
-              }}>{e.value}kΩ</span>
+                color:e.value===null?"#f87171":e.status==="good"?"#7ec8d9":e.status==="fair"?"#facc15":"#f87171"
+              }}>{e.value===null?"-":`${e.value}kΩ`}</span>
             </div>
           ))}
         </div>
@@ -3361,7 +3350,7 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
 // ══════════════════════════════════════════════════════════════
 function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStore, setEdfFileStore }) {
   // State declared before useEEGState so they can be passed as args
-  const [selectedDevice, setSelectedDevice] = useState(null);
+  const [selectedDevice, setSelectedDevice] = useState(DEVICE_CATALOG.find(d => d.id === "openbci-cyton-16") || null);
   const [isRecording, setIsRecording] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
@@ -3385,7 +3374,21 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
   const simCurrentEpochRef = useRef(0);
 
   const isSim = selectedDevice?.protocol === "simulated";
-  const eeg = useEEGState(600, null, (isSim && isRecording) ? simEpochSeed : null);
+  const simSeed = isSim ? (isRecording ? simEpochSeed : 42) : null;
+  const eeg = useEEGState(600, null, simSeed);
+
+  // Auto-hide channels that don't match the hardware's available electrodes
+  useEffect(() => {
+    if (!selectedDevice) return;
+    if (isSim) {
+      // Simulator has all electrodes for the current EEG system
+      eeg.setAvailableElectrodes(new Set(ELECTRODE_SETS[eeg.eegSystem] || ELECTRODE_SETS["10-20"]));
+      return;
+    }
+    const hw = OPENBCI_CHANNEL_MAP[selectedDevice.id];
+    if (hw) eeg.setAvailableElectrodes(new Set(hw));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDevice?.id, isSim, eeg.montage, eeg.eegSystem]);
 
   // Use app-level annotations keyed by acquire filename
   const acqFilename = subjectId ? generateFilename(subjectId, studyType, new Date().toISOString().split("T")[0]) : "acquire-session";
@@ -3406,11 +3409,11 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
 
   // Device state
   const [connectionState, setConnectionState] = useState(CONN.disconnected);
-  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 256, channels: 19, port: "COM3" });
+  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 125, channels: 16, port: "COM3" });
   const [impedances, setImpedances] = useState(null);
   const [showImpedance, setShowImpedance] = useState(false);
 
-  // Simulated connection flow
+  // Connection flow
   const handleConnect = useCallback(() => {
     if (!selectedDevice) return;
     if (selectedDevice.protocol === "simulated") {
@@ -3418,34 +3421,18 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       setTimeout(() => { setConnectionState(CONN.connected); setTimeout(() => setConnectionState(CONN.ready), 500); }, 800);
       return;
     }
-    if (selectedDevice.protocol === "file") {
-      setConnectionState(CONN.ready);
-      return;
-    }
-    // BrainFlow / LSL simulated connection
+    // BrainFlow hardware — no real integration yet, show error
     setConnectionState(CONN.connecting);
     setTimeout(() => {
-      setConnectionState(CONN.connected);
-      // Auto-trigger impedance check for real devices
-      setTimeout(() => {
-        setConnectionState(CONN.impedance);
-        const imp = generateImpedances(selectedDevice.channels || deviceConfig.channels);
-        setImpedances(imp);
-        setShowImpedance(true);
-      }, 1200);
-    }, 1500);
-  }, [selectedDevice, deviceConfig]);
+      setConnectionState(CONN.error);
+    }, 2000);
+  }, [selectedDevice]);
 
   const handleDisconnect = () => {
     setConnectionState(CONN.disconnected);
     setImpedances(null);
     setShowImpedance(false);
     if (isRecording) { setIsRecording(false); setIsPaused(false); }
-  };
-
-  const handleScan = () => {
-    setConnectionState(CONN.scanning);
-    setTimeout(() => setConnectionState(CONN.found), 2000);
   };
 
   const handleAcceptImpedance = () => {
@@ -3574,7 +3561,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       {/* Device Selector */}
       <DeviceSelector selectedDevice={selectedDevice} setSelectedDevice={setSelectedDevice}
         connectionState={connectionState} onConnect={handleConnect} onDisconnect={handleDisconnect}
-        onScan={handleScan} deviceConfig={deviceConfig} setDeviceConfig={setDeviceConfig}/>
+        deviceConfig={deviceConfig} setDeviceConfig={setDeviceConfig}/>
 
       {/* Recording controls bar */}
       <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexShrink:0}}>
@@ -3590,18 +3577,6 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
               {generateFilename(subjectId, studyType, new Date().toISOString().split("T")[0])}
             </div>
           )}
-          <div style={{flex:1}}/>
-          {connectionState >= CONN.ready && (
-            <button onClick={()=>{setShowImpedance(true);setImpedances(generateImpedances(selectedDevice?.channels||19));}} style={{
-              padding:"6px 14px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
-              color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-            }}>{I.Activity()} IMPEDANCE</button>
-          )}
-          <button onClick={startRecording} disabled={!canRecord} style={{
-            padding:"8px 20px",background:canRecord?"#7f1d1d":"#1a1a1a",border:`1px solid ${canRecord?"#EF444450":"#333"}`,
-            borderRadius:0,color:canRecord?"#EF4444":"#555",cursor:canRecord?"pointer":"default",
-            fontSize:12,fontWeight:700,display:"flex",alignItems:"center",gap:6
-          }}>{I.Record()} START RECORDING</button>
         </>) : (<>
           <div style={{display:"flex",alignItems:"center",gap:6}}>
             <div style={{width:10,height:10,borderRadius:"50%",background:isPaused?"#F59E0B":"#EF4444",
@@ -3628,11 +3603,6 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
             <span style={{fontSize:10,color:"#555"}}>|</span>
             <span style={{fontSize:10,color:DEVICE_PROTOCOLS[selectedDevice.protocol].color}}>{selectedDevice.name}</span>
           </>)}
-          <div style={{flex:1}}/>
-          <button onClick={stopRecording} style={{
-            padding:"6px 14px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
-            color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-          }}>{I.Square()} STOP</button>
         </>)}
       </div>
         <EEGControls montage={eeg.montage} setMontage={eeg.setMontage}
@@ -3697,21 +3667,12 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
                   </div>
                 </>
               )}
-              {(connectionState === CONN.scanning || connectionState === CONN.connecting) && (
+              {connectionState === CONN.connecting && (
                 <>
                   <div style={{width:48,height:48,borderRadius:0,background:"#111",border:"1px solid #F59E0B30",
                     display:"flex",alignItems:"center",justifyContent:"center",color:"#F59E0B",
                     animation:"pulse 1.5s ease infinite"}}>{I.Radio(20)}</div>
-                  <div style={{color:"#F59E0B",fontSize:14,fontWeight:600}}>
-                    {connectionState===CONN.scanning?"Scanning for LSL streams...":"Connecting to device..."}
-                  </div>
-                </>
-              )}
-              {connectionState === CONN.found && (
-                <>
-                  <div style={{width:48,height:48,borderRadius:0,background:"#111",border:"1px solid #3B82F630",
-                    display:"flex",alignItems:"center",justifyContent:"center",color:"#3B82F6"}}>{I.Radio(20)}</div>
-                  <div style={{color:"#3B82F6",fontSize:14,fontWeight:600}}>Stream found — click CONNECT</div>
+                  <div style={{color:"#F59E0B",fontSize:14,fontWeight:600}}>Connecting to device...</div>
                 </>
               )}
               {connectionState === CONN.connected && (
@@ -3725,8 +3686,8 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
                 <>
                   <div style={{width:48,height:48,borderRadius:0,background:"#111",border:"1px solid #EF444430",
                     display:"flex",alignItems:"center",justifyContent:"center",color:"#EF4444"}}>{I.Alert(20)}</div>
-                  <div style={{color:"#EF4444",fontSize:14,fontWeight:600}}>Connection Failed</div>
-                  <div style={{color:"#666",fontSize:11}}>Check device power and port settings, then retry</div>
+                  <div style={{color:"#EF4444",fontSize:14,fontWeight:600}}>No Device Detected</div>
+                  <div style={{color:"#666",fontSize:11}}>Check device power, USB connection, and port settings</div>
                 </>
               )}
             </div>
@@ -3739,7 +3700,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
                 {I.Check(18)} <span style={{fontSize:14,fontWeight:700}}>Device Ready</span>
               </div>
               <div style={{color:"#555",fontSize:12}}>
-                {subjectId ? "Click START RECORDING to begin acquisition" : "Enter a Subject ID to begin"}
+                {subjectId ? "Click REC in the bottom bar to begin acquisition" : "Enter a Subject ID to begin"}
               </div>
             </div>
           )}
@@ -3748,7 +3709,27 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
 
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
         totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
-        isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}/>
+        isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
+        leftContent={connectionState >= CONN.ready && !isRecording ? (
+          <button onClick={()=>{setShowImpedance(true);setImpedances(isSim ? generateImpedances(selectedDevice?.channels||19) : generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
+            padding:"4px 10px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
+            color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+          }}>{I.Ohm(14)} Z</button>
+        ) : null}
+        rightContent={!isRecording ? (
+          connectionState >= CONN.ready ? (
+            <button onClick={startRecording} disabled={!canRecord} style={{
+              padding:"4px 14px",background:canRecord?"#7f1d1d":"#1a1a1a",border:`1px solid ${canRecord?"#EF444450":"#333"}`,
+              borderRadius:0,color:canRecord?"#EF4444":"#555",cursor:canRecord?"pointer":"default",
+              fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+            }}>{I.Record()} REC</button>
+          ) : null
+        ) : (
+          <button onClick={stopRecording} style={{
+            padding:"4px 10px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
+            color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+          }}>{I.Square()} STOP</button>
+        )}/>
 
       {/* Floating annotation panel */}
       {showAnnotations && (
