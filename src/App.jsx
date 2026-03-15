@@ -2219,24 +2219,30 @@ function analyzeFullFileEyeSync(edfData) {
   const nEpochs = Math.min(30, Math.floor(totalSamples / epochSamples));
   if (nEpochs < 1) return null;
 
+  // Bilateral metrics (L vs R eye — LOC1 vs ROC1, LOC2 vs ROC2)
   let wpliVertSum = 0, wpliVertN = 0;
   let wpliHorizSum = 0, wpliHorizN = 0;
   let corrVertSum = 0, corrVertN = 0;
   let corrHorizSum = 0, corrHorizN = 0;
   let blinkEvents = 0, blinkSymCount = 0;
+  // Per-eye metrics (LOC1 vs LOC2 = left eye, ROC1 vs ROC2 = right eye)
+  let wpliLeftSum = 0, wpliLeftN = 0;
+  let wpliRightSum = 0, wpliRightN = 0;
+  let corrLeftSum = 0, corrLeftN = 0;
+  let corrRightSum = 0, corrRightN = 0;
 
   for (let e = 0; e < nEpochs; e++) {
     const s = e * epochSamples;
     const aV = edfData.channelData[loc1].slice(s, s + epochSamples);
     const bV = edfData.channelData[roc1].slice(s, s + epochSamples);
 
-    // Vertical WPLI (LOC1 vs ROC1 — both above-eye, should be conjugate)
+    // Bilateral vertical WPLI (LOC1 vs ROC1)
     const wV = computeWPLI(aV, bV, sr, 1, 15);
     if (wV !== null) { wpliVertSum += wV; wpliVertN++; }
     const cV = computeCrossCorrelation(aV, bV);
     if (cV !== null) { corrVertSum += Math.max(0, cV); corrVertN++; }
 
-    // Horizontal WPLI (LOC2 vs ROC2 — below-eye, if available)
+    // Bilateral horizontal WPLI (LOC2 vs ROC2)
     if (loc2 >= 0 && roc2 >= 0) {
       const aH = edfData.channelData[loc2].slice(s, s + epochSamples);
       const bH = edfData.channelData[roc2].slice(s, s + epochSamples);
@@ -2246,12 +2252,29 @@ function analyzeFullFileEyeSync(edfData) {
       if (cH !== null) { corrHorizSum += Math.max(0, cH); corrHorizN++; }
     }
 
+    // Per-eye: Left eye (LOC1 vs LOC2 — vertical vs horizontal of left eye)
+    if (loc2 >= 0) {
+      const lH = edfData.channelData[loc2].slice(s, s + epochSamples);
+      const wL = computeWPLI(aV, lH, sr, 1, 15);
+      if (wL !== null) { wpliLeftSum += wL; wpliLeftN++; }
+      const cL = computeCrossCorrelation(aV, lH);
+      if (cL !== null) { corrLeftSum += Math.max(0, cL); corrLeftN++; }
+    }
+
+    // Per-eye: Right eye (ROC1 vs ROC2 — vertical vs horizontal of right eye)
+    if (roc2 >= 0) {
+      const rH = edfData.channelData[roc2].slice(s, s + epochSamples);
+      const wR = computeWPLI(bV, rH, sr, 1, 15);
+      if (wR !== null) { wpliRightSum += wR; wpliRightN++; }
+      const cR = computeCrossCorrelation(bV, rH);
+      if (cR !== null) { corrRightSum += Math.max(0, cR); corrRightN++; }
+    }
+
     // Blink symmetry: detect blinks as peaks > 80µV in LOC1, check if ROC1 also peaks
     const blinkThresh = 80;
     for (let i = 1; i < aV.length - 1; i++) {
       if (Math.abs(aV[i]) > blinkThresh && Math.abs(aV[i]) > Math.abs(aV[i - 1]) && Math.abs(aV[i]) > Math.abs(aV[i + 1])) {
         blinkEvents++;
-        // Check if ROC1 also has a peak within ±10 samples
         let found = false;
         for (let j = Math.max(0, i - 10); j <= Math.min(bV.length - 1, i + 10); j++) {
           if (Math.abs(bV[j]) > blinkThresh * 0.5) { found = true; break; }
@@ -2266,6 +2289,10 @@ function analyzeFullFileEyeSync(edfData) {
   const corrVert = corrVertN > 0 ? corrVertSum / corrVertN : null;
   const corrHoriz = corrHorizN > 0 ? corrHorizSum / corrHorizN : null;
   const blinkSymmetry = blinkEvents > 0 ? blinkSymCount / blinkEvents : null;
+  const wpliLeft = wpliLeftN > 0 ? wpliLeftSum / wpliLeftN : null;
+  const wpliRight = wpliRightN > 0 ? wpliRightSum / wpliRightN : null;
+  const corrLeft = corrLeftN > 0 ? corrLeftSum / corrLeftN : null;
+  const corrRight = corrRightN > 0 ? corrRightSum / corrRightN : null;
 
   // Combined score — WPLI-weighted
   const scores = [];
@@ -2274,7 +2301,7 @@ function analyzeFullFileEyeSync(edfData) {
   if (blinkSymmetry !== null) scores.push(blinkSymmetry);
   const syncScore = scores.length > 0 ? (scores.reduce((a, b) => a + b, 0) / scores.length) * 100 : null;
 
-  return { wpliVert, wpliHoriz, corrVert, corrHoriz, blinkSymmetry, syncScore, nEpochs };
+  return { wpliVert, wpliHoriz, corrVert, corrHoriz, wpliLeft, wpliRight, corrLeft, corrRight, blinkSymmetry, syncScore, nEpochs };
 }
 
 function ComparePanel({ openTabs, records, edfFileStore, onSelectRecord, onClose, panelPos, setPanelPos }) {
@@ -2443,188 +2470,97 @@ function ComparePanel({ openTabs, records, edfFileStore, onSelectRecord, onClose
           </div>
         ) : (
           <>
-            {/* ── SPECTRAL SPEED ANALYSIS ── */}
+            {/* ── SPECTRAL SPEED ── */}
             {comparison.analysisA && comparison.analysisB && (() => {
               const a = comparison.analysisA, b = comparison.analysisB;
               const totA = a.bands.total || 1, totB = b.bands.total || 1;
+              const mono = "'IBM Plex Mono', monospace";
+              const mkRow = (label, vA, vB, unit, inverted) => {
+                const d = vB - vA;
+                const c = Math.abs(d) < (unit === "%" ? 2 : unit === "Hz" ? 0.3 : 0.15) ? "#555"
+                  : inverted ? (d > 0 ? "#f87171" : "#4ade80") : (d > 0 ? "#4ade80" : "#f87171");
+                return (
+                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 1 }}>
+                    <span style={{ fontSize: 8, color: "#666", width: 68, flexShrink: 0 }}>{label}</span>
+                    <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: mono, width: 44, textAlign: "right" }}>{typeof vA === "number" ? (unit === "%" ? vA.toFixed(1) : vA.toFixed(2)) : vA}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
+                    <span style={{ fontSize: 7, color: "#333" }}>&rarr;</span>
+                    <span style={{ fontSize: 9, color: "#c084fc", fontFamily: mono, width: 44 }}>{typeof vB === "number" ? (unit === "%" ? vB.toFixed(1) : vB.toFixed(2)) : vB}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: c, fontFamily: mono, flex: 1, textAlign: "right" }}>
+                      {d > 0 ? "+" : ""}{unit === "%" ? d.toFixed(1) + "%" : unit === "Hz" ? d.toFixed(1) + "Hz" : d.toFixed(2)}
+                    </span>
+                  </div>
+                );
+              };
+              const slowA = (a.bands.delta + a.bands.theta), fastA = (a.bands.alpha + a.bands.beta) || 0.0001;
+              const slowB = (b.bands.delta + b.bands.theta), fastB = (b.bands.alpha + b.bands.beta) || 0.0001;
               return (
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 8, color: "#555", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>
-                    SPECTRAL POWER DISTRIBUTION CHANGE
-                  </div>
-                  <div style={{ fontSize: 7, color: "#333", marginBottom: 6 }}>
-                    Multi-epoch Hanning-windowed FFT averaged across {a.nChannels}ch &times; {a.nSegments} epochs (A) / {b.nSegments} epochs (B)
-                  </div>
-
-                  {/* Band power rows */}
-                  {bandNames.map(band => {
-                    const pctA = (a.bands[band] / totA) * 100;
-                    const pctB = (b.bands[band] / totB) * 100;
-                    const delta = pctB - pctA;
-                    const slowBand = band === "delta" || band === "theta";
-                    const changeColor = Math.abs(delta) < 2 ? "#888" : (slowBand ? (delta > 0 ? "#f87171" : "#10B981") : (delta > 0 ? "#10B981" : "#f87171"));
-                    return (
-                      <div key={band} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-                        <div style={{ width: 6, height: 6, background: bandColors[band], flexShrink: 0 }}/>
-                        <span style={{ fontSize: 8, color: "#888", width: 32 }}>{band.charAt(0).toUpperCase() + band.slice(1, 5)}</span>
-                        <span style={{ fontSize: 8, color: "#444", width: 55 }}>{bandLabels[band]?.split(" ")[1] || ""}</span>
-                        <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 42, textAlign: "right" }}>{pctA.toFixed(1)}%</span>
-                        <span style={{ fontSize: 8, color: "#333" }}>&rarr;</span>
-                        <span style={{ fontSize: 9, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 42 }}>{pctB.toFixed(1)}%</span>
-                        <span style={{ fontSize: 10, fontWeight: 700, color: changeColor, fontFamily: "'IBM Plex Mono', monospace", width: 52, textAlign: "right" }}>
-                          {delta > 0 ? "+" : ""}{delta.toFixed(1)}%
-                        </span>
-                      </div>
-                    );
-                  })}
-
-                  {/* Key indices */}
-                  <div style={{ borderTop: "1px solid #111", marginTop: 6, paddingTop: 6 }}>
-                    {/* Peak Alpha Frequency */}
-                    {(() => {
-                      const pafA = a.peakAlphaFreq, pafB = b.peakAlphaFreq;
-                      const delta = pafB - pafA;
-                      // Slowing = decrease in PAF = bad
-                      const color = Math.abs(delta) < 0.3 ? "#888" : (delta < 0 ? "#f87171" : "#10B981");
-                      return (
-                        <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
-                          <span style={{ fontSize: 8, color: "#10B981", width: 90 }}>Peak Alpha Freq</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: "right" }}>{pafA.toFixed(1)} Hz</span>
-                          <span style={{ fontSize: 8, color: "#333" }}>&rarr;</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 50 }}>{pafB.toFixed(1)} Hz</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color, fontFamily: "'IBM Plex Mono', monospace", flex: 1, textAlign: "right" }}>
-                            {delta > 0 ? "+" : ""}{delta.toFixed(1)} Hz
-                          </span>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Theta/Beta Ratio */}
-                    {(() => {
-                      const tbrA = a.thetaBetaRatio, tbrB = b.thetaBetaRatio;
-                      const delta = tbrB - tbrA;
-                      // Increase in TBR = more slow activity relative to fast = bad
-                      const color = Math.abs(delta) < 0.2 ? "#888" : (delta > 0 ? "#f87171" : "#10B981");
-                      return (
-                        <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
-                          <span style={{ fontSize: 8, color: "#F59E0B", width: 90 }}>Theta/Beta Ratio</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: "right" }}>{tbrA.toFixed(2)}</span>
-                          <span style={{ fontSize: 8, color: "#333" }}>&rarr;</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 50 }}>{tbrB.toFixed(2)}</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color, fontFamily: "'IBM Plex Mono', monospace", flex: 1, textAlign: "right" }}>
-                            {delta > 0 ? "+" : ""}{delta.toFixed(2)}
-                          </span>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Slow/Fast Ratio: (delta+theta)/(alpha+beta) — composite slowing index */}
-                    {(() => {
-                      const slowA = (a.bands.delta + a.bands.theta), fastA = (a.bands.alpha + a.bands.beta) || 0.0001;
-                      const slowB = (b.bands.delta + b.bands.theta), fastB = (b.bands.alpha + b.bands.beta) || 0.0001;
-                      const ratioA = slowA / fastA, ratioB = slowB / fastB;
-                      const delta = ratioB - ratioA;
-                      const color = Math.abs(delta) < 0.1 ? "#888" : (delta > 0 ? "#f87171" : "#10B981");
-                      return (
-                        <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
-                          <span style={{ fontSize: 8, color: "#6366F1", width: 90 }}>Slow/Fast Ratio</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: "right" }}>{ratioA.toFixed(2)}</span>
-                          <span style={{ fontSize: 8, color: "#333" }}>&rarr;</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 50 }}>{ratioB.toFixed(2)}</span>
-                          <span style={{ fontSize: 10, fontWeight: 700, color, fontFamily: "'IBM Plex Mono', monospace", flex: 1, textAlign: "right" }}>
-                            {delta > 0 ? "+" : ""}{delta.toFixed(2)}
-                          </span>
-                        </div>
-                      );
-                    })()}
+                <div style={{ marginBottom: 6 }}>
+                  <div style={{ fontSize: 8, color: "#555", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 4 }}>SPECTRAL POWER CHANGE</div>
+                  {bandNames.map(band => mkRow(
+                    band.charAt(0).toUpperCase() + band.slice(1),
+                    (a.bands[band] / totA) * 100, (b.bands[band] / totB) * 100, "%",
+                    band === "delta" || band === "theta"
+                  ))}
+                  <div style={{ borderTop: "1px solid #111", marginTop: 4, paddingTop: 4 }}>
+                    {mkRow("Peak Alpha", a.peakAlphaFreq, b.peakAlphaFreq, "Hz", false)}
+                    {mkRow("θ/β Ratio", a.thetaBetaRatio, b.thetaBetaRatio, "", true)}
+                    {mkRow("Slow/Fast", slowA / fastA, slowB / fastB, "", true)}
                   </div>
                 </div>
               );
             })()}
 
-            {/* ── EYE MOVEMENT SYNCHRONICITY ── */}
+            {/* ── EYE SYNCHRONICITY ── */}
             {(comparison.eyeA || comparison.eyeB) && (
-              <div style={{ borderTop: "1px solid #1a1a1a", paddingTop: 8, marginTop: 4 }}>
-                <div style={{ fontSize: 8, color: "#F59E0B", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>
-                  BILATERAL EYE MOVEMENT SYNCHRONICITY CHANGE
-                </div>
+              <div style={{ borderTop: "1px solid #1a1a1a", paddingTop: 6, marginTop: 2 }}>
+                <div style={{ fontSize: 8, color: "#F59E0B", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 4 }}>EYE SYNCHRONICITY CHANGE</div>
                 {comparison.eyeA && comparison.eyeB ? (() => {
                   const eA = comparison.eyeA, eB = comparison.eyeB;
-                  const rows = [];
-
-                  // Overall sync score
-                  if (eA.syncScore !== null && eB.syncScore !== null) {
-                    const d = eB.syncScore - eA.syncScore;
-                    const c = Math.abs(d) < 3 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "Sync Score", valueA: `${eA.syncScore.toFixed(0)}%`, valueB: `${eB.syncScore.toFixed(0)}%`, delta: `${d > 0 ? "+" : ""}${d.toFixed(1)}%`, color: c, bold: true });
-                  }
-
-                  // WPLI Vertical
-                  if (eA.wpliVert !== null && eB.wpliVert !== null) {
-                    const d = eB.wpliVert - eA.wpliVert;
-                    const c = Math.abs(d) < 0.03 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "WPLI Vert", valueA: eA.wpliVert.toFixed(3), valueB: eB.wpliVert.toFixed(3), delta: `${d > 0 ? "+" : ""}${d.toFixed(3)}`, color: c });
-                  }
-
-                  // WPLI Horizontal
-                  if (eA.wpliHoriz !== null && eB.wpliHoriz !== null) {
-                    const d = eB.wpliHoriz - eA.wpliHoriz;
-                    const c = Math.abs(d) < 0.03 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "WPLI Horiz", valueA: eA.wpliHoriz.toFixed(3), valueB: eB.wpliHoriz.toFixed(3), delta: `${d > 0 ? "+" : ""}${d.toFixed(3)}`, color: c });
-                  }
-
-                  // Pearson Vertical
-                  if (eA.corrVert !== null && eB.corrVert !== null) {
-                    const d = eB.corrVert - eA.corrVert;
-                    const c = Math.abs(d) < 0.03 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "r Vert", valueA: eA.corrVert.toFixed(3), valueB: eB.corrVert.toFixed(3), delta: `${d > 0 ? "+" : ""}${d.toFixed(3)}`, color: c, dim: true });
-                  }
-
-                  // Pearson Horizontal
-                  if (eA.corrHoriz !== null && eB.corrHoriz !== null) {
-                    const d = eB.corrHoriz - eA.corrHoriz;
-                    const c = Math.abs(d) < 0.03 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "r Horiz", valueA: eA.corrHoriz.toFixed(3), valueB: eB.corrHoriz.toFixed(3), delta: `${d > 0 ? "+" : ""}${d.toFixed(3)}`, color: c, dim: true });
-                  }
-
-                  // Blink Symmetry
-                  if (eA.blinkSymmetry !== null && eB.blinkSymmetry !== null) {
-                    const pA = eA.blinkSymmetry * 100, pB = eB.blinkSymmetry * 100;
-                    const d = pB - pA;
-                    const c = Math.abs(d) < 5 ? "#888" : (d > 0 ? "#10B981" : "#f87171");
-                    rows.push({ label: "Blink Sym", valueA: `${pA.toFixed(0)}%`, valueB: `${pB.toFixed(0)}%`, delta: `${d > 0 ? "+" : ""}${d.toFixed(0)}%`, color: c });
-                  }
-
+                  const mono = "'IBM Plex Mono', monospace";
+                  const eyeRow = (label, vA, vB, unit, labelColor) => {
+                    if (vA === null || vB === null) return null;
+                    const d = vB - vA;
+                    const thresh = unit === "%" ? 3 : 0.03;
+                    const c = Math.abs(d) < thresh ? "#555" : (d > 0 ? "#4ade80" : "#f87171");
+                    return (
+                      <div key={label} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 1 }}>
+                        <span style={{ fontSize: 8, color: labelColor || "#666", width: 68, flexShrink: 0 }}>{label}</span>
+                        <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: mono, width: 44, textAlign: "right" }}>{unit === "%" ? vA.toFixed(0) + "%" : vA.toFixed(3)}</span>
+                        <span style={{ fontSize: 7, color: "#333" }}>&rarr;</span>
+                        <span style={{ fontSize: 9, color: "#c084fc", fontFamily: mono, width: 44 }}>{unit === "%" ? vB.toFixed(0) + "%" : vB.toFixed(3)}</span>
+                        <span style={{ fontSize: 9, fontWeight: 700, color: c, fontFamily: mono, flex: 1, textAlign: "right" }}>
+                          {d > 0 ? "+" : ""}{unit === "%" ? d.toFixed(1) + "%" : d.toFixed(3)}
+                        </span>
+                      </div>
+                    );
+                  };
                   return (
                     <>
-                      <div style={{ fontSize: 7, color: "#333", marginBottom: 4 }}>
-                        WPLI (Vinck 2011): phase-lag index resistant to volume conduction. Pearson: amplitude correlation. Averaged across {eA.nEpochs}/{eB.nEpochs} epochs.
-                      </div>
-                      {rows.map((r, i) => (
-                        <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}>
-                          <span style={{ fontSize: 8, color: r.dim ? "#444" : "#888", width: 65 }}>{r.label}</span>
-                          <span style={{ fontSize: r.bold ? 11 : 9, fontWeight: r.bold ? 700 : 600, color: r.dim ? "#7ec8d980" : "#7ec8d9",
-                            fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: "right" }}>{r.valueA}</span>
-                          <span style={{ fontSize: 8, color: "#333" }}>&rarr;</span>
-                          <span style={{ fontSize: r.bold ? 11 : 9, fontWeight: r.bold ? 700 : 600, color: r.dim ? "#c084fc80" : "#c084fc",
-                            fontFamily: "'IBM Plex Mono', monospace", width: 50 }}>{r.valueB}</span>
-                          <span style={{ fontSize: r.bold ? 11 : 9, fontWeight: 700, color: r.color,
-                            fontFamily: "'IBM Plex Mono', monospace", flex: 1, textAlign: "right" }}>{r.delta}</span>
-                        </div>
-                      ))}
+                      {/* Bilateral (L eye vs R eye) */}
+                      <div style={{ fontSize: 7, color: "#444", marginBottom: 3 }}>Bilateral (L vs R eye)</div>
+                      {eyeRow("Sync Score", eA.syncScore, eB.syncScore, "%", "#F59E0B")}
+                      {eyeRow("WPLI Vert", eA.wpliVert, eB.wpliVert, "")}
+                      {eyeRow("WPLI Horiz", eA.wpliHoriz, eB.wpliHoriz, "")}
+                      {eyeRow("Blink Sym", eA.blinkSymmetry !== null ? eA.blinkSymmetry * 100 : null, eB.blinkSymmetry !== null ? eB.blinkSymmetry * 100 : null, "%")}
+
+                      {/* Per-eye (L eye internal, R eye internal) */}
+                      <div style={{ fontSize: 7, color: "#444", marginTop: 4, marginBottom: 3 }}>Per-eye (vertical vs horizontal within each eye)</div>
+                      {eyeRow("L Eye WPLI", eA.wpliLeft, eB.wpliLeft, "", "#4fc3f7")}
+                      {eyeRow("L Eye r", eA.corrLeft, eB.corrLeft, "")}
+                      {eyeRow("R Eye WPLI", eA.wpliRight, eB.wpliRight, "", "#ce93d8")}
+                      {eyeRow("R Eye r", eA.corrRight, eB.corrRight, "")}
                     </>
                   );
                 })() : (
-                  <div style={{ fontSize: 9, color: "#555" }}>Eye lead data (LOC1/ROC1) not available in both files.</div>
+                  <div style={{ fontSize: 9, color: "#555" }}>Eye lead data (LOC/ROC) not available in both files.</div>
                 )}
               </div>
             )}
 
             {/* Clinical note */}
-            <div style={{ marginTop: 8, padding: "6px 8px", background: "#0a0a0a", border: "1px solid #1a1a1a" }}>
-              <div style={{ fontSize: 7, color: "#444", lineHeight: 1.4 }}>
-                Increased slow/fast ratio, decreased peak alpha frequency, elevated theta/beta ratio, or decreased eye synchronicity
-                between recordings may indicate persistent neurological change. Observational tool — not a diagnostic device.
+            <div style={{ marginTop: 6, padding: "4px 8px", background: "#0a0a0a", border: "1px solid #1a1a1a" }}>
+              <div style={{ fontSize: 7, color: "#444", lineHeight: 1.3 }}>
+                Observational tool — not a diagnostic device. WPLI: Vinck et al. 2011.
               </div>
             </div>
           </>
@@ -2932,7 +2868,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   const [visibilityState, setVisibilityState] = useState(0); // 0=default, 1=EEG shown (eyes hidden), 2=all shown
 
   // Normalize EDF label for matching (shared across hook)
-  const normEdf = (l) => l.toUpperCase().replace(/^(EEG|ECG|EOG|EMG)\s+/,"").replace(/[\s\-\.]/g,"");
+  const normEdf = (l) => { const u = l.toUpperCase().trim(); if (/^(ECG|EKG)$/i.test(u)) return u.replace(/[\s\-\.]/g,""); return u.replace(/^(EEG|ECG|EOG|EMG)\s+/,"").replace(/[\s\-\.]/g,""); };
   const normCh  = (l) => l.toUpperCase().replace(/[\s\-\.]/g,"");
 
   // Compute which montage channels have real EDF coverage
@@ -3122,7 +3058,19 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
             if (isEyeLead && EYE_LEAD_ALIASES[n] === ch) return true;
             return false;
           });
-          if (edfIdx >= 0) raw = getEDFEpochData(edfData, edfIdx, epochStart, epochSec, sampleRate);
+          if (edfIdx >= 0) {
+            raw = getEDFEpochData(edfData, edfIdx, epochStart, epochSec, sampleRate);
+            // ECG channels in many EDF files are stored in mV — convert to µV for display
+            if (raw && isEKG) {
+              let maxAbs = 0;
+              for (let i = 0; i < raw.length; i++) { const a = Math.abs(raw[i]); if (a > maxAbs) maxAbs = a; }
+              if (maxAbs > 0 && maxAbs < 10) { // values < 10 likely in mV, scale to µV
+                const scaled = new Float32Array(raw.length);
+                for (let i = 0; i < raw.length; i++) scaled[i] = raw[i] * 1000;
+                raw = scaled;
+              }
+            }
+          }
         } else {
           const parts = ch.split("-");
           const ref = parts[parts.length - 1];
