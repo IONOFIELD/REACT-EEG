@@ -913,8 +913,11 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
       const data = waveformData[i];
       if (!data) return;
       const chSensOffset = channelSensitivity[ch] || 0;
-      const ekgDampen = ch === "EKG" ? 3 : 1; // EKG needs lower default sensitivity
-      const chScale = Math.max(1, (sensitivity - chSensOffset)) * 1.5 * ekgDampen;
+      const isAux = ch === "EKG" || ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
+      const baseSens = isAux ? 7 : sensitivity; // Global sensitivity only affects EEG channels
+      const effSens = Math.max(1, baseSens + chSensOffset); // Per-channel offset still applies
+      const ekgDampen = ch === "EKG" ? 3 : 1;
+      const chScale = (73.5 / effSens) * ekgDampen; // Higher sensitivity = taller waveforms (mm/µV)
       ctx.strokeStyle = "#151515"; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(plotX, chHeight * (i + 1)); ctx.lineTo(W, chHeight * (i + 1)); ctx.stroke();
       ctx.fillStyle = ch === "EKG" ? "#EC4899" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B" : "#666";
@@ -1215,11 +1218,11 @@ function EEGControls({ montage, setMontage, eegSystem, setEegSystem, recordingSy
         <select value={epochSec} onChange={e=>setEpochSec(parseInt(e.target.value))} style={selectStyle}>
           {[5,10,15,20,30].map(v=><option key={v} value={v}>{v}s</option>)}
         </select></div>
-      <div><div style={microLabel}>Sensitivity</div>
+      <div><div style={microLabel}>Sensitivity (mm/µV)</div>
         <div style={{display:"flex",alignItems:"center",gap:4}}>
-          <button onClick={()=>setSensitivity(p=>Math.min(p+1,30))} style={controlBtn()}>{I.ZoomOut()}</button>
+          <button onClick={()=>setSensitivity(p=>Math.max(p-1,1))} style={controlBtn()}>{I.ZoomOut()}</button>
           <span style={{fontSize:11,color:"#888",minWidth:24,textAlign:"center"}}>{sensitivity}</span>
-          <button onClick={()=>setSensitivity(p=>Math.max(p-1,1))} style={controlBtn()}>{I.ZoomIn()}</button>
+          <button onClick={()=>setSensitivity(p=>Math.min(p+1,30))} style={controlBtn()}>{I.ZoomIn()}</button>
         </div></div>
       <div style={{flex:1}}/>
       {rightContent}
@@ -3217,8 +3220,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
       const secStep = epochSec > 0 ? 1 / epochSec : 1;
       if (e.key === "d") setCurrentEpoch(p => Math.min(p + secStep, totalEpochs - 1));
       if (e.key === "a") setCurrentEpoch(p => Math.max(p - secStep, 0));
-      if (e.key === "=") setSensitivity(p => Math.max(p-1, 1));
-      if (e.key === "-") setSensitivity(p => Math.min(p+1, 30));
+      if (e.key === "=") setSensitivity(p => Math.min(p+1, 30));
+      if (e.key === "-") setSensitivity(p => Math.max(p-1, 1));
       if (e.key === "Escape") { setIsAddingAnnotation(false); setAnnotationDraft(null); setIsMeasuring(false); setMeasureSel(null); measureDragRef.current = null; }
     };
     window.addEventListener("keydown", handler);
