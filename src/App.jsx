@@ -2706,7 +2706,9 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
 // ══════════════════════════════════════════════════════════════
 // EPOCH NAV BAR — shared
 // ══════════════════════════════════════════════════════════════
-function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, totalDuration, isPlaying, onPlayPause, leftContent, rightContent }) {
+function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochSec, epochStart, epochEnd, totalDuration, isPlaying, onPlayPause, leftContent, rightContent }) {
+  const secStep = epochSec > 0 ? 1 / epochSec : 1;
+  const maxEpoch = Math.max(0, totalEpochs - 1);
   return (
     <div style={{ display:"flex",alignItems:"center",justifyContent:"center",gap:10,
       padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0 }}>
@@ -2723,11 +2725,11 @@ function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epoc
           }
         </button>
       )}
-      <button onClick={()=>setCurrentEpoch(0)} style={controlBtn()}>|◀</button>
-      <button onClick={()=>setCurrentEpoch(Math.max(0,currentEpoch-1))} style={controlBtn()}>{I.ChevLeft()}</button>
+      <button onClick={()=>setCurrentEpoch(Math.max(0, Math.floor(currentEpoch) - 1))} title="Back 1 epoch" style={controlBtn()}>|◀</button>
+      <button onClick={()=>setCurrentEpoch(Math.max(0, currentEpoch - secStep))} title="Back 1 second" style={controlBtn()}>{I.ChevLeft()}</button>
       <div style={{display:"flex",alignItems:"center",gap:6}}>
         <span style={{fontSize:11,color:"#888"}}>
-          Epoch <span style={{color:"#7ec8d9",fontWeight:700}}>{currentEpoch+1}</span>
+          Epoch <span style={{color:"#7ec8d9",fontWeight:700}}>{Math.floor(currentEpoch)+1}</span>
           <span style={{color:"#444"}}> / {totalEpochs}</span>
         </span>
         <span style={{color:"#333"}}>|</span>
@@ -2735,13 +2737,13 @@ function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epoc
           {Math.floor(epochStart/60)}:{String(Math.floor(epochStart%60)).padStart(2,"0")}
         </span>
       </div>
-      <input type="range" min={0} max={totalEpochs-1} value={currentEpoch}
-        onChange={e=>setCurrentEpoch(parseInt(e.target.value))} style={{width:180,accentColor:"#7ec8d9"}}/>
+      <input type="range" min={0} max={maxEpoch} step={secStep} value={currentEpoch}
+        onChange={e=>setCurrentEpoch(parseFloat(e.target.value))} style={{width:180,accentColor:"#7ec8d9"}}/>
       <span style={{fontSize:11,color:"#555"}}>
         {totalDuration != null ? `${Math.floor(totalDuration/60)}:${String(Math.floor(totalDuration%60)).padStart(2,"0")}` : ""}
       </span>
-      <button onClick={()=>setCurrentEpoch(Math.min(totalEpochs-1,currentEpoch+1))} style={controlBtn()}>{I.ChevRight()}</button>
-      <button onClick={()=>setCurrentEpoch(totalEpochs-1)} style={controlBtn()}>▶|</button>
+      <button onClick={()=>setCurrentEpoch(Math.min(maxEpoch, currentEpoch + secStep))} title="Forward 1 second" style={controlBtn()}>{I.ChevRight()}</button>
+      <button onClick={()=>setCurrentEpoch(Math.min(maxEpoch, Math.ceil(currentEpoch + 0.001)))} title="Forward 1 epoch" style={controlBtn()}>▶|</button>
       <span style={{color:"#333"}}>|</span>
       {rightContent}
     </div>
@@ -3211,9 +3213,10 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   useEffect(() => {
     const handler = (e) => {
       if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-      // Arrow keys handled by ReviewTab/AcquireTab to support hold-to-scroll; d/a as aliases here
-      if (e.key === "d") setCurrentEpoch(p => Math.min(p+1, totalEpochs-1));
-      if (e.key === "a") setCurrentEpoch(p => Math.max(p-1, 0));
+      // Arrow keys handled by ReviewTab/AcquireTab to support hold-to-scroll; d/a as aliases (1 sec step)
+      const secStep = epochSec > 0 ? 1 / epochSec : 1;
+      if (e.key === "d") setCurrentEpoch(p => Math.min(p + secStep, totalEpochs - 1));
+      if (e.key === "a") setCurrentEpoch(p => Math.max(p - secStep, 0));
       if (e.key === "=") setSensitivity(p => Math.max(p-1, 1));
       if (e.key === "-") setSensitivity(p => Math.min(p+1, 30));
       if (e.key === "Escape") { setIsAddingAnnotation(false); setAnnotationDraft(null); setIsMeasuring(false); setMeasureSel(null); measureDragRef.current = null; }
@@ -4002,20 +4005,24 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
       if (e.key === "ArrowRight") {
         e.preventDefault();
         setIsPlaying(false);
-        setCurrentEpochRef.current(p => Math.min(p + 1, totalEpochsRef.current - 1));
+        const step = epochSecRef.current > 0 ? 1 / epochSecRef.current : 1;
+        setCurrentEpochRef.current(p => Math.min(p + step, totalEpochsRef.current - 1));
         if (!arrowInterval) {
           arrowInterval = setInterval(() => {
-            setCurrentEpochRef.current(p => Math.min(p + 1, totalEpochsRef.current - 1));
+            const s = epochSecRef.current > 0 ? 1 / epochSecRef.current : 1;
+            setCurrentEpochRef.current(p => Math.min(p + s, totalEpochsRef.current - 1));
           }, 180);
         }
       }
       if (e.key === "ArrowLeft") {
         e.preventDefault();
         setIsPlaying(false);
-        setCurrentEpochRef.current(p => Math.max(p - 1, 0));
+        const step = epochSecRef.current > 0 ? 1 / epochSecRef.current : 1;
+        setCurrentEpochRef.current(p => Math.max(p - step, 0));
         if (!arrowInterval) {
           arrowInterval = setInterval(() => {
-            setCurrentEpochRef.current(p => Math.max(p - 1, 0));
+            const s = epochSecRef.current > 0 ? 1 / epochSecRef.current : 1;
+            setCurrentEpochRef.current(p => Math.max(p - s, 0));
           }, 180);
         }
       }
@@ -4185,7 +4192,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
         </div>
       )}
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
-        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalEpochs={eeg.totalEpochs} epochSec={eeg.epochSec} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
         totalDuration={eeg.totalDuration}/>
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
         <WaveformCanvas channels={eeg.channels} waveformData={eeg.waveformData} epochSec={eeg.epochSec}
@@ -5182,7 +5189,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
         </div>
       )}
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
-        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalEpochs={eeg.totalEpochs} epochSec={eeg.epochSec} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
         totalDuration={acqDuration}
         isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
         leftContent={connectionState >= CONN.ready && !isRecording ? (
