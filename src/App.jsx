@@ -3952,19 +3952,20 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
     eeg.setAnnotationDraft(null); eeg.setAnnotationText(""); eeg.setIsAddingAnnotation(false);
   };
 
-  // Play / pause auto-advance — uses refs to avoid stale closures
+  // Play / pause auto-advance
   useEffect(() => {
     clearInterval(playIntervalRef.current);
-    if (isPlaying) {
+    if (isPlaying && eeg.epochSec > 0) {
+      const intervalMs = eeg.epochSec * 1000;
       playIntervalRef.current = setInterval(() => {
         setCurrentEpochRef.current(p => {
           if (p >= totalEpochsRef.current - 1) { setIsPlaying(false); return p; }
           return p + 1;
         });
-      }, epochSecRef.current * 1000);
+      }, intervalMs);
     }
     return () => clearInterval(playIntervalRef.current);
-  }, [isPlaying]);
+  }, [isPlaying, eeg.epochSec]);
 
   // Keyboard: Spacebar=play/pause, Arrow=epoch, Enter=annotation — all via stable refs
   const annotationDraftRef = useRef(null);
@@ -4870,7 +4871,8 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
 
   const isSim = selectedDevice?.protocol === "simulated";
   const simSeed = isSim ? (isRecording ? simEpochSeed : 42) : null;
-  const eeg = useEEGState(600, null, simSeed);
+  const acqDuration = elapsedSec > 0 ? elapsedSec : 0;
+  const eeg = useEEGState(Math.max(acqDuration, 1), null, simSeed);
 
   // Auto-hide channels that don't match the hardware's available electrodes
   useEffect(() => {
@@ -5182,7 +5184,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
       )}
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
         totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
-        totalDuration={eeg.totalDuration}
+        totalDuration={acqDuration}
         isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
         leftContent={connectionState >= CONN.ready && !isRecording ? (
           <button onClick={()=>{setShowImpedance(true);setImpedances(isSim ? generateImpedances(selectedDevice?.channels||19) : generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
