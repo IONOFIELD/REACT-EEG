@@ -847,7 +847,7 @@ function StatusControl({ status, onSetStatus, size = "normal" }) {
 // ══════════════════════════════════════════════════════════════
 function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd, sampleRate,
   sensitivity, channelSensitivity = {}, annotations = [], annotationDraft, selectedAnnotationType, hoveredTime,
-  isAddingAnnotation, isMeasuring, measurePoints, onMouseMove, onMouseLeave, onClick, onContextMenu, containerRef, canvasRef, children,
+  isAddingAnnotation, isMeasuring, measureSel, measureDragRef, onMouseMove, onMouseDown, onMouseUp, onMouseLeave, onClick, onContextMenu, containerRef, canvasRef, children,
   isLiveSimulation, simClipRef }) {
 
   const drawEEG = useCallback(() => {
@@ -955,95 +955,110 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
     }
     ctx.textAlign = "left";
 
-    // Measurement crosshairs
-    if (measurePoints && measurePoints.length > 0) {
-      measurePoints.forEach((pt, idx) => {
-        const x = plotX + ((pt.time - epochStart) / epochSec) * plotW;
-        const chIdx = pt.channelIdx;
-        const y = chIdx >= 0 && chIdx < chCount ? chHeight * chIdx + chHeight / 2 : pt.y;
+    // Measurement selection rectangle (drag or completed)
+    const sel = measureSel || (measureDragRef?.current ? {
+      startTime: Math.min(measureDragRef.current.startTime, measureDragRef.current.curTime),
+      endTime: Math.max(measureDragRef.current.startTime, measureDragRef.current.curTime),
+      startChIdx: Math.min(measureDragRef.current.startChIdx, measureDragRef.current.curChIdx),
+      endChIdx: Math.max(measureDragRef.current.startChIdx, measureDragRef.current.curChIdx),
+    } : null);
+    if (sel && isMeasuring) {
+      const x1 = plotX + ((sel.startTime - epochStart) / epochSec) * plotW;
+      const x2 = plotX + ((sel.endTime - epochStart) / epochSec) * plotW;
+      const y1 = chHeight * sel.startChIdx;
+      const y2 = chHeight * (sel.endChIdx + 1);
+      // Selection fill
+      ctx.fillStyle = "rgba(126, 200, 217, 0.08)";
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      // Selection border
+      ctx.strokeStyle = "#7ec8d9";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
 
-        // Vertical line
-        ctx.strokeStyle = idx === 0 ? "#FF6B6B" : "#6BFF6B";
+      // Analysis overlay (only for completed selection, not during drag)
+      if (measureSel && !measureDragRef?.current) {
+        const dur = sel.endTime - sel.startTime;
+        const durMs = (dur * 1000).toFixed(1);
+        const nCh = sel.endChIdx - sel.startChIdx + 1;
+        const chNames = channels.slice(sel.startChIdx, sel.endChIdx + 1);
+
+        // Compute region analysis
+        let totalPP = 0, ppCount = 0, domFreq = 0, freqCount = 0;
+        for (let ci = sel.startChIdx; ci <= sel.endChIdx; ci++) {
+          const data = waveformData[ci];
+          if (!data) continue;
+          const s0 = Math.max(0, Math.floor((sel.startTime - epochStart) / epochSec * data.length));
+          const s1 = Math.min(data.length, Math.floor((sel.endTime - epochStart) / epochSec * data.length));
+          if (s1 <= s0) continue;
+          let mn = Infinity, mx = -Infinity;
+          for (let j = s0; j < s1; j++) { if (data[j] < mn) mn = data[j]; if (data[j] > mx) mx = data[j]; }
+          totalPP += (mx - mn); ppCount++;
+
+          // Dominant frequency via zero-crossing rate (fast approximation)
+          let crossings = 0;
+          const slice = data.slice(s0, s1);
+          const mean = slice.reduce((a, b) => a + b, 0) / slice.length;
+          for (let j = 1; j < slice.length; j++) {
+            if ((slice[j] - mean) * (slice[j - 1] - mean) < 0) crossings++;
+          }
+          const estFreq = (crossings / 2) / dur;
+          domFreq += estFreq; freqCount++;
+        }
+        const avgPP = ppCount > 0 ? (totalPP / ppCount) : 0;
+        const avgFreq = freqCount > 0 ? (domFreq / freqCount) : 0;
+        const bandName = avgFreq < 4 ? "Delta" : avgFreq < 8 ? "Theta" : avgFreq < 13 ? "Alpha" : avgFreq < 30 ? "Beta" : "Gamma";
+
+        // Draw analysis box anchored to top-right of selection
+        const boxW = 130, boxH = 58;
+        let bx = x2 + 6, by = y1;
+        if (bx + boxW > plotX + plotW) bx = x1 - boxW - 6;
+        if (by + boxH > H) by = H - boxH - 4;
+
+        ctx.fillStyle = "#000000DD";
+        ctx.fillRect(bx, by, boxW, boxH);
+        ctx.strokeStyle = "#7ec8d960";
         ctx.lineWidth = 1;
-        ctx.setLineDash([3, 3]);
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
-        ctx.setLineDash([]);
+        ctx.strokeRect(bx, by, boxW, boxH);
 
-        // Horizontal line through the point
-        ctx.strokeStyle = idx === 0 ? "#FF6B6B40" : "#6BFF6B40";
-        ctx.beginPath(); ctx.moveTo(plotX, pt.y); ctx.lineTo(plotX + plotW, pt.y); ctx.stroke();
-
-        // Point marker
-        ctx.fillStyle = idx === 0 ? "#FF6B6B" : "#6BFF6B";
-        ctx.beginPath(); ctx.arc(x, pt.y, 4, 0, Math.PI * 2); ctx.fill();
-
-        // Label
-        ctx.fillStyle = idx === 0 ? "#FF6B6B" : "#6BFF6B";
-        ctx.font = "bold 10px 'IBM Plex Mono', monospace";
-        ctx.fillText(idx === 0 ? "A" : "B", x + 6, pt.y - 6);
-        ctx.font = "9px 'IBM Plex Mono', monospace";
-        ctx.fillText(pt.time.toFixed(3) + "s", x + 6, pt.y + 12);
-      });
-
-      // Draw connecting line and measurement between two points
-      if (measurePoints.length === 2) {
-        const p1 = measurePoints[0], p2 = measurePoints[1];
-        const x1 = plotX + ((p1.time - epochStart) / epochSec) * plotW;
-        const x2 = plotX + ((p2.time - epochStart) / epochSec) * plotW;
-
-        // Connecting line
-        ctx.strokeStyle = "#ffffff40";
-        ctx.lineWidth = 1;
-        ctx.setLineDash([2, 2]);
-        ctx.beginPath(); ctx.moveTo(x1, p1.y); ctx.lineTo(x2, p2.y); ctx.stroke();
-        ctx.setLineDash([]);
-
-        // Measurement box
-        const midX = (x1 + x2) / 2;
-        const midY = Math.min(p1.y, p2.y) - 20;
-        const timeDelta = Math.abs(p2.time - p1.time);
-        const ampDelta = Math.abs(p2.amplitude - p1.amplitude);
-        const freq = timeDelta > 0 ? (1 / timeDelta).toFixed(1) : "---";
-
-        const label1 = `dt: ${(timeDelta * 1000).toFixed(1)} ms`;
-        const label2 = `dA: ${ampDelta.toFixed(1)} uV`;
-        const label3 = `f: ${freq} Hz`;
-
-        ctx.fillStyle = "#000000CC";
-        ctx.fillRect(midX - 55, midY - 28, 110, 42);
-        ctx.strokeStyle = "#ffffff30";
-        ctx.strokeRect(midX - 55, midY - 28, 110, 42);
-
-        ctx.fillStyle = "#ffffff";
-        ctx.font = "bold 10px 'IBM Plex Mono', monospace";
-        ctx.textAlign = "center";
-        ctx.fillText(label1, midX, midY - 14);
-        ctx.fillStyle = "#7ec8d9";
-        ctx.fillText(label2, midX, midY);
-        ctx.fillStyle = "#F59E0B";
-        ctx.font = "9px 'IBM Plex Mono', monospace";
-        ctx.fillText(label3, midX, midY + 12);
+        ctx.font = "bold 9px 'IBM Plex Mono', monospace";
         ctx.textAlign = "left";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(`${durMs} ms  ${nCh} ch`, bx + 6, by + 13);
+        ctx.fillStyle = "#7ec8d9";
+        ctx.fillText(`Amp p-p: ${avgPP.toFixed(1)} \u00B5V`, bx + 6, by + 26);
+        ctx.fillStyle = "#F59E0B";
+        ctx.fillText(`Freq: ${avgFreq.toFixed(1)} Hz`, bx + 6, by + 39);
+        ctx.fillStyle = "#888";
+        ctx.font = "8px 'IBM Plex Mono', monospace";
+        ctx.fillText(`Band: ${bandName}`, bx + 6, by + 51);
       }
     }
-  }, [waveformData, channels, epochSec, epochStart, epochEnd, sampleRate, sensitivity, channelSensitivity, annotations, annotationDraft, hoveredTime, selectedAnnotationType, canvasRef, containerRef, measurePoints, isMeasuring, isLiveSimulation, simClipRef]);
+  }, [waveformData, channels, epochSec, epochStart, epochEnd, sampleRate, sensitivity, channelSensitivity, annotations, annotationDraft, hoveredTime, selectedAnnotationType, canvasRef, containerRef, measureSel, isMeasuring, isLiveSimulation, simClipRef]);
 
   useEffect(() => {
     drawEEG();
     const h = () => drawEEG();
     window.addEventListener("resize", h);
     let animFrame;
-    if (isLiveSimulation) {
-      const animLoop = () => { drawEEG(); animFrame = requestAnimationFrame(animLoop); };
+    if (isLiveSimulation || isMeasuring) {
+      const animLoop = () => {
+        if (canvasRef.current?.__measureDirty || isLiveSimulation) {
+          drawEEG();
+          if (canvasRef.current) canvasRef.current.__measureDirty = false;
+        }
+        animFrame = requestAnimationFrame(animLoop);
+      };
       animFrame = requestAnimationFrame(animLoop);
     }
     return () => { window.removeEventListener("resize", h); if (animFrame) cancelAnimationFrame(animFrame); };
-  }, [drawEEG]);
+  }, [drawEEG, isMeasuring]);
 
   return (
     <div ref={containerRef}
       style={{ flex: 1, position: "relative", cursor: isMeasuring ? "crosshair" : isAddingAnnotation ? "crosshair" : "default" }}
-      onMouseMove={onMouseMove} onMouseLeave={onMouseLeave} onClick={onClick} onContextMenu={onContextMenu}>
+      onMouseMove={onMouseMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp} onMouseLeave={onMouseLeave} onClick={onClick} onContextMenu={onContextMenu}>
       <canvas ref={canvasRef} style={{ display: "block" }} />
       {children}
     </div>
@@ -2694,7 +2709,7 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
 function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epochEnd, totalDuration, isPlaying, onPlayPause, leftContent, rightContent }) {
   return (
     <div style={{ display:"flex",alignItems:"center",justifyContent:"center",gap:10,
-      padding:"8px 16px",borderTop:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0 }}>
+      padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0 }}>
       {leftContent}
       {/* Play button — only shown when callback provided */}
       {onPlayPause && (
@@ -2728,7 +2743,6 @@ function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochStart, epoc
       <button onClick={()=>setCurrentEpoch(Math.min(totalEpochs-1,currentEpoch+1))} style={controlBtn()}>{I.ChevRight()}</button>
       <button onClick={()=>setCurrentEpoch(totalEpochs-1)} style={controlBtn()}>▶|</button>
       <span style={{color:"#333"}}>|</span>
-      <span style={{fontSize:9,color:"#333"}}>Space play/pause &nbsp; ← → / hold &nbsp; Enter annotate &nbsp; +/- sens</span>
       {rightContent}
     </div>
   );
@@ -2861,7 +2875,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   const [channelLpf, setChannelLpf] = useState({});
   const [contextMenu, setContextMenu] = useState(null);
   const [isMeasuring, setIsMeasuring] = useState(false);
-  const [measurePoints, setMeasurePoints] = useState([]);
+  const [measureSel, setMeasureSel] = useState(null); // {startTime, endTime, startChIdx, endChIdx}
+  const measureDragRef = useRef(null); // {startTime, startChIdx, curTime, curChIdx} during drag
 
   const [customElectrodes, setCustomElectrodes] = useState(
     () => new Set([...ELECTRODE_SETS["10-20"], "LOC1","LOC2","ROC1","ROC2"])
@@ -3137,40 +3152,47 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     return epochStart + (x / plotW) * epochSec;
   }, [epochStart, epochSec]);
 
-  const handleCanvasMouseMove = (e) => setHoveredTime(getTimeFromX(e.clientX));
-  const handleCanvasClick = (e) => {
-    // Measurement mode
-    if (isMeasuring) {
+  const getChIdxFromY = useCallback((clientY) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return 0;
+    const rect = canvas.getBoundingClientRect();
+    const y = clientY - rect.top;
+    const chHeight = rect.height / channels.length;
+    return Math.max(0, Math.min(channels.length - 1, Math.floor(y / chHeight)));
+  }, [channels, canvasRef]);
+
+  const handleCanvasMouseMove = (e) => {
+    setHoveredTime(getTimeFromX(e.clientX));
+    if (isMeasuring && measureDragRef.current) {
       const time = getTimeFromX(e.clientX);
       if (time === null) return;
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const rect = canvas.getBoundingClientRect();
-      const y = e.clientY - rect.top;
-      const chHeight = rect.height / channels.length;
-      const chIdx = Math.floor(y / chHeight);
-      const yCenter = chIdx >= 0 && chIdx < channels.length ? chHeight * chIdx + chHeight / 2 : y;
-
-      // Get amplitude at this point
-      let amplitude = 0;
-      if (chIdx >= 0 && chIdx < channels.length && waveformData[chIdx]) {
-        const sampleIdx = Math.floor((time - epochStart) / epochSec * waveformData[chIdx].length);
-        if (sampleIdx >= 0 && sampleIdx < waveformData[chIdx].length) {
-          amplitude = waveformData[chIdx][sampleIdx];
-        }
-      }
-
-      const point = { time, y, channelIdx: chIdx, channel: chIdx >= 0 && chIdx < channels.length ? channels[chIdx] : "", amplitude };
-
-      if (measurePoints.length < 2) {
-        setMeasurePoints(prev => [...prev, point]);
-      } else {
-        // Reset and start new measurement
-        setMeasurePoints([point]);
-      }
-      return;
+      measureDragRef.current.curTime = time;
+      measureDragRef.current.curChIdx = getChIdxFromY(e.clientY);
+      // Force redraw via canvas
+      if (canvasRef.current) canvasRef.current.__measureDirty = true;
     }
-
+  };
+  const handleCanvasMouseDown = (e) => {
+    if (!isMeasuring) return;
+    if (e.button !== 0) return;
+    const time = getTimeFromX(e.clientX);
+    if (time === null) return;
+    const chIdx = getChIdxFromY(e.clientY);
+    measureDragRef.current = { startTime: time, startChIdx: chIdx, curTime: time, curChIdx: chIdx };
+    setMeasureSel(null);
+    e.preventDefault();
+  };
+  const handleCanvasMouseUp = (e) => {
+    if (!isMeasuring || !measureDragRef.current) return;
+    const drag = measureDragRef.current;
+    measureDragRef.current = null;
+    const t0 = Math.min(drag.startTime, drag.curTime), t1 = Math.max(drag.startTime, drag.curTime);
+    const c0 = Math.min(drag.startChIdx, drag.curChIdx), c1 = Math.max(drag.startChIdx, drag.curChIdx);
+    if (t1 - t0 < 0.005) return; // too small, ignore
+    setMeasureSel({ startTime: t0, endTime: t1, startChIdx: c0, endChIdx: c1 });
+  };
+  const handleCanvasClick = (e) => {
+    if (isMeasuring) return; // handled by mousedown/mouseup
     // Annotation mode
     if (!isAddingAnnotation) return;
     const time = getTimeFromX(e.clientX);
@@ -3194,7 +3216,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
       if (e.key === "a") setCurrentEpoch(p => Math.max(p-1, 0));
       if (e.key === "=") setSensitivity(p => Math.max(p-1, 1));
       if (e.key === "-") setSensitivity(p => Math.min(p+1, 30));
-      if (e.key === "Escape") { setIsAddingAnnotation(false); setAnnotationDraft(null); setIsMeasuring(false); setMeasurePoints([]); }
+      if (e.key === "Escape") { setIsAddingAnnotation(false); setAnnotationDraft(null); setIsMeasuring(false); setMeasureSel(null); measureDragRef.current = null; }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -3216,8 +3238,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     channelHpf, setChannelHpf, channelLpf, setChannelLpf,
     auxWithData, AUX_CHANNELS, channelsWithData,
     contextMenu, setContextMenu, handleContextMenu,
-    isMeasuring, setIsMeasuring, measurePoints, setMeasurePoints,
-    handleCanvasMouseMove, handleCanvasClick, confirmAnnotation,
+    isMeasuring, setIsMeasuring, measureSel, setMeasureSel, measureDragRef,
+    handleCanvasMouseMove, handleCanvasMouseDown, handleCanvasMouseUp, handleCanvasClick, confirmAnnotation,
   };
 }
 
@@ -4140,8 +4162,8 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
             <button onClick={(e)=>{e.stopPropagation();setShowCompare(prev => !prev);}} style={controlBtn(showCompare)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.GitCompare()} Compare</span>
             </button>
-            <button onClick={(e)=>{e.stopPropagation();if(eeg.isMeasuring){eeg.setIsMeasuring(false);eeg.setMeasurePoints([]);}else{eeg.setIsMeasuring(true);eeg.setMeasurePoints([]);eeg.setIsAddingAnnotation(false);}}} style={controlBtn(eeg.isMeasuring)}>
-              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Ruler()} Measure{eeg.measurePoints.length>0?` (${eeg.measurePoints.length}/2)`:""}</span>
+            <button onClick={(e)=>{e.stopPropagation();if(eeg.isMeasuring){eeg.setIsMeasuring(false);eeg.setMeasureSel(null);eeg.measureDragRef.current=null;}else{eeg.setIsMeasuring(true);eeg.setMeasureSel(null);eeg.setIsAddingAnnotation(false);}}} style={controlBtn(eeg.isMeasuring)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Ruler()} Measure</span>
             </button>
             <button onClick={(e)=>{e.stopPropagation();setShowAnnotations(prev => !prev);}} style={controlBtn(showAnnotations)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Bookmark()} Annotations ({annotations.length})</span>
@@ -4161,14 +4183,18 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
           <span style={{fontSize:8,color:"#555",lineHeight:1}}>&#9660;</span>
         </div>
       )}
+      <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
+        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalDuration={eeg.totalDuration}
+        isPlaying={isPlaying} onPlayPause={()=>setIsPlaying(p=>!p)}/>
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
         <WaveformCanvas channels={eeg.channels} waveformData={eeg.waveformData} epochSec={eeg.epochSec}
           epochStart={eeg.epochStart} epochEnd={eeg.epochEnd} sampleRate={eeg.sampleRate}
           sensitivity={eeg.sensitivity} channelSensitivity={eeg.channelSensitivity}
           annotations={annotations} annotationDraft={eeg.annotationDraft}
           selectedAnnotationType={eeg.selectedAnnotationType} hoveredTime={eeg.hoveredTime}
-          isAddingAnnotation={eeg.isAddingAnnotation} isMeasuring={eeg.isMeasuring} measurePoints={eeg.measurePoints}
-          onMouseMove={eeg.handleCanvasMouseMove}
+          isAddingAnnotation={eeg.isAddingAnnotation} isMeasuring={eeg.isMeasuring} measureSel={eeg.measureSel} measureDragRef={eeg.measureDragRef}
+          onMouseMove={eeg.handleCanvasMouseMove} onMouseDown={eeg.handleCanvasMouseDown} onMouseUp={eeg.handleCanvasMouseUp}
           onMouseLeave={()=>eeg.setHoveredTime(null)} onClick={eeg.handleCanvasClick}
           onContextMenu={eeg.handleContextMenu}
           containerRef={eeg.containerRef} canvasRef={eeg.canvasRef}>
@@ -4177,10 +4203,6 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
             onCancel={()=>{eeg.setAnnotationDraft(null);eeg.setIsAddingAnnotation(false);}} containerRef={eeg.containerRef}/>
         </WaveformCanvas>
       </div>
-      <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
-        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
-        totalDuration={eeg.totalDuration}
-        isPlaying={isPlaying} onPlayPause={()=>setIsPlaying(p=>!p)}/>
 
       {/* Floating annotation panel */}
       {showAnnotations && (
@@ -5165,8 +5187,8 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           sensitivity={eeg.sensitivity} channelSensitivity={eeg.channelSensitivity}
           annotations={annotations} annotationDraft={eeg.annotationDraft}
           selectedAnnotationType={eeg.selectedAnnotationType} hoveredTime={eeg.hoveredTime}
-          isAddingAnnotation={eeg.isAddingAnnotation} isMeasuring={eeg.isMeasuring} measurePoints={eeg.measurePoints}
-          onMouseMove={eeg.handleCanvasMouseMove}
+          isAddingAnnotation={eeg.isAddingAnnotation} isMeasuring={eeg.isMeasuring} measureSel={eeg.measureSel} measureDragRef={eeg.measureDragRef}
+          onMouseMove={eeg.handleCanvasMouseMove} onMouseDown={eeg.handleCanvasMouseDown} onMouseUp={eeg.handleCanvasMouseUp}
           onMouseLeave={()=>eeg.setHoveredTime(null)} onClick={eeg.handleCanvasClick}
           onContextMenu={eeg.handleContextMenu}
           containerRef={eeg.containerRef} canvasRef={eeg.canvasRef}
