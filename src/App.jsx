@@ -2498,6 +2498,13 @@ function ComparePanel({ openTabs, records, edfFileStore, onSelectRecord, onClose
               return (
                 <div style={{ marginBottom: 6 }}>
                   <div style={{ fontSize: 8, color: "#555", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 4 }}>SPECTRAL POWER CHANGE</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 3 }}>
+                    <span style={{ fontSize: 7, color: "#333", width: 68, flexShrink: 0 }}></span>
+                    <span style={{ fontSize: 7, color: "#7ec8d9", fontFamily: mono, width: 44, textAlign: "right" }}>FILE A</span>
+                    <span style={{ fontSize: 7, color: "#333", width: 8 }}></span>
+                    <span style={{ fontSize: 7, color: "#c084fc", fontFamily: mono, width: 44 }}>FILE B</span>
+                    <span style={{ fontSize: 7, color: "#666", fontFamily: mono, flex: 1, textAlign: "right" }}>CHANGE</span>
+                  </div>
                   {bandNames.map(band => mkRow(
                     band.charAt(0).toUpperCase() + band.slice(1),
                     (a.bands[band] / totA) * 100, (b.bands[band] / totB) * 100, "%",
@@ -2562,7 +2569,7 @@ function ComparePanel({ openTabs, records, edfFileStore, onSelectRecord, onClose
             {/* Clinical note */}
             <div style={{ marginTop: 6, padding: "4px 8px", background: "#0a0a0a", border: "1px solid #1a1a1a" }}>
               <div style={{ fontSize: 7, color: "#444", lineHeight: 1.3 }}>
-                Observational tool — not a diagnostic device. WPLI: Vinck et al. 2011.
+                Observational tool — not a diagnostic device.
               </div>
             </div>
           </>
