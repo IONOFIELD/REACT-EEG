@@ -596,6 +596,7 @@ const I = {
   Package: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="m16.5 9.4-9-5.19"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.29 7 12 12 20.71 7"/><line x1="12" y1="22" x2="12" y2="12"/></svg>,
   BarChart: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
   Ruler: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 2l20 20"/><path d="M5.5 5.5l3-3"/><path d="M9.5 9.5l3-3"/><path d="M13.5 13.5l3-3"/><path d="M17.5 17.5l3-3"/></svg>,
+  GitCompare: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>,
 };
 
 // ── Seed data — single simulated test record ──
@@ -1900,16 +1901,16 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
           })()}
         </>)}
 
-        {/* Per-Channel View */}
+        {/* Per-Channel View — compact inline rows */}
         {activeView === "channels" && (
           <div>
-            <div style={{fontSize:9,color:"#555",fontWeight:700,letterSpacing:"0.08em",marginBottom:8}}>BAND POWER BY CHANNEL</div>
+            <div style={{fontSize:8,color:"#555",fontWeight:700,letterSpacing:"0.08em",marginBottom:4}}>BAND POWER BY CHANNEL</div>
             {analysis.channelData.filter(c => !new Set(["EKG","LOC1","LOC2","ROC1","ROC2"]).has(c.channel)).map(c => {
               const total = c.bands.total || 1;
               return (
-                <div key={c.channel} style={{marginBottom:8}}>
-                  <div style={{fontSize:10,color:"#aaa",fontFamily:"'IBM Plex Mono', monospace",marginBottom:3}}>{c.channel}</div>
-                  <div style={{display:"flex",height:8,background:"#0a0a0a",border:"1px solid #111"}}>
+                <div key={c.channel} style={{display:"flex",alignItems:"center",gap:4,marginBottom:1}}>
+                  <div style={{fontSize:8,color:"#888",fontFamily:"'IBM Plex Mono', monospace",width:28,textAlign:"right",flexShrink:0}}>{c.channel}</div>
+                  <div style={{display:"flex",height:5,background:"#0a0a0a",border:"1px solid #111",flex:1}}>
                     {Object.entries(bandColors).map(([band, color]) => (
                       <div key={band} title={`${band}: ${((c.bands[band]/total)*100).toFixed(1)}%`}
                         style={{height:"100%",background:color,width:`${(c.bands[band]/total)*100}%`}}/>
@@ -1918,10 +1919,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
                 </div>
               );
             })}
-            <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:6,marginTop:4,flexWrap:"wrap"}}>
               {Object.entries(bandColors).map(([band, color]) => (
-                <div key={band} style={{display:"flex",alignItems:"center",gap:3,fontSize:8,color:"#555"}}>
-                  <div style={{width:8,height:8,background:color}}/>{band}
+                <div key={band} style={{display:"flex",alignItems:"center",gap:2,fontSize:7,color:"#555"}}>
+                  <div style={{width:6,height:6,background:color}}/>{band}
                 </div>
               ))}
             </div>
@@ -2071,6 +2072,280 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
         }} style={{padding:"3px 8px",background:"#111",border:"1px solid #222",color:"#666",cursor:"pointer",fontSize:9,fontWeight:600}}>
           {I.Save(12)} Export
         </button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPARE PANEL — cross-file frequency & eye sync comparison
+// ══════════════════════════════════════════════════════════════
+function ComparePanel({ openTabs, records, edfFileStore, onClose, panelPos, setPanelPos }) {
+  const [dragging, setDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    if (panelPos.x === null) setPanelPos({ x: Math.round(window.innerWidth / 2 - 200), y: 80 });
+  }, []);
+  const onMouseDown = (e) => {
+    const r = panelRef.current?.getBoundingClientRect();
+    if (!r) return;
+    setDragOffset({ x: e.clientX - r.left, y: e.clientY - r.top });
+    setDragging(true);
+  };
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e) => setPanelPos({ x: e.clientX - dragOffset.x, y: e.clientY - dragOffset.y });
+    const onUp = () => setDragging(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [dragging]);
+
+  // Band power from raw EDF channelData (whole-file average)
+  const computeFileBands = (edfData) => {
+    if (!edfData?.channelData || !edfData.channelLabels) return null;
+    const sr = edfData.sampleRate || 256;
+    const AUX = new Set(["EKG","LOC1","LOC2","ROC1","ROC2","PG1","PG2"]);
+    const eegIdxs = edfData.channelLabels.map((l, i) => AUX.has(l.trim().replace(/\s+/g,"").toUpperCase()) ? -1 : i).filter(i => i >= 0);
+    if (eegIdxs.length === 0) return null;
+
+    const bandRanges = { delta: [0.5, 4], theta: [4, 8], alpha: [8, 13], beta: [13, 30], gamma: [30, 50] };
+    const avgBands = { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
+    let nCh = 0;
+
+    for (const idx of eegIdxs) {
+      const raw = edfData.channelData[idx];
+      if (!raw || raw.length === 0) continue;
+      // Use middle 2-second segment for representative sample
+      const segLen = Math.min(sr * 2, raw.length);
+      const start = Math.max(0, Math.floor(raw.length / 2 - segLen / 2));
+      const seg = raw.slice(start, start + segLen);
+      const N = seg.length;
+      const freqRes = sr / N;
+
+      // Hanning window
+      const windowed = new Float32Array(N);
+      let winE = 0;
+      for (let n = 0; n < N; n++) {
+        const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (N - 1)));
+        windowed[n] = seg[n] * w;
+        winE += w * w;
+      }
+      const winNorm = winE / N;
+
+      Object.entries(bandRanges).forEach(([band, [fLow, fHigh]]) => {
+        let p = 0;
+        const kL = Math.max(1, Math.round(fLow / freqRes));
+        const kH = Math.min(Math.floor(N / 2), Math.round(fHigh / freqRes));
+        for (let k = kL; k <= kH; k++) {
+          let re = 0, im = 0;
+          for (let n = 0; n < N; n++) {
+            const angle = (2 * Math.PI * k * n) / N;
+            re += windowed[n] * Math.cos(angle);
+            im -= windowed[n] * Math.sin(angle);
+          }
+          p += (re * re + im * im) / (N * N * winNorm);
+        }
+        avgBands[band] += p;
+      });
+      avgBands.total += Object.values(bandRanges).reduce((s, [fL, fH]) => {
+        let p = 0;
+        const kL = Math.max(1, Math.round(fL / freqRes));
+        const kH = Math.min(Math.floor(N / 2), Math.round(fH / freqRes));
+        for (let k = kL; k <= kH; k++) {
+          let re = 0, im = 0;
+          for (let n = 0; n < N; n++) {
+            const angle = (2 * Math.PI * k * n) / N;
+            re += windowed[n] * Math.cos(angle);
+            im -= windowed[n] * Math.sin(angle);
+          }
+          p += (re * re + im * im) / (N * N * winNorm);
+        }
+        return s + p;
+      }, 0);
+      nCh++;
+    }
+    if (nCh === 0) return null;
+    Object.keys(avgBands).forEach(k => avgBands[k] /= nCh);
+    return avgBands;
+  };
+
+  // Eye sync from raw EDF (WPLI between LOC1/ROC1 vertical pair)
+  const computeFileEyeSync = (edfData) => {
+    if (!edfData?.channelData || !edfData.channelLabels) return null;
+    const sr = edfData.sampleRate || 256;
+    const labels = edfData.channelLabels.map(l => l.trim().replace(/\s+/g,"").toUpperCase());
+    const loc1 = labels.indexOf("LOC1"), roc1 = labels.indexOf("ROC1");
+    if (loc1 < 0 || roc1 < 0) return null;
+    const segLen = Math.min(sr * 2, edfData.channelData[loc1].length);
+    const start = Math.max(0, Math.floor(edfData.channelData[loc1].length / 2 - segLen / 2));
+    const a = edfData.channelData[loc1].slice(start, start + segLen);
+    const b = edfData.channelData[roc1].slice(start, start + segLen);
+    const wpli = computeWPLI(a, b, sr, 1, 15);
+    const corr = computeCrossCorrelation(a, b);
+    const score = wpli !== null ? wpli * 100 : (corr !== null ? Math.max(0, corr) * 100 : null);
+    return { wpli, corr, score };
+  };
+
+  // Find same-subject pairs among open tabs
+  const comparison = useMemo(() => {
+    if (openTabs.length < 2) return { error: "Open 2+ files in Review to compare." };
+    // Match by subjectHash
+    const bySubject = {};
+    for (const tab of openTabs) {
+      const rec = records.find(r => r.filename === tab.filename);
+      if (!rec) continue;
+      const key = rec.subjectHash || rec.subjectId || rec.filename;
+      if (!bySubject[key]) bySubject[key] = [];
+      bySubject[key].push({ tab, rec });
+    }
+    const pairs = Object.values(bySubject).filter(g => g.length >= 2);
+    if (pairs.length === 0) return { error: "No matching subject found. Open two files from the same patient." };
+
+    // Use first pair found
+    const pair = pairs[0];
+    // Sort: BL first, then by date
+    pair.sort((a, b) => {
+      if (a.rec.studyType === "BL" && b.rec.studyType !== "BL") return -1;
+      if (b.rec.studyType === "BL" && a.rec.studyType !== "BL") return 1;
+      return (a.rec.date || "").localeCompare(b.rec.date || "");
+    });
+    const [fileA, fileB] = pair;
+    const edfA = edfFileStore?.[fileA.tab.filename];
+    const edfB = edfFileStore?.[fileB.tab.filename];
+    const bandsA = edfA ? computeFileBands(edfA) : null;
+    const bandsB = edfB ? computeFileBands(edfB) : null;
+    const eyeA = edfA ? computeFileEyeSync(edfA) : null;
+    const eyeB = edfB ? computeFileEyeSync(edfB) : null;
+
+    // For sim records without EDF data, we can't compare
+    if (!bandsA && !bandsB) return { error: "No EDF data available for comparison. Import real EDF files." };
+
+    return { fileA, fileB, bandsA, bandsB, eyeA, eyeB };
+  }, [openTabs, records, edfFileStore]);
+
+  const bandColors = { delta: "#6366F1", theta: "#F59E0B", alpha: "#10B981", beta: "#3B82F6", gamma: "#EC4899" };
+  const bandNames = ["delta", "theta", "alpha", "beta", "gamma"];
+
+  return (
+    <div ref={panelRef} style={{
+      position: "fixed", left: panelPos.x, top: panelPos.y, width: 400,
+      background: "#0c0c0c", border: "1px solid #2a2a2a", borderRadius: 0,
+      display: "flex", flexDirection: "column", zIndex: 85,
+      cursor: dragging ? "grabbing" : "default", userSelect: dragging ? "none" : "auto",
+      maxHeight: "70vh",
+    }}>
+      <div onMouseDown={onMouseDown} style={{ padding: "8px 12px", borderBottom: "1px solid #1a1a1a", cursor: "grab",
+        display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: "#7ec8d9", letterSpacing: "0.1em" }}>CROSS-FILE COMPARISON</span>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "#555", cursor: "pointer", padding: 2 }}>{I.X()}</button>
+      </div>
+
+      <div style={{ flex: 1, overflow: "auto", padding: "10px 12px" }}>
+        {comparison.error ? (
+          <div style={{ fontSize: 11, color: "#666", textAlign: "center", padding: "20px 10px", lineHeight: 1.6 }}>
+            {comparison.error}
+          </div>
+        ) : (
+          <>
+            {/* File labels */}
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              <div style={{ flex: 1, background: "#0a1520", border: "1px solid #1a3040", padding: "4px 8px" }}>
+                <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.06em" }}>{comparison.fileA.rec.studyType === "BL" ? "BASELINE" : "FILE A"}</div>
+                <div style={{ fontSize: 9, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {comparison.fileA.tab.filename}
+                </div>
+                <div style={{ fontSize: 8, color: "#444" }}>{comparison.fileA.rec.date}</div>
+              </div>
+              <div style={{ flex: 1, background: "#150a20", border: "1px solid #302040", padding: "4px 8px" }}>
+                <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.06em" }}>{comparison.fileB.rec.studyType === "FU" ? "FOLLOW-UP" : "FILE B"}</div>
+                <div style={{ fontSize: 9, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {comparison.fileB.tab.filename}
+                </div>
+                <div style={{ fontSize: 8, color: "#444" }}>{comparison.fileB.rec.date}</div>
+              </div>
+            </div>
+
+            {/* Band power comparison */}
+            {comparison.bandsA && comparison.bandsB && (
+              <div style={{ marginBottom: 10 }}>
+                <div style={{ fontSize: 8, color: "#555", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>BAND POWER CHANGE</div>
+                {bandNames.map(band => {
+                  const totA = comparison.bandsA.total || 1;
+                  const totB = comparison.bandsB.total || 1;
+                  const pctA = (comparison.bandsA[band] / totA) * 100;
+                  const pctB = (comparison.bandsB[band] / totB) * 100;
+                  const delta = pctB - pctA;
+                  // For theta/delta increase = worse (red), decrease = better (green)
+                  // For alpha increase = better (green), decrease = worse (red) — in concussion context
+                  const slowBand = band === "delta" || band === "theta";
+                  const changeColor = Math.abs(delta) < 2 ? "#888" : (slowBand ? (delta > 0 ? "#f87171" : "#10B981") : (delta > 0 ? "#10B981" : "#f87171"));
+                  return (
+                    <div key={band} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+                      <div style={{ width: 8, height: 8, background: bandColors[band], flexShrink: 0 }}/>
+                      <span style={{ fontSize: 9, color: "#888", width: 40 }}>{band.charAt(0).toUpperCase() + band.slice(1, 3)}</span>
+                      <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 4 }}>
+                        <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 40, textAlign: "right" }}>{pctA.toFixed(1)}%</span>
+                        <span style={{ fontSize: 9, color: "#555" }}>&rarr;</span>
+                        <span style={{ fontSize: 9, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 40 }}>{pctB.toFixed(1)}%</span>
+                      </div>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: changeColor, fontFamily: "'IBM Plex Mono', monospace", width: 50, textAlign: "right" }}>
+                        {delta > 0 ? "+" : ""}{delta.toFixed(1)}%
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Eye sync comparison */}
+            {(comparison.eyeA || comparison.eyeB) && (
+              <div style={{ borderTop: "1px solid #1a1a1a", paddingTop: 8 }}>
+                <div style={{ fontSize: 8, color: "#F59E0B", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>EYE SYNCHRONICITY CHANGE</div>
+                {comparison.eyeA && comparison.eyeB ? (() => {
+                  const scoreA = comparison.eyeA.score || 0;
+                  const scoreB = comparison.eyeB.score || 0;
+                  const delta = scoreB - scoreA;
+                  const changeColor = Math.abs(delta) < 3 ? "#888" : (delta > 0 ? "#10B981" : "#f87171");
+                  return (
+                    <>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                        <span style={{ fontSize: 9, color: "#888", width: 50 }}>Sync</span>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: "#7ec8d9", fontFamily: "'IBM Plex Mono', monospace", width: 40, textAlign: "right" }}>{scoreA.toFixed(0)}%</span>
+                        <span style={{ fontSize: 9, color: "#555" }}>&rarr;</span>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: "#c084fc", fontFamily: "'IBM Plex Mono', monospace", width: 40 }}>{scoreB.toFixed(0)}%</span>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: changeColor, fontFamily: "'IBM Plex Mono', monospace", flex: 1, textAlign: "right" }}>
+                          {delta > 0 ? "+" : ""}{delta.toFixed(1)}%
+                        </span>
+                      </div>
+                      {comparison.eyeA.wpli !== null && comparison.eyeB.wpli !== null && (
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
+                          <span style={{ fontSize: 8, color: "#555", width: 50 }}>WPLI</span>
+                          <span style={{ fontSize: 9, color: "#7ec8d980", fontFamily: "'IBM Plex Mono', monospace", width: 40, textAlign: "right" }}>{comparison.eyeA.wpli.toFixed(3)}</span>
+                          <span style={{ fontSize: 9, color: "#444" }}>&rarr;</span>
+                          <span style={{ fontSize: 9, color: "#c084fc80", fontFamily: "'IBM Plex Mono', monospace", width: 40 }}>{comparison.eyeB.wpli.toFixed(3)}</span>
+                        </div>
+                      )}
+                    </>
+                  );
+                })() : (
+                  <div style={{ fontSize: 9, color: "#555" }}>Eye lead data not available for both files.</div>
+                )}
+              </div>
+            )}
+
+            {/* Clinical interpretation hint */}
+            {comparison.bandsA && comparison.bandsB && (
+              <div style={{ marginTop: 8, padding: "6px 8px", background: "#0a0a0a", border: "1px solid #1a1a1a" }}>
+                <div style={{ fontSize: 7, color: "#444", lineHeight: 1.4 }}>
+                  Increased delta/theta or decreased eye synchronicity between recordings may indicate persistent neurological change. This is an observational tool — not a diagnostic device.
+                </div>
+              </div>
+            )}
+          </>
+        )}
       </div>
     </div>
   );
@@ -3317,7 +3592,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
 // ══════════════════════════════════════════════════════════════
 // TAB: REVIEW
 // ══════════════════════════════════════════════════════════════
-function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, edfFileStore }) {
+function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, edfFileStore, openTabs, setOpenTabs, activeTabIdx, setActiveTabIdx, tabEpochCache }) {
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   const totalDur = edfData ? edfData.totalDuration : 600;
@@ -3336,13 +3611,10 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   const [annotationPanelPos, setAnnotationPanelPos] = useState({ x: null, y: null });
   const [showAnalysis, setShowAnalysis] = useState(false);
   const [analysisPanelPos, setAnalysisPanelPos] = useState({ x: null, y: null });
+  const [showCompare, setShowCompare] = useState(false);
+  const [comparePanelPos, setComparePanelPos] = useState({ x: null, y: null });
   const [isPlaying, setIsPlaying] = useState(false);
   const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
-
-  // Multi-tab state
-  const [openTabs, setOpenTabs] = useState([]);
-  const [activeTabIdx, setActiveTabIdx] = useState(0);
-  const tabEpochCache = useRef({});
 
   const playIntervalRef = useRef(null);
   // Stable refs so interval callbacks never capture stale values
@@ -3358,26 +3630,14 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
     eeg.setCurrentEpoch(cached !== undefined ? cached : 0);
   }, [record?.filename]);
 
-  // Sync tabs with current record
+  // Save epoch when switching away from a file
   const prevFilenameRef = useRef(null);
   useEffect(() => {
     if (!record) return;
-    // Save epoch of the tab we're leaving (e.g. via file picker)
     if (prevFilenameRef.current && prevFilenameRef.current !== record.filename) {
       tabEpochCache.current[prevFilenameRef.current] = eeg.currentEpoch;
     }
     prevFilenameRef.current = record.filename;
-    setOpenTabs(prev => {
-      const existingIdx = prev.findIndex(t => t.filename === record.filename);
-      if (existingIdx >= 0) {
-        setActiveTabIdx(existingIdx);
-        return prev;
-      }
-      let next = [...prev, record];
-      if (next.length > 5) next = next.slice(next.length - 5);
-      setActiveTabIdx(next.length - 1);
-      return next;
-    });
   }, [record?.filename]);
 
   const switchToTab = (idx) => {
@@ -3515,7 +3775,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   return (
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden"}}>
       {/* Multi-file tabs — always visible */}
-      {openTabs.length > 1 && (
+      {openTabs.length >= 1 && (
         <div style={{display:"flex",alignItems:"center",gap:0,padding:"0 16px",borderBottom:"1px solid #1a1a1a",background:"#080808",overflow:"hidden",flexShrink:0}}>
           {openTabs.map((tab, idx) => {
             const isActive = idx === activeTabIdx;
@@ -3624,6 +3884,9 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
             <button onClick={(e)=>{e.stopPropagation();setShowAnalysis(prev => !prev);}} style={controlBtn(showAnalysis)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.BarChart()} qEEG</span>
             </button>
+            <button onClick={(e)=>{e.stopPropagation();setShowCompare(prev => !prev);}} style={controlBtn(showCompare)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.GitCompare()} Compare</span>
+            </button>
             <button onClick={(e)=>{e.stopPropagation();if(eeg.isMeasuring){eeg.setIsMeasuring(false);eeg.setMeasurePoints([]);}else{eeg.setIsMeasuring(true);eeg.setMeasurePoints([]);eeg.setIsAddingAnnotation(false);}}} style={controlBtn(eeg.isMeasuring)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Ruler()} Measure{eeg.measurePoints.length>0?` (${eeg.measurePoints.length}/2)`:""}</span>
             </button>
@@ -3683,6 +3946,13 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
           sampleRate={eeg.sampleRate} epochSec={eeg.epochSec} epochStart={eeg.epochStart}
           onClose={()=>setShowAnalysis(false)}
           panelPos={analysisPanelPos} setPanelPos={setAnalysisPanelPos}/>
+      )}
+
+      {/* Floating cross-file comparison panel */}
+      {showCompare && (
+        <ComparePanel openTabs={openTabs} records={records} edfFileStore={edfFileStore}
+          onClose={()=>setShowCompare(false)}
+          panelPos={comparePanelPos} setPanelPos={setComparePanelPos}/>
       )}
 
       {eeg.showCustomPicker && (
@@ -4815,6 +5085,11 @@ export default function ReactEEGApp() {
   const [initialized, setInitialized] = useState(false);
   const [dataDir, setDataDir] = useState("");
 
+  // Multi-tab state (lifted from ReviewTab so it persists across tab switches)
+  const [openTabs, setOpenTabs] = useState([]);
+  const [activeTabIdx, setActiveTabIdx] = useState(0);
+  const tabEpochCache = useRef({});
+
   // ── Initialize on first launch ──
   useEffect(() => {
     (async () => {
@@ -4869,6 +5144,18 @@ export default function ReactEEGApp() {
   const openReview = (record) => {
     setReviewRecord(record);
     setActiveTab("review");
+    // Add to multi-tab list (max 5)
+    setOpenTabs(prev => {
+      const existingIdx = prev.findIndex(t => t.filename === record.filename);
+      if (existingIdx >= 0) {
+        setActiveTabIdx(existingIdx);
+        return prev;
+      }
+      let next = [...prev, record];
+      if (next.length > 5) next = next.slice(next.length - 5);
+      setActiveTabIdx(next.length - 1);
+      return next;
+    });
   };
 
   const updateRecordStatus = (recordId, newStatus) => {
@@ -4984,7 +5271,7 @@ export default function ReactEEGApp() {
       {/* ══ Tab Content ══ */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab records={records} setRecords={setRecords} onOpenReview={openReview} updateRecordStatus={updateRecordStatus} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
-        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore}/>}
+        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore} openTabs={openTabs} setOpenTabs={setOpenTabs} activeTabIdx={activeTabIdx} setActiveTabIdx={setActiveTabIdx} tabEpochCache={tabEpochCache}/>}
         {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore} openReview={openReview}/>}
       </div>
     </div>
