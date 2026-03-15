@@ -4186,8 +4186,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
       )}
       <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
         totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
-        totalDuration={eeg.totalDuration}
-        isPlaying={isPlaying} onPlayPause={()=>setIsPlaying(p=>!p)}/>
+        totalDuration={eeg.totalDuration}/>
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
         <WaveformCanvas channels={eeg.channels} waveformData={eeg.waveformData} epochSec={eeg.epochSec}
           epochStart={eeg.epochStart} epochEnd={eeg.epochEnd} sampleRate={eeg.sampleRate}
