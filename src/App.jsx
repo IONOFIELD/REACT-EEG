@@ -680,7 +680,7 @@ const tauriBridge = {
     console.log(`[Tauri stub] ${cmd}`, args);
     if (cmd === "initialize_app") return "Browser Mode — no local storage";
     if (cmd === "get_data_directory") return "Documents/REACT EEG (Tauri required)";
-    if (cmd === "load_library_index") return "[]";
+    if (cmd === "load_library_index") return localStorage.getItem("react_eeg_library") || "[]";
     if (cmd === "load_config") return "{}";
     return null;
   },
@@ -699,6 +699,7 @@ const tauriBridge = {
     if (window.__TAURI__) {
       return window.__TAURI__.invoke("save_library_index", { recordsJson: JSON.stringify(records) });
     }
+    try { localStorage.setItem("react_eeg_library", JSON.stringify(records)); } catch (e) { console.warn("Failed to save library:", e); }
   },
   async saveAnnotations(filename, annotations) {
     if (window.__TAURI__) {
@@ -912,7 +913,8 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
       const data = waveformData[i];
       if (!data) return;
       const chSensOffset = channelSensitivity[ch] || 0;
-      const chScale = Math.max(1, (sensitivity - chSensOffset)) * 1.5;
+      const ekgDampen = ch === "EKG" ? 3 : 1; // EKG needs lower default sensitivity
+      const chScale = Math.max(1, (sensitivity - chSensOffset)) * 1.5 * ekgDampen;
       ctx.strokeStyle = "#151515"; ctx.lineWidth = 0.5;
       ctx.beginPath(); ctx.moveTo(plotX, chHeight * (i + 1)); ctx.lineTo(W, chHeight * (i + 1)); ctx.stroke();
       ctx.fillStyle = ch === "EKG" ? "#EC4899" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B" : "#666";
