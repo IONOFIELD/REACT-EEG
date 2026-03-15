@@ -5180,6 +5180,30 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           <span style={{fontSize:8,color:"#555",lineHeight:1}}>&#9660;</span>
         </div>
       )}
+      <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
+        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
+        totalDuration={eeg.totalDuration}
+        isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
+        leftContent={connectionState >= CONN.ready && !isRecording ? (
+          <button onClick={()=>{setShowImpedance(true);setImpedances(isSim ? generateImpedances(selectedDevice?.channels||19) : generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
+            padding:"4px 10px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
+            color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+          }}>{I.Ohm(14)} Z</button>
+        ) : null}
+        rightContent={!isRecording ? (
+          connectionState >= CONN.ready ? (
+            <button onClick={startRecording} disabled={!canRecord} style={{
+              padding:"4px 14px",background:canRecord?"#7f1d1d":"#1a1a1a",border:`1px solid ${canRecord?"#EF444450":"#333"}`,
+              borderRadius:0,color:canRecord?"#EF4444":"#555",cursor:canRecord?"pointer":"default",
+              fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+            }}>{I.Record()} REC</button>
+          ) : null
+        ) : (
+          <button onClick={stopRecording} style={{
+            padding:"4px 10px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
+            color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
+          }}>{I.Square()} STOP</button>
+        )}/>
 
       <div style={{flex:1,display:"flex",overflow:"hidden",position:"relative"}}>
         <WaveformCanvas channels={eeg.channels} waveformData={eeg.waveformData} epochSec={eeg.epochSec}
@@ -5249,31 +5273,6 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           )}
         </WaveformCanvas>
       </div>
-
-      <EpochNav currentEpoch={eeg.currentEpoch} setCurrentEpoch={eeg.setCurrentEpoch}
-        totalEpochs={eeg.totalEpochs} epochStart={eeg.epochStart} epochEnd={eeg.epochEnd}
-        totalDuration={eeg.totalDuration}
-        isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
-        leftContent={connectionState >= CONN.ready && !isRecording ? (
-          <button onClick={()=>{setShowImpedance(true);setImpedances(isSim ? generateImpedances(selectedDevice?.channels||19) : generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
-            padding:"4px 10px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
-            color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-          }}>{I.Ohm(14)} Z</button>
-        ) : null}
-        rightContent={!isRecording ? (
-          connectionState >= CONN.ready ? (
-            <button onClick={startRecording} disabled={!canRecord} style={{
-              padding:"4px 14px",background:canRecord?"#7f1d1d":"#1a1a1a",border:`1px solid ${canRecord?"#EF444450":"#333"}`,
-              borderRadius:0,color:canRecord?"#EF4444":"#555",cursor:canRecord?"pointer":"default",
-              fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-            }}>{I.Record()} REC</button>
-          ) : null
-        ) : (
-          <button onClick={stopRecording} style={{
-            padding:"4px 10px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
-            color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
-          }}>{I.Square()} STOP</button>
-        )}/>
 
       {/* Floating annotation panel */}
       {showAnnotations && (
