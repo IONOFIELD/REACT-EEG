@@ -73,21 +73,42 @@ const STUDY_TYPES = {
   AUTO: { label: "Autonomic", color: "#F97316" },
 };
 
-function generateFilename(subjectId, studyType, date, seq = 1) {
+function generateFilename(subjectId, studyType, date, sex = "", age = "", seq = 1) {
   const hash = hashSubjectId(subjectId).slice(0, 4);
   const cleanId = subjectId.replace(/[^a-zA-Z0-9-]/g, "").toUpperCase();
   const d = date.replace(/-/g, "");
-  return `${cleanId}-${studyType}-${hash}-${d}-${String(seq).padStart(3, "0")}.edf`;
+  const demo = (sex || age) ? `-${(sex || "").toUpperCase()}${age}` : "";
+  return `${cleanId}${demo}-${studyType}-${hash}-${d}-${String(seq).padStart(3, "0")}.edf`;
+}
+
+// Parse EDF+ patient field: "subjectcode sex birthdate name"
+function parseEdfPatientField(field) {
+  if (!field || !field.trim()) return { sex: null, age: null };
+  const parts = field.trim().split(/\s+/);
+  let sex = null, age = null;
+  if (parts.length >= 2 && /^[MFX]$/i.test(parts[1])) sex = parts[1].toUpperCase();
+  if (parts.length >= 3 && /^\d{2}-[A-Z]{3}-\d{4}$/i.test(parts[2])) {
+    const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+    const [dd, mmm, yyyy] = parts[2].split("-");
+    const mo = months[mmm.toUpperCase()];
+    if (mo !== undefined) {
+      const bd = new Date(parseInt(yyyy), mo, parseInt(dd));
+      const now = new Date();
+      age = Math.floor((now - bd) / (365.25 * 24 * 60 * 60 * 1000));
+      if (age < 0 || age > 120) age = null;
+    }
+  }
+  return { sex, age };
 }
 
 // Extract the subject ID and patient hash from filename
-// e.g. "FB001-BL-42C1-20260301-001.edf" → subjectId="FB001", hash="42C1"
+// e.g. "FB001-M32-BL-42C1-20260301-001.edf" or "FB001-BL-42C1-20260301-001.edf"
 function extractPatientHash(filename) {
-  const m = filename?.match(/^(.+?)-\w{2,4}-([A-F0-9]{4})-\d{8}-/i);
+  const m = filename?.match(/^(.+?)(?:-[MFX]\d{0,3})?-\w{2,4}-([A-F0-9]{4})-\d{8}-/i);
   return m ? m[2].toUpperCase() : null;
 }
 function extractSubjectId(filename) {
-  const m = filename?.match(/^(.+?)-\w{2,4}-[A-F0-9]{4}-\d{8}-/i);
+  const m = filename?.match(/^(.+?)(?:-[MFX]\d{0,3})?-\w{2,4}-[A-F0-9]{4}-\d{8}-/i);
   return m ? m[1] : null;
 }
 
@@ -631,6 +652,8 @@ function generateSeedData() {
     status: "pending",
     isTest: true,
     isSimulated: true,
+    sex: "",
+    age: null,
     notes: "Simulated baseline — lobe-accurate synthetic signals",
     uploadedAt: "2026-03-01T09:00:00.000Z",
   };
@@ -712,6 +735,18 @@ const tauriBridge = {
       return JSON.parse(json);
     }
     return [];
+  },
+  async saveClinicalNotes(filename, text) {
+    if (window.__TAURI__) {
+      return window.__TAURI__.invoke("save_clinical_notes", { filename, notesText: text });
+    }
+    try { localStorage.setItem("react_eeg_notes_" + filename, text); } catch (e) { console.warn("Failed to save notes:", e); }
+  },
+  async loadClinicalNotes(filename) {
+    if (window.__TAURI__) {
+      return await window.__TAURI__.invoke("load_clinical_notes", { filename }) || "";
+    }
+    return localStorage.getItem("react_eeg_notes_" + filename) || "";
   },
   async openDataDirectory() {
     if (window.__TAURI__) {
@@ -2707,6 +2742,58 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
 }
 
 // ══════════════════════════════════════════════════════════════
+// CLINICAL NOTES PANEL — floating, draggable
+// ══════════════════════════════════════════════════════════════
+function ClinicalNotesPanel({ notes, setNotes, filename, onClose, panelPos, setPanelPos }) {
+  const [dragging, setDragging] = useState(false);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    if (panelPos.x === null) {
+      setPanelPos({ x: 20, y: Math.round(window.innerHeight * 0.35) });
+    }
+  }, []);
+
+  const onMouseDown = (e) => {
+    if (e.target.tagName === "BUTTON" || e.target.tagName === "TEXTAREA") return;
+    setDragging(true);
+    const rect = panelRef.current.getBoundingClientRect();
+    setDragOffset({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+  };
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e) => setPanelPos({ x: e.clientX - dragOffset.x, y: e.clientY - dragOffset.y });
+    const onUp = () => setDragging(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [dragging, dragOffset]);
+
+  const len = (notes || "").length;
+  return (
+    <div ref={panelRef} style={{position:"fixed",left:panelPos.x??20,top:panelPos.y??200,width:280,background:"#111",border:"1px solid #2a2a2a",
+      zIndex:200,fontFamily:"'IBM Plex Mono', monospace",boxShadow:"0 4px 20px rgba(0,0,0,0.6)",cursor:dragging?"grabbing":"default"}}
+      onMouseDown={onMouseDown}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",borderBottom:"1px solid #1a1a1a",cursor:"grab"}}>
+        <span style={{fontSize:10,fontWeight:700,color:"#888",letterSpacing:"0.08em"}}>CLINICAL NOTES</span>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontSize:14,padding:0}}>&times;</button>
+      </div>
+      <div style={{padding:"10px 12px"}}>
+        <textarea value={notes||""} onChange={e=>setNotes(e.target.value.slice(0,500))} maxLength={500} placeholder="Injury location, date of injury, clinical context..."
+          style={{width:"100%",height:120,background:"#0d0d0d",border:"1px solid #2a2a2a",color:"#e0e0e0",fontSize:12,fontFamily:"'IBM Plex Mono', monospace",
+            padding:"8px",resize:"vertical",outline:"none",boxSizing:"border-box",lineHeight:1.5}}/>
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:6,fontSize:10}}>
+          <span style={{color:"#555"}}>{filename}</span>
+          <span style={{color:len>450?"#F59E0B":len>0?"#555":"#333"}}>{len}/500</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
 // EPOCH NAV BAR — shared
 // ══════════════════════════════════════════════════════════════
 function EpochNav({ currentEpoch, setCurrentEpoch, totalEpochs, epochSec, epochStart, epochEnd, totalDuration, isPlaying, onPlayPause, leftContent, rightContent }) {
@@ -3643,7 +3730,7 @@ function ExportModal({ records, onClose }) {
 function IngestForm({ onClose, onIngest, setEdfFileStore }) {
   const [form, setForm] = useState({
     subjectId:"",studyType:"BL",date:new Date().toISOString().split("T")[0],
-    channels:21,sampleRate:256,duration:30,montage:"10-20",notes:"",
+    channels:21,sampleRate:256,duration:30,montage:"10-20",notes:"",sex:"",age:"",
   });
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileInfo, setFileInfo] = useState(null);
@@ -3740,6 +3827,10 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
         const patientId = decoder.decode(header.slice(8, 88)).trim();
         if (patientId && patientId !== "X" && patientId.length > 0) {
           setFileInfo(prev => ({...prev, patientField: patientId}));
+          // Try to auto-detect sex/age from EDF+ patient field
+          const parsed = parseEdfPatientField(patientId);
+          if (parsed.sex) setForm(prev => ({...prev, sex: parsed.sex}));
+          if (parsed.age != null) setForm(prev => ({...prev, age: String(parsed.age)}));
         }
         // Recording date from bytes 168-176
         const startDate = decoder.decode(header.slice(168, 176)).trim();
@@ -3758,12 +3849,12 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
     if (!form.subjectId) return;
     const fileSizeMB = selectedFile ? Math.round(selectedFile.size/1024/1024*10)/10 :
       Math.round(form.channels*form.sampleRate*form.duration*60*2/1024/1024*10)/10;
-    const deIdFilename = generateFilename(form.subjectId,form.studyType,form.date);
+    const deIdFilename = generateFilename(form.subjectId,form.studyType,form.date,form.sex,form.age);
     const record = {
       id:`REC-${Date.now()}`,subjectHash:hashSubjectId(form.subjectId),subjectId:form.subjectId,sport:"",position:"",
       studyType:form.studyType,date:form.date,filename:deIdFilename,
       channels:form.channels,duration:form.duration,sampleRate:form.sampleRate,
-      fileSize:fileSizeMB,
+      fileSize:fileSizeMB,sex:form.sex||"",age:form.age?parseInt(form.age):null,
       montage:form.montage,status:"pending",isTest:false,notes:form.notes,uploadedAt:new Date().toISOString(),
       sourceFile: selectedFile ? selectedFile.name : null,
       hasEdfData: !!selectedFile,
@@ -3830,11 +3921,13 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
     </div>
 
     {form.subjectId&&<div style={{background:"#0a0a0a",border:"1px solid #1a3040",borderRadius:0,padding:"8px 12px",marginBottom:20,fontFamily:"'IBM Plex Mono', monospace",fontSize:12,color:"#7ec8d9"}}>
-      <span style={{color:"#555",fontSize:10,display:"block",marginBottom:2}}>GENERATED FILENAME</span>{generateFilename(form.subjectId,form.studyType,form.date)}
+      <span style={{color:"#555",fontSize:10,display:"block",marginBottom:2}}>GENERATED FILENAME</span>{generateFilename(form.subjectId,form.studyType,form.date,form.sex,form.age)}
     </div>}
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
       <div><label style={formLabel}>Internal Subject ID</label><SubjectIdInput value={form.subjectId} onChange={v=>setForm({...form,subjectId:v})}/></div>
       <div><label style={formLabel}>Study Type</label><select style={inputStyle} value={form.studyType} onChange={e=>setForm({...form,studyType:e.target.value})}>{Object.entries(STUDY_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}</select></div>
+      <div><label style={formLabel}>Sex</label><select style={inputStyle} value={form.sex} onChange={e=>setForm({...form,sex:e.target.value})}><option value="">—</option><option value="M">Male</option><option value="F">Female</option><option value="X">Other</option></select>{fileInfo?.patientField && form.sex && <span style={{fontSize:9,color:"#10B981",marginTop:2,display:"block"}}>detected from EDF</span>}</div>
+      <div><label style={formLabel}>Age</label><input style={inputStyle} type="number" min={0} max={120} value={form.age} onChange={e=>setForm({...form,age:e.target.value})} placeholder="Years"/>{fileInfo?.patientField && form.age && <span style={{fontSize:9,color:"#10B981",marginTop:2,display:"block"}}>detected from EDF</span>}</div>
       <div><label style={formLabel}>Recording Date</label><input style={inputStyle} type="date" value={form.date} onChange={e=>setForm({...form,date:e.target.value})}/></div>
       <div style={{gridColumn:"1/-1"}}><label style={formLabel}>Notes</label><input style={inputStyle} value={form.notes} onChange={e=>setForm({...form,notes:e.target.value})} placeholder="Optional notes"/></div>
     </div>
@@ -3866,7 +3959,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
 // ══════════════════════════════════════════════════════════════
 // TAB: REVIEW
 // ══════════════════════════════════════════════════════════════
-function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, edfFileStore, openTabs, setOpenTabs, activeTabIdx, setActiveTabIdx, tabEpochCache }) {
+function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap, edfFileStore, openTabs, setOpenTabs, activeTabIdx, setActiveTabIdx, tabEpochCache }) {
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   const totalDur = edfData ? edfData.totalDuration : 600;
@@ -3887,6 +3980,8 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   const [analysisPanelPos, setAnalysisPanelPos] = useState({ x: null, y: null });
   const [showCompare, setShowCompare] = useState(false);
   const [comparePanelPos, setComparePanelPos] = useState({ x: null, y: null });
+  const [showClinicalNotes, setShowClinicalNotes] = useState(false);
+  const [clinicalNotesPanelPos, setClinicalNotesPanelPos] = useState({ x: null, y: null });
   const [isPlaying, setIsPlaying] = useState(false);
   const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
 
@@ -4179,6 +4274,9 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
             <button onClick={(e)=>{e.stopPropagation();setShowAnnotations(prev => !prev);}} style={controlBtn(showAnnotations)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Bookmark()} Annotations ({annotations.length})</span>
             </button>
+            <button onClick={(e)=>{e.stopPropagation();setShowClinicalNotes(prev => !prev);}} style={controlBtn(showClinicalNotes)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Edit()} Notes</span>
+            </button>
           </>}/>
         <div onClick={()=>setToolbarCollapsed(true)}
           onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
@@ -4238,6 +4336,13 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
         <ComparePanel openTabs={openTabs} records={records} edfFileStore={edfFileStore}
           onClose={()=>setShowCompare(false)}
           panelPos={comparePanelPos} setPanelPos={setComparePanelPos}/>
+      )}
+
+      {/* Floating clinical notes panel */}
+      {showClinicalNotes && (
+        <ClinicalNotesPanel notes={clinicalNotesMap[filename]||""} setNotes={(text)=>setClinicalNotesMap(prev=>({...prev,[filename]:text}))}
+          filename={filename} onClose={()=>setShowClinicalNotes(false)}
+          panelPos={clinicalNotesPanelPos} setPanelPos={setClinicalNotesPanelPos}/>
       )}
 
       {eeg.showCustomPicker && (
@@ -5366,6 +5471,7 @@ export default function ReactEEGApp() {
   const [records, setRecords] = useState([]);
   const [reviewRecord, setReviewRecord] = useState(null);
   const [annotationsMap, setAnnotationsMap] = useState({});
+  const [clinicalNotesMap, setClinicalNotesMap] = useState({});
   const [edfFileStore, setEdfFileStore] = useState({});
   const [initialized, setInitialized] = useState(false);
   const [dataDir, setDataDir] = useState("");
@@ -5425,6 +5531,31 @@ export default function ReactEEGApp() {
       tauriBridge.saveLibrary(records);
     }
   }, [records, initialized]);
+
+  // ── Load clinical notes for all records on init ──
+  useEffect(() => {
+    if (!initialized || records.length === 0) return;
+    (async () => {
+      const map = {};
+      for (const r of records) {
+        const text = await tauriBridge.loadClinicalNotes(r.filename);
+        if (text) map[r.filename] = text;
+      }
+      if (Object.keys(map).length > 0) setClinicalNotesMap(prev => ({ ...prev, ...map }));
+    })();
+  }, [initialized]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Debounced auto-save clinical notes ──
+  const notesTimerRef = useRef(null);
+  useEffect(() => {
+    if (!initialized) return;
+    clearTimeout(notesTimerRef.current);
+    notesTimerRef.current = setTimeout(() => {
+      Object.entries(clinicalNotesMap).forEach(([fn, text]) => {
+        tauriBridge.saveClinicalNotes(fn, text);
+      });
+    }, 1000);
+  }, [clinicalNotesMap, initialized]);
 
   const openReview = (record) => {
     setReviewRecord(record);
@@ -5556,7 +5687,7 @@ export default function ReactEEGApp() {
       {/* ══ Tab Content ══ */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab records={records} setRecords={setRecords} onOpenReview={openReview} updateRecordStatus={updateRecordStatus} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
-        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} edfFileStore={edfFileStore} openTabs={openTabs} setOpenTabs={setOpenTabs} activeTabIdx={activeTabIdx} setActiveTabIdx={setActiveTabIdx} tabEpochCache={tabEpochCache}/>}
+        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} clinicalNotesMap={clinicalNotesMap} setClinicalNotesMap={setClinicalNotesMap} edfFileStore={edfFileStore} openTabs={openTabs} setOpenTabs={setOpenTabs} activeTabIdx={activeTabIdx} setActiveTabIdx={setActiveTabIdx} tabEpochCache={tabEpochCache}/>}
         {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore} openReview={openReview}/>}
       </div>
     </div>
