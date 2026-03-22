@@ -602,18 +602,18 @@ function butterworthCoeffs(cutoff, sr, order, type) {
   const nPairs = Math.floor(order / 2);
   for (let k = 0; k < nPairs; k++) {
     const theta = Math.PI * (2 * k + 1) / (2 * order);
-    const alpha = -2 * wc * Math.sin(theta); // 2 * Re(pole) * wc
+    const gamma = 2 * Math.sin(theta); // damping factor for this pole pair
     if (type === "low") {
-      const a0 = 1 + wc2 - alpha;
+      const a0 = 1 + gamma * wc + wc2;
       sections.push({
         b0: wc2 / a0, b1: 2 * wc2 / a0, b2: wc2 / a0,
-        a1: 2 * (wc2 - 1) / a0, a2: (1 + wc2 + alpha) / a0
+        a1: 2 * (wc2 - 1) / a0, a2: (1 - gamma * wc + wc2) / a0
       });
     } else {
-      const a0 = wc2 + 1 - alpha;
+      const a0 = 1 + gamma * wc + wc2;
       sections.push({
         b0: 1 / a0, b1: -2 / a0, b2: 1 / a0,
-        a1: 2 * (1 - wc2) / a0, a2: (wc2 + 1 + alpha) / a0
+        a1: 2 * (wc2 - 1) / a0, a2: (1 - gamma * wc + wc2) / a0
       });
     }
   }
@@ -622,8 +622,8 @@ function butterworthCoeffs(cutoff, sr, order, type) {
       const a0 = 1 + wc;
       sections.push({ b0: wc / a0, b1: wc / a0, b2: 0, a1: (wc - 1) / a0, a2: 0 });
     } else {
-      const a0 = wc + 1;
-      sections.push({ b0: 1 / a0, b1: -1 / a0, b2: 0, a1: (1 - wc) / a0, a2: 0 });
+      const a0 = 1 + wc;
+      sections.push({ b0: 1 / a0, b1: -1 / a0, b2: 0, a1: (wc - 1) / a0, a2: 0 });
     }
   }
   return sections;
@@ -651,12 +651,10 @@ function applyButterworthFilter(data, cutoff, sr, order, type) {
   if (sections.length === 0) return data;
   const N = data.length;
   if (N < 4) return data;
-  // Reflect-pad to reduce startup transient
-  const padLen = Math.min(3 * order * 10, Math.floor(N / 2) - 1, 200);
-  if (padLen < 1) {
-    // Not enough data to pad — just do forward-only
-    return applyBiquadCascade(data, sections);
-  }
+  // Pad length scales with filter time constant: ~3 cycles at cutoff frequency
+  const cycleLen = Math.ceil(sr / Math.max(cutoff, 0.1));
+  const padLen = Math.min(cycleLen * 3, Math.floor(N / 2) - 1);
+  if (padLen < 2) return applyBiquadCascade(data, sections);
   const totalLen = N + 2 * padLen;
   const padded = new Float32Array(totalLen);
   // Reflect-pad start: mirror around data[0]
@@ -664,37 +662,25 @@ function applyButterworthFilter(data, cutoff, sr, order, type) {
     const srcIdx = Math.min(padLen - i, N - 1);
     padded[i] = 2 * data[0] - data[srcIdx];
   }
-  // Copy data
   for (let i = 0; i < N; i++) padded[padLen + i] = data[i];
   // Reflect-pad end: mirror around data[N-1]
   for (let i = 0; i < padLen; i++) {
     const srcIdx = Math.max(N - 2 - i, 0);
     padded[padLen + N + i] = 2 * data[N - 1] - data[srcIdx];
   }
-  // Forward pass
   let result = applyBiquadCascade(padded, sections);
-  // Reverse for backward pass
   result.reverse();
   result = applyBiquadCascade(result, sections);
   result.reverse();
-  // Extract original segment
   return result.slice(padLen, padLen + N);
 }
 
 function applyHighPass(data, cutoff, sr, order = 3) {
   if (cutoff <= 0) return data;
-  // For low cutoffs relative to sample rate, use cascaded first-order to avoid edge transient
-  if (cutoff < sr * 0.05) {
-    let buf = data;
-    for (let i = 0; i < order; i++) {
-      const rc = 1 / (2 * Math.PI * cutoff), dt = 1 / sr, a = rc / (rc + dt);
-      const out = new Float32Array(buf.length); out[0] = buf[0];
-      for (let j = 1; j < buf.length; j++) out[j] = a * (out[j-1] + buf[j] - buf[j-1]);
-      buf = out;
-    }
-    return buf;
-  }
-  return applyButterworthFilter(data, cutoff, sr, order, "high");
+  // HPF uses single-pass (causal) to avoid forward-backward transient amplification
+  const sections = butterworthCoeffs(cutoff, sr, order, "high");
+  if (sections.length === 0) return data;
+  return applyBiquadCascade(data, sections);
 }
 function applyLowPass(data, cutoff, sr, order = 3) {
   if (cutoff <= 0) return data;
