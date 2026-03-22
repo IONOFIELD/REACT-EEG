@@ -169,6 +169,32 @@ const MONTAGE_DEFS = {
   },
 };
 
+// Chain break indices per montage — spacing is added after these channel indices
+// For bipolar-longitudinal (double banana): 4 chains of 4, midline of 2, then aux
+const CHAIN_BREAKS = {
+  "bipolar-longitudinal": [4, 8, 12, 16, 18], // after each chain: L-para, R-para, L-temp, R-temp, midline
+  "bipolar-transverse": [3, 7, 11, 15, 16],   // frontal, central-frontal, central, parietal, occipital
+  referential: [4, 8, 12, 16, 18],             // group by region
+  "average-reference": [4, 8, 12, 16, 18],
+};
+
+// Compute Y positions with chain spacing for channels
+function getChannelYPositions(channels, montage, totalHeight) {
+  const breaks = CHAIN_BREAKS[montage] || [];
+  const gapPx = 8; // pixels of extra space between chains
+  const nGaps = breaks.filter(b => b < channels.length).length;
+  const usableHeight = totalHeight - nGaps * gapPx;
+  const chHeight = usableHeight / channels.length;
+  const positions = [];
+  let cumulativeGap = 0;
+  for (let i = 0; i < channels.length; i++) {
+    if (breaks.includes(i)) cumulativeGap += gapPx;
+    const yTop = chHeight * i + cumulativeGap;
+    positions.push({ yTop, yCenter: yTop + chHeight / 2, height: chHeight });
+  }
+  return { positions, chHeight };
+}
+
 // Helper: get channels for a montage + system combination
 function getMontageChannels(montage, eegSystem, customElectrodes = null) {
   const def = MONTAGE_DEFS[montage];
@@ -657,8 +683,8 @@ function applyButterworthFilter(data, cutoff, sr, order, type) {
 
 function applyHighPass(data, cutoff, sr, order = 3) {
   if (cutoff <= 0) return data;
-  // For very low cutoffs relative to sample rate, use cascaded first-order to avoid instability
-  if (cutoff < sr * 0.01) {
+  // For low cutoffs relative to sample rate, use cascaded first-order to avoid edge transient
+  if (cutoff < sr * 0.05) {
     let buf = data;
     for (let i = 0; i < order; i++) {
       const rc = 1 / (2 * Math.PI * cutoff), dt = 1 / sr, a = rc / (rc + dt);
@@ -1188,7 +1214,7 @@ function StatusControl({ status, onSetStatus, size = "normal" }) {
 function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd, sampleRate,
   sensitivity, channelSensitivity = {}, annotations = [], annotationDraft, selectedAnnotationType, hoveredTime,
   isAddingAnnotation, isMeasuring, measureSel, measureDragRef, onMouseMove, onMouseDown, onMouseUp, onMouseLeave, onClick, onContextMenu, containerRef, canvasRef, children,
-  isLiveSimulation, simClipRef }) {
+  isLiveSimulation, simClipRef, montage }) {
 
   const drawEEG = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1206,7 +1232,7 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
     ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, W, H);
 
     const labelWidth = 72, plotW = W - labelWidth - 16, plotX = labelWidth;
-    const chCount = channels.length, chHeight = H / chCount;
+    const { positions: chPositions, chHeight } = getChannelYPositions(channels, montage, H);
     const samplesPerEpoch = sampleRate * epochSec;
     const scale = sensitivity * 1.5;
 
@@ -1249,7 +1275,7 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
 
     // Channels
     channels.forEach((ch, i) => {
-      const yCenter = chHeight * i + chHeight / 2;
+      const yCenter = chPositions[i].yCenter;
       const data = waveformData[i];
       if (!data) return;
       const chSensOffset = channelSensitivity[ch] || 0;
@@ -1258,8 +1284,11 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
       const effSens = Math.max(1, baseSens + chSensOffset); // Per-channel offset still applies
       const ekgDampen = ch === "EKG" ? 3 : 1;
       const chScale = (73.5 / effSens) * ekgDampen; // Higher sensitivity = taller waveforms (mm/µV)
-      ctx.strokeStyle = "#151515"; ctx.lineWidth = 0.5;
-      ctx.beginPath(); ctx.moveTo(plotX, chHeight * (i + 1)); ctx.lineTo(W, chHeight * (i + 1)); ctx.stroke();
+      // Chain break: draw slightly thicker line at chain boundaries
+      const breaks = CHAIN_BREAKS[montage] || [];
+      const isChainBreak = breaks.includes(i);
+      ctx.strokeStyle = isChainBreak ? "#2a2a2a" : "#151515"; ctx.lineWidth = isChainBreak ? 1 : 0.5;
+      ctx.beginPath(); ctx.moveTo(plotX, chPositions[i].yTop + chPositions[i].height); ctx.lineTo(W, chPositions[i].yTop + chPositions[i].height); ctx.stroke();
       ctx.fillStyle = ch === "EKG" ? "#EC4899" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B" : "#666";
       ctx.font = "600 10px 'IBM Plex Mono', monospace"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
       ctx.fillText(ch, labelWidth - 8, yCenter);
@@ -1308,8 +1337,8 @@ function WaveformCanvas({ channels, waveformData, epochSec, epochStart, epochEnd
     if (sel && isMeasuring) {
       const x1 = plotX + ((sel.startTime - epochStart) / epochSec) * plotW;
       const x2 = plotX + ((sel.endTime - epochStart) / epochSec) * plotW;
-      const y1 = chHeight * sel.startChIdx;
-      const y2 = chHeight * (sel.endChIdx + 1);
+      const y1 = chPositions[sel.startChIdx]?.yTop || 0;
+      const y2 = (chPositions[sel.endChIdx]?.yTop || 0) + (chPositions[sel.endChIdx]?.height || chHeight);
       // Selection fill
       ctx.fillStyle = "rgba(126, 200, 217, 0.08)";
       ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
@@ -3257,7 +3286,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   const [notch, setNotch] = useState(60);
   const [epochSec, setEpochSec] = useState(10);
   const [currentEpoch, setCurrentEpoch] = useState(0);
-  const [sensitivity, setSensitivity] = useState(7);
+  const [sensitivity, setSensitivity] = useState(20);
   const sampleRate = edfData?.sampleRate || 256;
   const [annotations, setAnnotations] = useState([]);
   const [selectedAnnotationType, setSelectedAnnotationType] = useState(0);
@@ -3578,9 +3607,13 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     if (!canvas) return 0;
     const rect = canvas.getBoundingClientRect();
     const y = clientY - rect.top;
-    const chHeight = rect.height / channels.length;
-    return Math.max(0, Math.min(channels.length - 1, Math.floor(y / chHeight)));
-  }, [channels, canvasRef]);
+    const { positions } = getChannelYPositions(channels, montage, rect.height);
+    // Find closest channel by Y position
+    for (let i = positions.length - 1; i >= 0; i--) {
+      if (y >= positions[i].yTop) return i;
+    }
+    return 0;
+  }, [channels, montage, canvasRef]);
 
   const handleCanvasMouseMove = (e) => {
     setHoveredTime(getTimeFromX(e.clientX));
@@ -4653,7 +4686,7 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
           onMouseMove={eeg.handleCanvasMouseMove} onMouseDown={eeg.handleCanvasMouseDown} onMouseUp={eeg.handleCanvasMouseUp}
           onMouseLeave={()=>eeg.setHoveredTime(null)} onClick={eeg.handleCanvasClick}
           onContextMenu={eeg.handleContextMenu}
-          containerRef={eeg.containerRef} canvasRef={eeg.canvasRef}>
+          containerRef={eeg.containerRef} canvasRef={eeg.canvasRef} montage={eeg.montage}>
           <AnnotationPopup draft={eeg.annotationDraft} annotationType={eeg.selectedAnnotationType}
             text={eeg.annotationText} setText={eeg.setAnnotationText} onConfirm={eeg.confirmAnnotation}
             onCancel={()=>{eeg.setAnnotationDraft(null);eeg.setIsAddingAnnotation(false);}} containerRef={eeg.containerRef}/>
@@ -5679,7 +5712,7 @@ function AcquireTab({ annotationsMap, setAnnotationsMap, setRecords, edfFileStor
           onMouseMove={eeg.handleCanvasMouseMove} onMouseDown={eeg.handleCanvasMouseDown} onMouseUp={eeg.handleCanvasMouseUp}
           onMouseLeave={()=>eeg.setHoveredTime(null)} onClick={eeg.handleCanvasClick}
           onContextMenu={eeg.handleContextMenu}
-          containerRef={eeg.containerRef} canvasRef={eeg.canvasRef}
+          containerRef={eeg.containerRef} canvasRef={eeg.canvasRef} montage={eeg.montage}
           isLiveSimulation={isSim && isRecording && !isPaused} simClipRef={simClipRef}>
           <AnnotationPopup draft={eeg.annotationDraft} annotationType={eeg.selectedAnnotationType}
             text={eeg.annotationText} setText={eeg.setAnnotationText} onConfirm={eeg.confirmAnnotation}
