@@ -57,7 +57,7 @@ function hashSubjectId(id, salt = "REACT-EEG-2026") {
   for (let i = 0; i < str.length; i++) {
     h = ((h << 5) - h + str.charCodeAt(i)) | 0;
   }
-  return Math.abs(h).toString(16).toUpperCase().padStart(8, "0");
+  return Math.abs(h).toString(16).toUpperCase().padStart(6, "0").slice(0, 6);
 }
 
 // ── Study type codes ──
@@ -74,7 +74,7 @@ const STUDY_TYPES = {
 };
 
 function generateFilename(subjectId, studyType, date, sex = "", age = "", seq = 1) {
-  const hash = hashSubjectId(subjectId).slice(0, 4);
+  const hash = hashSubjectId(subjectId);
   const cleanId = subjectId.replace(/[^a-zA-Z0-9-]/g, "").toUpperCase();
   const d = date.replace(/-/g, "");
   const demo = (sex || age) ? `-${(sex || "").toUpperCase()}${age}` : "";
@@ -945,7 +945,7 @@ const I = {
   BarChart: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
   Ruler: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 2l20 20"/><path d="M5.5 5.5l3-3"/><path d="M9.5 9.5l3-3"/><path d="M13.5 13.5l3-3"/><path d="M17.5 17.5l3-3"/></svg>,
   GitCompare: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>,
-  BrainElectrode: (s=18) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9.5 4a3.5 3.5 0 0 0-3.2 4.8A3.5 3.5 0 0 0 4 12.5a3.5 3.5 0 0 0 1 6.8A3.5 3.5 0 0 0 8.5 24h1V4Z"/><path d="M14.5 4a3.5 3.5 0 0 1 3.2 4.8 3.5 3.5 0 0 1 2.3 3.7 3.5 3.5 0 0 1-1 6.8 3.5 3.5 0 0 1-3.5 4.7h-1V4Z"/><circle cx="8" cy="1.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="0.8" r="1.2" fill="currentColor" stroke="none"/><circle cx="16" cy="1.5" r="1.2" fill="currentColor" stroke="none"/><line x1="8" y1="2.7" x2="8" y2="5" strokeWidth="1"/><line x1="12" y1="2" x2="12" y2="4" strokeWidth="1"/><line x1="16" y1="2.7" x2="16" y2="5" strokeWidth="1"/></svg>,
+  BrainElectrode: (s=18) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9.5 4a3.5 3.5 0 0 0-3.2 4.8A3.5 3.5 0 0 0 4 12.5a3.5 3.5 0 0 0 1 6.8A3.5 3.5 0 0 0 8.5 24h1V4Z"/><path d="M14.5 4a3.5 3.5 0 0 1 3.2 4.8 3.5 3.5 0 0 1 2.3 3.7 3.5 3.5 0 0 1-1 6.8 3.5 3.5 0 0 1-3.5 4.7h-1V4Z"/><circle cx="12" cy="14" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.5"/></svg>,
   Waves: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 12c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/><path d="M2 6c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/><path d="M2 18c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/></svg>,
 };
 
