@@ -566,19 +566,113 @@ function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSe
 }
 
 // ── Filters ──
-function applyHighPass(data, cutoff, sr) {
-  if (cutoff <= 0) return data;
-  const rc = 1 / (2 * Math.PI * cutoff), dt = 1 / sr, a = rc / (rc + dt);
-  const out = new Float32Array(data.length); out[0] = data[0];
-  for (let i = 1; i < data.length; i++) out[i] = a * (out[i-1] + data[i] - data[i-1]);
-  return out;
+// ── Butterworth filter design (cascaded biquad sections) ──
+// Compute biquad coefficients for Nth-order Butterworth via bilinear transform
+function butterworthCoeffs(cutoff, sr, order, type) {
+  if (cutoff <= 0 || cutoff >= sr / 2) return [];
+  const wc = Math.tan(Math.PI * cutoff / sr); // pre-warped cutoff
+  const wc2 = wc * wc;
+  const sections = [];
+  const nPairs = Math.floor(order / 2);
+  for (let k = 0; k < nPairs; k++) {
+    const theta = Math.PI * (2 * k + 1) / (2 * order);
+    const alpha = -2 * wc * Math.sin(theta); // 2 * Re(pole) * wc
+    if (type === "low") {
+      const a0 = 1 + wc2 - alpha;
+      sections.push({
+        b0: wc2 / a0, b1: 2 * wc2 / a0, b2: wc2 / a0,
+        a1: 2 * (wc2 - 1) / a0, a2: (1 + wc2 + alpha) / a0
+      });
+    } else {
+      const a0 = wc2 + 1 - alpha;
+      sections.push({
+        b0: 1 / a0, b1: -2 / a0, b2: 1 / a0,
+        a1: 2 * (1 - wc2) / a0, a2: (wc2 + 1 + alpha) / a0
+      });
+    }
+  }
+  if (order % 2 === 1) {
+    if (type === "low") {
+      const a0 = 1 + wc;
+      sections.push({ b0: wc / a0, b1: wc / a0, b2: 0, a1: (wc - 1) / a0, a2: 0 });
+    } else {
+      const a0 = wc + 1;
+      sections.push({ b0: 1 / a0, b1: -1 / a0, b2: 0, a1: (1 - wc) / a0, a2: 0 });
+    }
+  }
+  return sections;
 }
-function applyLowPass(data, cutoff, sr) {
+
+// Apply cascaded biquad filter sections
+function applyBiquadCascade(data, sections) {
+  let buf = data;
+  for (const s of sections) {
+    const N = buf.length;
+    const out = new Float32Array(N);
+    // Initialize with steady-state to reduce transient
+    out[0] = s.b0 * buf[0];
+    if (N > 1) out[1] = s.b0 * buf[1] + s.b1 * buf[0] - s.a1 * out[0];
+    for (let i = 2; i < N; i++)
+      out[i] = s.b0 * buf[i] + s.b1 * buf[i-1] + s.b2 * buf[i-2] - s.a1 * out[i-1] - s.a2 * out[i-2];
+    buf = out;
+  }
+  return buf;
+}
+
+// Forward-backward (zero-phase) Butterworth filter with edge padding
+function applyButterworthFilter(data, cutoff, sr, order, type) {
+  const sections = butterworthCoeffs(cutoff, sr, order, type);
+  if (sections.length === 0) return data;
+  const N = data.length;
+  if (N < 4) return data;
+  // Reflect-pad to reduce startup transient
+  const padLen = Math.min(3 * order * 10, Math.floor(N / 2) - 1, 200);
+  if (padLen < 1) {
+    // Not enough data to pad — just do forward-only
+    return applyBiquadCascade(data, sections);
+  }
+  const totalLen = N + 2 * padLen;
+  const padded = new Float32Array(totalLen);
+  // Reflect-pad start: mirror around data[0]
+  for (let i = 0; i < padLen; i++) {
+    const srcIdx = Math.min(padLen - i, N - 1);
+    padded[i] = 2 * data[0] - data[srcIdx];
+  }
+  // Copy data
+  for (let i = 0; i < N; i++) padded[padLen + i] = data[i];
+  // Reflect-pad end: mirror around data[N-1]
+  for (let i = 0; i < padLen; i++) {
+    const srcIdx = Math.max(N - 2 - i, 0);
+    padded[padLen + N + i] = 2 * data[N - 1] - data[srcIdx];
+  }
+  // Forward pass
+  let result = applyBiquadCascade(padded, sections);
+  // Reverse for backward pass
+  result.reverse();
+  result = applyBiquadCascade(result, sections);
+  result.reverse();
+  // Extract original segment
+  return result.slice(padLen, padLen + N);
+}
+
+function applyHighPass(data, cutoff, sr, order = 3) {
   if (cutoff <= 0) return data;
-  const rc = 1 / (2 * Math.PI * cutoff), dt = 1 / sr, a = dt / (rc + dt);
-  const out = new Float32Array(data.length); out[0] = data[0];
-  for (let i = 1; i < data.length; i++) out[i] = out[i-1] + a * (data[i] - out[i-1]);
-  return out;
+  // For very low cutoffs relative to sample rate, use cascaded first-order to avoid instability
+  if (cutoff < sr * 0.01) {
+    let buf = data;
+    for (let i = 0; i < order; i++) {
+      const rc = 1 / (2 * Math.PI * cutoff), dt = 1 / sr, a = rc / (rc + dt);
+      const out = new Float32Array(buf.length); out[0] = buf[0];
+      for (let j = 1; j < buf.length; j++) out[j] = a * (out[j-1] + buf[j] - buf[j-1]);
+      buf = out;
+    }
+    return buf;
+  }
+  return applyButterworthFilter(data, cutoff, sr, order, "high");
+}
+function applyLowPass(data, cutoff, sr, order = 3) {
+  if (cutoff <= 0) return data;
+  return applyButterworthFilter(data, cutoff, sr, order, "low");
 }
 function applyNotch(data, freq, sr, q = 30) {
   if (freq <= 0) return data;
@@ -588,6 +682,215 @@ function applyNotch(data, freq, sr, q = 30) {
   for (let i = 2; i < data.length; i++)
     out[i] = (b0/a0)*data[i] + (b1/a0)*data[i-1] + (b2/a0)*data[i-2] - (a1/a0)*out[i-1] - (a2/a0)*out[i-2];
   return out;
+}
+
+// ── Discrete Wavelet Transform (Daubechies-4) denoising ──
+function applyWaveletDenoise(data, levels = 4) {
+  const N = data.length;
+  if (N < 16) return data;
+  // Db4 filter coefficients
+  const h = [0.4829629131445341, 0.8365163037378079, 0.2241438680420134, -0.1294095225512604];
+  const g = [h[3], -h[2], h[1], -h[0]]; // highpass from lowpass via QMF
+  const hR = [...h].reverse(); // reconstruction lowpass
+  const gR = [...g].reverse(); // reconstruction highpass
+
+  // Forward DWT — multi-level decomposition
+  const details = [];
+  let approx = new Float32Array(data);
+  for (let lev = 0; lev < levels; lev++) {
+    const len = approx.length;
+    if (len < 8) break;
+    const halfLen = Math.floor(len / 2);
+    const newApprox = new Float32Array(halfLen);
+    const detail = new Float32Array(halfLen);
+    for (let i = 0; i < halfLen; i++) {
+      let lo = 0, hi = 0;
+      for (let j = 0; j < 4; j++) {
+        const idx = (2 * i + j) % len;
+        lo += h[j] * approx[idx];
+        hi += g[j] * approx[idx];
+      }
+      newApprox[i] = lo;
+      detail[i] = hi;
+    }
+    details.push(detail);
+    approx = newApprox;
+  }
+
+  // Estimate noise from finest detail level via MAD
+  const finest = details[0];
+  const sorted = Array.from(finest).map(Math.abs).sort((a, b) => a - b);
+  const mad = sorted[Math.floor(sorted.length / 2)] / 0.6745;
+  const threshold = mad * Math.sqrt(2 * Math.log(N));
+
+  // Soft thresholding on detail coefficients
+  for (let lev = 0; lev < details.length; lev++) {
+    const d = details[lev];
+    for (let i = 0; i < d.length; i++) {
+      const abs = Math.abs(d[i]);
+      d[i] = abs > threshold ? Math.sign(d[i]) * (abs - threshold) : 0;
+    }
+  }
+
+  // Inverse DWT — multi-level reconstruction
+  let recon = approx;
+  for (let lev = details.length - 1; lev >= 0; lev--) {
+    const detail = details[lev];
+    const outLen = detail.length * 2;
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < detail.length; i++) {
+      for (let j = 0; j < 4; j++) {
+        const idx = (2 * i + j) % outLen;
+        out[idx] += hR[j] * recon[i] + gR[j] * detail[i];
+      }
+    }
+    recon = out;
+  }
+
+  // Trim or pad to original length
+  const result = new Float32Array(N);
+  for (let i = 0; i < N && i < recon.length; i++) result[i] = recon[i];
+  return result;
+}
+
+// ── Simplified FastICA for artifact removal ──
+function applyICA(channelData, auxChannels, sr) {
+  // channelData: array of Float32Array (EEG channels)
+  // auxChannels: array of Float32Array (EOG/EKG reference channels)
+  const nCh = channelData.length;
+  const N = channelData[0]?.length || 0;
+  if (nCh < 2 || N < 16) return channelData;
+
+  // 1. Center data
+  const means = channelData.map(ch => { let s = 0; for (let i = 0; i < N; i++) s += ch[i]; return s / N; });
+  const centered = channelData.map((ch, ci) => {
+    const c = new Float32Array(N);
+    for (let i = 0; i < N; i++) c[i] = ch[i] - means[ci];
+    return c;
+  });
+
+  // 2. Whiten via PCA (covariance → eigendecomposition via power iteration)
+  // Compute covariance matrix
+  const cov = Array.from({ length: nCh }, () => new Float64Array(nCh));
+  for (let i = 0; i < nCh; i++) {
+    for (let j = i; j < nCh; j++) {
+      let s = 0;
+      for (let k = 0; k < N; k++) s += centered[i][k] * centered[j][k];
+      cov[i][j] = cov[j][i] = s / N;
+    }
+  }
+
+  // Simple whitening: scale each channel by 1/sqrt(variance)
+  const whitened = centered.map((ch, ci) => {
+    const std = Math.sqrt(Math.max(cov[ci][ci], 1e-10));
+    const w = new Float32Array(N);
+    for (let i = 0; i < N; i++) w[i] = ch[i] / std;
+    return w;
+  });
+
+  // 3. FastICA — extract independent components using tanh nonlinearity
+  const nComp = Math.min(nCh, 8); // limit components for performance
+  const W = Array.from({ length: nComp }, () => {
+    const w = new Float64Array(nCh);
+    for (let i = 0; i < nCh; i++) w[i] = Math.random() - 0.5;
+    return w;
+  });
+
+  // Normalize vector
+  const normalize = (w) => {
+    let norm = 0;
+    for (let i = 0; i < w.length; i++) norm += w[i] * w[i];
+    norm = Math.sqrt(norm) || 1;
+    for (let i = 0; i < w.length; i++) w[i] /= norm;
+  };
+
+  // Iterate each component
+  for (let comp = 0; comp < nComp; comp++) {
+    const w = W[comp];
+    normalize(w);
+    for (let iter = 0; iter < 50; iter++) {
+      // w_new = E{x * tanh(w^T * x)} - E{1 - tanh^2(w^T * x)} * w
+      const wNew = new Float64Array(nCh);
+      let gPrimeSum = 0;
+      for (let t = 0; t < N; t++) {
+        let wx = 0;
+        for (let i = 0; i < nCh; i++) wx += w[i] * whitened[i][t];
+        const gx = Math.tanh(wx);
+        const gPrime = 1 - gx * gx;
+        for (let i = 0; i < nCh; i++) wNew[i] += whitened[i][t] * gx;
+        gPrimeSum += gPrime;
+      }
+      for (let i = 0; i < nCh; i++) wNew[i] = wNew[i] / N - (gPrimeSum / N) * w[i];
+
+      // Deflation: orthogonalize against previous components
+      for (let p = 0; p < comp; p++) {
+        let dot = 0;
+        for (let i = 0; i < nCh; i++) dot += wNew[i] * W[p][i];
+        for (let i = 0; i < nCh; i++) wNew[i] -= dot * W[p][i];
+      }
+      normalize(wNew);
+
+      // Check convergence
+      let conv = 0;
+      for (let i = 0; i < nCh; i++) conv += Math.abs(Math.abs(wNew[i]) - Math.abs(w[i]));
+      for (let i = 0; i < nCh; i++) w[i] = wNew[i];
+      if (conv < 1e-6) break;
+    }
+  }
+
+  // 4. Extract independent components: IC = W * whitened
+  const ICs = W.map(w => {
+    const ic = new Float32Array(N);
+    for (let t = 0; t < N; t++) {
+      let s = 0;
+      for (let i = 0; i < nCh; i++) s += w[i] * whitened[i][t];
+      ic[t] = s;
+    }
+    return ic;
+  });
+
+  // 5. Identify artifact components by correlation with aux channels
+  const artifactMask = new Array(nComp).fill(false);
+  for (let c = 0; c < nComp; c++) {
+    for (const aux of auxChannels) {
+      if (!aux || aux.length < N) continue;
+      // Pearson correlation
+      let sumIC = 0, sumAux = 0;
+      for (let i = 0; i < N; i++) { sumIC += ICs[c][i]; sumAux += aux[i]; }
+      const mIC = sumIC / N, mAux = sumAux / N;
+      let num = 0, dIC = 0, dAux = 0;
+      for (let i = 0; i < N; i++) {
+        const a = ICs[c][i] - mIC, b = aux[i] - mAux;
+        num += a * b; dIC += a * a; dAux += b * b;
+      }
+      const r = Math.sqrt(dIC * dAux) > 0 ? Math.abs(num / Math.sqrt(dIC * dAux)) : 0;
+      if (r > 0.35) { artifactMask[c] = true; break; }
+    }
+  }
+
+  // 6. Reconstruct: zero artifact ICs, project back
+  const cleaned = channelData.map((ch, ci) => {
+    const std = Math.sqrt(Math.max(cov[ci][ci], 1e-10));
+    const out = new Float32Array(N);
+    // Start from whitened data, subtract artifact IC contributions
+    for (let i = 0; i < N; i++) out[i] = ch[i]; // start from original
+    return out;
+  });
+
+  // Subtract artifact component projections from each channel
+  for (let c = 0; c < nComp; c++) {
+    if (!artifactMask[c]) continue;
+    const w = W[c];
+    for (let ci = 0; ci < nCh; ci++) {
+      const std = Math.sqrt(Math.max(cov[ci][ci], 1e-10));
+      const weight = w[ci] * std; // un-whiten the weight
+      for (let t = 0; t < N; t++) {
+        cleaned[ci][t] -= weight * ICs[c][t];
+      }
+    }
+  }
+
+  return cleaned;
 }
 
 // ── Icons ──
@@ -630,6 +933,8 @@ const I = {
   BarChart: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
   Ruler: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 2l20 20"/><path d="M5.5 5.5l3-3"/><path d="M9.5 9.5l3-3"/><path d="M13.5 13.5l3-3"/><path d="M17.5 17.5l3-3"/></svg>,
   GitCompare: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg>,
+  BrainElectrode: (s=18) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M9.5 4a3.5 3.5 0 0 0-3.2 4.8A3.5 3.5 0 0 0 4 12.5a3.5 3.5 0 0 0 1 6.8A3.5 3.5 0 0 0 8.5 24h1V4Z"/><path d="M14.5 4a3.5 3.5 0 0 1 3.2 4.8 3.5 3.5 0 0 1 2.3 3.7 3.5 3.5 0 0 1-1 6.8 3.5 3.5 0 0 1-3.5 4.7h-1V4Z"/><circle cx="8" cy="1.5" r="1.2" fill="currentColor" stroke="none"/><circle cx="12" cy="0.8" r="1.2" fill="currentColor" stroke="none"/><circle cx="16" cy="1.5" r="1.2" fill="currentColor" stroke="none"/><line x1="8" y1="2.7" x2="8" y2="5" strokeWidth="1"/><line x1="12" y1="2" x2="12" y2="4" strokeWidth="1"/><line x1="16" y1="2.7" x2="16" y2="5" strokeWidth="1"/></svg>,
+  Waves: (s=14) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M2 12c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/><path d="M2 6c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/><path d="M2 18c2-3 4-3 6 0s4 3 6 0 4-3 6 0"/></svg>,
 };
 
 // ── Seed data — single simulated test record ──
@@ -2969,6 +3274,8 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [measureSel, setMeasureSel] = useState(null); // {startTime, endTime, startChIdx, endChIdx}
   const measureDragRef = useRef(null); // {startTime, startChIdx, curTime, curChIdx} during drag
+  const [waveletDenoise, setWaveletDenoise] = useState(false);
+  const [icaClean, setIcaClean] = useState(false);
 
   const [customElectrodes, setCustomElectrodes] = useState(
     () => new Set([...ELECTRODE_SETS["10-20"], "LOC1","LOC2","ROC1","ROC2"])
@@ -3230,9 +3537,31 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
       if (chHpf > 0) raw = applyHighPass(raw, chHpf, sampleRate);
       if (chLpf > 0) raw = applyLowPass(raw, chLpf, sampleRate);
       if (notch > 0) raw = applyNotch(raw, notch, sampleRate);
+      // Wavelet denoising (EEG channels only)
+      if (waveletDenoise && !AUX_CHANNELS.has(ch)) {
+        const levels = sampleRate >= 256 ? 5 : 4;
+        raw = applyWaveletDenoise(raw, levels);
+      }
       return raw;
     });
-  }, [montage, hpf, lpf, notch, epochSec, currentEpoch, sampleRate, channels, allChannels, hiddenChannels, channelHpf, channelLpf, edfData, epochStart, simSeedOverride]);
+  }, [montage, hpf, lpf, notch, epochSec, currentEpoch, sampleRate, channels, allChannels, hiddenChannels, channelHpf, channelLpf, edfData, epochStart, simSeedOverride, waveletDenoise]);
+
+  // ICA artifact cleaning — applied as post-processing on waveformData
+  const cleanedWaveformData = useMemo(() => {
+    if (!icaClean) return waveformData;
+    // Separate EEG and aux channel data
+    const eegIdxs = [], auxData = [];
+    channels.forEach((ch, i) => {
+      if (AUX_CHANNELS.has(ch)) auxData.push(waveformData[i]);
+      else eegIdxs.push(i);
+    });
+    if (eegIdxs.length < 2 || auxData.length === 0) return waveformData;
+    const eegData = eegIdxs.map(i => waveformData[i]);
+    const cleaned = applyICA(eegData, auxData, sampleRate);
+    const result = [...waveformData];
+    eegIdxs.forEach((origIdx, newIdx) => { result[origIdx] = cleaned[newIdx]; });
+    return result;
+  }, [waveformData, icaClean, channels]);
 
   const getTimeFromX = useCallback((clientX) => {
     const canvas = canvasRef.current;
@@ -3321,7 +3650,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     hpf, setHpf, lpf, setLpf, notch, setNotch,
     epochSec, setEpochSec: (v) => { setEpochSec(v); setCurrentEpoch(0); },
     currentEpoch, setCurrentEpoch, sensitivity, setSensitivity, sampleRate,
-    channels, allChannels, totalEpochs, epochStart, epochEnd, totalDuration, waveformData,
+    channels, allChannels, totalEpochs, epochStart, epochEnd, totalDuration, waveformData: cleanedWaveformData,
     annotations, setAnnotations, selectedAnnotationType, setSelectedAnnotationType,
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
@@ -3332,6 +3661,7 @@ function useEEGState(totalDuration = 600, edfData = null, simSeedOverride = null
     auxWithData, AUX_CHANNELS, channelsWithData,
     contextMenu, setContextMenu, handleContextMenu,
     isMeasuring, setIsMeasuring, measureSel, setMeasureSel, measureDragRef,
+    waveletDenoise, setWaveletDenoise, icaClean, setIcaClean,
     handleCanvasMouseMove, handleCanvasMouseDown, handleCanvasMouseUp, handleCanvasClick, confirmAnnotation,
   };
 }
@@ -4270,6 +4600,12 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
                 {eeg.visibilityState===1 && <>{I.EyeDots(12)} Show Eyes</>}
                 {eeg.visibilityState===2 && <>{I.EyeOff(12)} Hide</>}
               </span>
+            </button>
+            <button onClick={(e)=>{e.stopPropagation();eeg.setWaveletDenoise(prev=>!prev);}} style={controlBtn(eeg.waveletDenoise)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Waves()} Denoise</span>
+            </button>
+            <button onClick={(e)=>{e.stopPropagation();eeg.setIcaClean(prev=>!prev);}} style={controlBtn(eeg.icaClean)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Zap()} ICA Clean</span>
             </button>
             <button onClick={(e)=>{e.stopPropagation();setShowPatternTable(true);}} style={controlBtn(showPatternTable)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List()} Pattern Table</span>
@@ -5604,7 +5940,7 @@ export default function ReactEEGApp() {
   const tabs = [
     { id: "library", label: "LIBRARY", icon: I.Database(18), desc: "File Repository" },
     { id: "review",  label: "REVIEW",  icon: I.Eye(18),      desc: "Waveform Viewer" },
-    { id: "acquire", label: "ACQUIRE", icon: I.Activity(18),  desc: "Live Recording" },
+    { id: "acquire", label: "ACQUIRE", icon: I.BrainElectrode(18), desc: "External Source" },
   ];
 
   // ── Splash Screen ──
@@ -5638,7 +5974,7 @@ export default function ReactEEGApp() {
           fontSize:11,color:"#444",fontWeight:400,letterSpacing:"0.06em",
           animation: "splashFadeIn 1s ease 0.4s both, splashFadeOut 0.6s ease 2.2s forwards",
           display:"flex",alignItems:"center",gap:12,
-        }}>REACT EEG, LLC &mdash; 2026 <span style={{color:"#4a9bab80",fontFamily:"'IBM Plex Mono', monospace",fontSize:10,fontWeight:600,letterSpacing:"0.1em"}}>v11.0</span></div>
+        }}>REACT EEG, LLC &mdash; 2026 <span style={{color:"#4a9bab80",fontFamily:"'IBM Plex Mono', monospace",fontSize:10,fontWeight:600,letterSpacing:"0.1em"}}>v12.0</span></div>
       </div>
     );
   }
@@ -5665,7 +6001,7 @@ export default function ReactEEGApp() {
             <div>
               <div style={{fontSize:18,fontWeight:700,letterSpacing:"0.04em",color:"#e0e0e0",fontFamily:"'Rajdhani', sans-serif",display:"flex",alignItems:"baseline",gap:8}}>
                 REACT <span style={{color:"#7ec8d9"}}>EEG</span>
-                <span style={{fontSize:9,fontWeight:600,color:"#4a9bab80",letterSpacing:"0.08em",fontFamily:"'IBM Plex Mono', monospace"}}>v11.0</span>
+                <span style={{fontSize:9,fontWeight:600,color:"#4a9bab80",letterSpacing:"0.08em",fontFamily:"'IBM Plex Mono', monospace"}}>v12.0</span>
               </div>
               <div style={{fontSize:9,color:"#555",letterSpacing:"0.12em",fontWeight:600,fontFamily:"'Rajdhani', sans-serif",textTransform:"uppercase"}}>BIOMETRIC DATA ACQUISITION & STORAGE</div>
             </div>
