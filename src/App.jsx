@@ -5940,7 +5940,6 @@ export default function ReactEEGApp() {
   const tabs = [
     { id: "library", label: "LIBRARY", icon: I.Database(18), desc: "File Repository" },
     { id: "review",  label: "REVIEW",  icon: I.Eye(18),      desc: "Waveform Viewer" },
-    { id: "acquire", label: "ACQUIRE", icon: I.BrainElectrode(18), desc: "External Source" },
   ];
 
   // ── Splash Screen ──
@@ -6006,8 +6005,17 @@ export default function ReactEEGApp() {
               <div style={{fontSize:9,color:"#555",letterSpacing:"0.12em",fontWeight:600,fontFamily:"'Rajdhani', sans-serif",textTransform:"uppercase"}}>BIOMETRIC DATA ACQUISITION & STORAGE</div>
             </div>
           </div>
-          <div style={{display:"flex",alignItems:"center",gap:6,color:"#7ec8d9",fontSize:11,fontWeight:600,fontFamily:"'Rajdhani', sans-serif",letterSpacing:"0.08em"}}>
-            {I.Shield()} PHI PROTECTED
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <div style={{display:"flex",alignItems:"center",gap:6,color:"#7ec8d9",fontSize:11,fontWeight:600,fontFamily:"'Rajdhani', sans-serif",letterSpacing:"0.08em"}}>
+              {I.Shield()} PHI PROTECTED
+            </div>
+            <button onClick={()=>setActiveTab("acquire")} title="Acquire — External Source" style={{
+              width:32,height:32,padding:0,borderRadius:4,cursor:"pointer",
+              background:activeTab==="acquire"?"#1a3a40":"#111",
+              border:activeTab==="acquire"?"1px solid #7ec8d9":"1px solid #2a2a2a",
+              color:activeTab==="acquire"?"#7ec8d9":"#555",
+              display:"flex",alignItems:"center",justifyContent:"center",transition:"all 0.15s",
+            }}>{I.BrainElectrode(18)}</button>
           </div>
         </div>
 
