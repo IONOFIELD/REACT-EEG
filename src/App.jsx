@@ -3959,7 +3959,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore }) {
 // ══════════════════════════════════════════════════════════════
 // TAB: REVIEW
 // ══════════════════════════════════════════════════════════════
-function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap, edfFileStore, openTabs, setOpenTabs, activeTabIdx, setActiveTabIdx, tabEpochCache }) {
+function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap, notesShownFilesRef, edfFileStore, openTabs, setOpenTabs, activeTabIdx, setActiveTabIdx, tabEpochCache }) {
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   const totalDur = edfData ? edfData.totalDuration : 600;
@@ -3997,6 +3997,18 @@ function ReviewTab({ record, updateRecordStatus, records, onSelectRecord, annota
   useEffect(() => {
     const cached = tabEpochCache.current[record?.filename];
     eeg.setCurrentEpoch(cached !== undefined ? cached : 0);
+  }, [record?.filename]);
+
+  // Auto-open clinical notes on first review of a file, close on subsequent visits
+  const prevNoteFilenameRef = useRef(null);
+  useEffect(() => {
+    if (!record?.filename) return;
+    const fn = record.filename;
+    if (fn === prevNoteFilenameRef.current) return;
+    const isFirst = !notesShownFilesRef.current.has(fn);
+    prevNoteFilenameRef.current = fn;
+    notesShownFilesRef.current.add(fn);
+    setShowClinicalNotes(isFirst);
   }, [record?.filename]);
 
   // Save epoch when switching away from a file
@@ -5472,6 +5484,7 @@ export default function ReactEEGApp() {
   const [reviewRecord, setReviewRecord] = useState(null);
   const [annotationsMap, setAnnotationsMap] = useState({});
   const [clinicalNotesMap, setClinicalNotesMap] = useState({});
+  const notesShownFilesRef = useRef(new Set()); // tracks which files have had notes auto-opened (persists across tab switches)
   const [edfFileStore, setEdfFileStore] = useState({});
   const [initialized, setInitialized] = useState(false);
   const [dataDir, setDataDir] = useState("");
@@ -5687,9 +5700,10 @@ export default function ReactEEGApp() {
       {/* ══ Tab Content ══ */}
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab records={records} setRecords={setRecords} onOpenReview={openReview} updateRecordStatus={updateRecordStatus} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore}/>}
-        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} clinicalNotesMap={clinicalNotesMap} setClinicalNotesMap={setClinicalNotesMap} edfFileStore={edfFileStore} openTabs={openTabs} setOpenTabs={setOpenTabs} activeTabIdx={activeTabIdx} setActiveTabIdx={setActiveTabIdx} tabEpochCache={tabEpochCache}/>}
+        {activeTab === "review" && <ReviewTab record={reviewRecord || records[0] || null} updateRecordStatus={updateRecordStatus} records={records} onSelectRecord={openReview} annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} clinicalNotesMap={clinicalNotesMap} setClinicalNotesMap={setClinicalNotesMap} notesShownFilesRef={notesShownFilesRef} edfFileStore={edfFileStore} openTabs={openTabs} setOpenTabs={setOpenTabs} activeTabIdx={activeTabIdx} setActiveTabIdx={setActiveTabIdx} tabEpochCache={tabEpochCache}/>}
         {activeTab === "acquire" && <AcquireTab annotationsMap={annotationsMap} setAnnotationsMap={setAnnotationsMap} setRecords={setRecords} edfFileStore={edfFileStore} setEdfFileStore={setEdfFileStore} openReview={openReview}/>}
       </div>
     </div>
   );
 }
+// cache-bust 1774161153
