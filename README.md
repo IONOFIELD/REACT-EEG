@@ -98,7 +98,7 @@ Subject IDs follow a guided format like FB-001, SC-042, or OT-003. The app inclu
 - Input Source dropdown grouped by protocol
 - BrainFlow: OpenBCI Cyton 8/16ch, Ganglion, g.tec Unicorn, ANT Neuro eego, Neurosity Crown, Muse 2, BrainBit, Enophone
 - LSL: Generic auto-discover, Natus Xltek, Nihon Kohden, BioSemi ActiveTwo via LSL bridge
-- File Import: EDF/EDF+ and BDF/BDF+
+- File Import: EDF / EDF+ (BDF/BDF+ planned — 24-bit decode not yet implemented; BDF files will be rejected)
 - Simulated: 19ch and 32ch test signal generators
 - Connection flow: Select, Configure, Connect, Impedance check, Ready, Record
 - Impedance check with per-electrode color coding
