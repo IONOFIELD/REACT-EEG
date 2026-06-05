@@ -1,4 +1,12 @@
 node_modules
 dist
+dist-single
 .DS_Store
 *.local
+
+# Local tooling / machine-specific config (absolute paths)
+.claude/
+
+# Local-only data + notes (not part of the app/deploy)
+seed-edfs-archive/
+AUDIT-v13.md

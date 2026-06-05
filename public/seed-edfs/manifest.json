@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "v14.1",
+  "source": "PhysioNet EEG Motor Movement/Imagery Dataset (EEGMMIDB) v1.0.0",
+  "sourceUrl": "https://physionet.org/content/eegmmidb/1.0.0/",
+  "license": "ODC-By 1.0 (Open Data Commons Attribution)",
+  "citation": "Schalk, G., McFarland, D.J., Hinterberger, T., Birbaumer, N., Wolpaw, J.R. BCI2000: A General-Purpose Brain-Computer Interface (BCI) System. IEEE Transactions on Biomedical Engineering 51(6):1034-1043, 2004.",
+  "note": "Curated set of real human EEG recordings from PhysioNet's EEGMMIDB, re-named to REACT's PHI-free convention. Spans two same-subject sessions (S001 R01/R02 — for Subject Timeline demo), two additional baselines (S004, S007), and one task recording (S010 motor R03). 64-channel BCI2000, ~1-2 minutes each. Additional EDFs are staged in /seed-edfs-archive/ for easy re-addition.",
+  "files": [
+    {
+      "path": "S001R01-eyes-open.edf",
+      "subjectId": "PHY-S001",
+      "studyType": "BL",
+      "date": "2025-10-12",
+      "task": "Baseline, eyes open",
+      "durationSec": 61,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "S001R02-eyes-closed.edf",
+      "subjectId": "PHY-S001",
+      "studyType": "FU",
+      "date": "2025-12-04",
+      "task": "Follow-up, eyes closed",
+      "durationSec": 61,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "S004R01-eyes-open.edf",
+      "subjectId": "PHY-S004",
+      "studyType": "BL",
+      "date": "2025-09-15",
+      "task": "Baseline, eyes open",
+      "durationSec": 61,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "S007R02-eyes-closed.edf",
+      "subjectId": "PHY-S007",
+      "studyType": "BL",
+      "date": "2025-11-20",
+      "task": "Baseline, eyes closed",
+      "durationSec": 61,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "S010R03-left-right-fist.edf",
+      "subjectId": "PHY-S010",
+      "studyType": "RT",
+      "date": "2026-01-08",
+      "task": "Routine EEG with motor task (left/right fist)",
+      "durationSec": 124,
+      "sex": "",
+      "age": null
+    }
+  ]
+}
