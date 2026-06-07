@@ -1224,8 +1224,11 @@ function getChainBreaks(channelList) {
 function getChannelYPositions(channels, montage, totalHeight) {
   const breaks = getChainBreaks(channels);
   const gapPx = 8; // pixels of extra space between chains
+  // Small bottom buffer so the lowest channel's downward deflection has room and isn't
+  // clipped at the canvas edge. Shared by drawing + hit-testing, so they stay aligned.
+  const bottomPad = 14;
   const nGaps = breaks.filter(b => b < channels.length).length;
-  const usableHeight = totalHeight - nGaps * gapPx;
+  const usableHeight = Math.max(1, totalHeight - nGaps * gapPx - bottomPad);
   const chHeight = usableHeight / channels.length;
   const positions = [];
   let cumulativeGap = 0;
@@ -3179,6 +3182,93 @@ function CustomElectrodePicker({ customElectrodes, setCustomElectrodes, onClose 
 // ══════════════════════════════════════════════════════════════
 // MONTAGE BUILDER — build a custom bipolar montage from any two leads
 // ══════════════════════════════════════════════════════════════
+// Canonical electrode order for the builder pickers: front → back of the head, the
+// circumferential (outer perimeter) chain first, then the parasagittal/central chains —
+// the same anatomical sweep a 10-10 longitudinal-bipolar ("double banana") montage follows.
+// Alias spellings (T7/T3, T8/T4, P7/T5, P8/T6) are both listed so whichever the EDF uses
+// is ranked correctly. Anything not listed sorts to the end, alphabetically.
+const ELECTRODE_DISPLAY_ORDER = [
+  // ── Circumferential ring, front → back ──
+  "Fp1", "Fpz", "Fp2",
+  "AF7", "AF8",
+  "F9", "F7", "F8", "F10",
+  "FT9", "FT7", "FT8", "FT10",
+  "T9", "T7", "T3", "T4", "T8", "T10",
+  "TP9", "TP7", "TP8", "TP10",
+  "P9", "P7", "T5", "T6", "P8", "P10",
+  "PO7", "PO8",
+  "O1", "Oz", "O2", "Iz",
+  // ── Parasagittal + central chains, front → back ──
+  "AF3", "AFz", "AF4",
+  "F5", "F3", "F1", "Fz", "F2", "F4", "F6",
+  "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6",
+  "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+  "CP5", "CP3", "CP1", "CPz", "CP2", "CP4", "CP6",
+  "P5", "P3", "P1", "Pz", "P2", "P4", "P6",
+  "PO3", "POz", "PO4",
+  // ── Reference / ear leads last ──
+  "A1", "A2", "M1", "M2",
+];
+const ELECTRODE_RANK = Object.fromEntries(ELECTRODE_DISPLAY_ORDER.map((e, i) => [e, i]));
+const electrodeRank = (name) => (name in ELECTRODE_RANK ? ELECTRODE_RANK[name] : ELECTRODE_DISPLAY_ORDER.length);
+
+// Leads that are NOT scalp EEG (EOG/eye, EKG, EMG) — excluded from the montage builder,
+// which only offers 10-10 EEG nomenclature.
+const NON_EEG_LEADS = new Set(["LEOG1", "LEOG2", "REOG1", "REOG2", "LOC1", "LOC2", "ROC1", "ROC2", "EKG", "ECG", "EOG", "EMG"]);
+
+// Single-select electrode dropdown for the montage builder. Mirrors the Channels button:
+// each row shows a green dot when that electrode has EEG data in the loaded EDF (hollow when
+// not). Electrodes with data are listed first; no-data electrodes are deprioritized below a
+// divider so the user can see what's available to include.
+function ElectrodeSelect({ label, value, onChange, electrodes, dataSet }) {
+  const [open, setOpen] = useState(false);
+  const withData = electrodes.filter(e => dataSet.has(e));
+  const without = electrodes.filter(e => !dataSet.has(e));
+  const dot = (has) => ({ width: 7, height: 7, borderRadius: "50%", flexShrink: 0, background: has ? "#22c55e" : "transparent", border: has ? "none" : "1px solid #444" });
+  const row = (e) => {
+    const has = dataSet.has(e);
+    return (
+      <div key={e} onClick={() => { onChange(e); setOpen(false); }} style={{
+        display: "flex", alignItems: "center", gap: 8, padding: "3px 10px", cursor: "pointer", fontSize: 11,
+        fontFamily: "'IBM Plex Mono', monospace", color: has ? "#ccc" : "#666",
+        background: value === e ? "#1a2a30" : "transparent",
+      }} onMouseEnter={ev => ev.currentTarget.style.background = "#1a1a1a"}
+         onMouseLeave={ev => ev.currentTarget.style.background = value === e ? "#1a2a30" : "transparent"}>
+        <span title={has ? "EEG data present in EDF" : "No matching signal in EDF"} style={dot(has)} />
+        <span style={{ fontWeight: 600 }}>{e}</span>
+      </div>
+    );
+  };
+  return (
+    <div style={{ position: "relative" }}>
+      <div style={microLabel}>{label}</div>
+      <button type="button" onClick={() => setOpen(o => !o)} style={{
+        width: 124, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6,
+        background: "#0a0a0a", border: "1px solid #2a2a2a", color: value ? "#ddd" : "#555", fontSize: 12,
+        padding: "4px 8px", cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
+      }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {value && <span style={dot(dataSet.has(value))} />}{value || "—"}
+        </span>
+        <span style={{ color: "#555", fontSize: 9 }}>▾</span>
+      </button>
+      {open && (<>
+        <div style={{ position: "fixed", inset: 0, zIndex: 10000 }} onClick={() => setOpen(false)} />
+        <div onClick={e => e.stopPropagation()} style={{
+          position: "absolute", top: "100%", left: 0, zIndex: 10001, marginTop: 2, background: "#111",
+          border: "1px solid #2a2a2a", minWidth: 150, maxHeight: 300, overflowY: "auto", boxShadow: "0 8px 24px rgba(0,0,0,0.8)",
+        }}>
+          {withData.map(row)}
+          {without.length > 0 && (
+            <div style={{ padding: "3px 10px", fontSize: 8, color: "#444", borderTop: "1px solid #1a1a1a", borderBottom: "1px solid #1a1a1a", letterSpacing: "0.08em" }}>NO DATA IN THIS EDF</div>
+          )}
+          {without.map(row)}
+        </div>
+      </>)}
+    </div>
+  );
+}
+
 function MontageBuilderPanel({ availableElectrodes, customMontages, persistCustomMontages, montage, setMontage, onClose }) {
   const dialogRef = useRef(null);
   useFocusTrap(dialogRef, true, onClose);
@@ -3188,8 +3278,15 @@ function MontageBuilderPanel({ availableElectrodes, customMontages, persistCusto
   const [pairs, setPairs] = useState(editing ? editing.pairs.slice() : []);
   const [elA, setElA] = useState("");
   const [elB, setElB] = useState("");
-  // Electrodes the user can pick — those actually present in the loaded EDF, else the 10-20 set.
-  const electrodes = (availableElectrodes && availableElectrodes.length) ? availableElectrodes : ELECTRODE_SETS["10-20"];
+  // Electrodes the user can pick — strictly 10-10 EEG nomenclature (EOG/EKG excluded).
+  // `dataSet` = electrodes that actually carry EEG signal in this EDF (green dot). The picker
+  // universe = those-with-data ∪ the standard 10-20 set, so common leads are always offered;
+  // no-data leads show a hollow dot and are deprioritized to the bottom of each list.
+  const present = (availableElectrodes || []).filter(e => !NON_EEG_LEADS.has(e));
+  const dataSet = new Set(present);
+  const electrodes = Array.from(new Set([...present, ...ELECTRODE_SETS["10-20"]]))
+    .filter(e => !NON_EEG_LEADS.has(e) && (dataSet.has(e) || electrodeRank(e) < ELECTRODE_DISPLAY_ORDER.length))
+    .sort((a, b) => (electrodeRank(a) - electrodeRank(b)) || a.localeCompare(b));
 
   const addPair = () => {
     if (!elA || !elB || elA === elB) return;
@@ -3239,23 +3336,21 @@ function MontageBuilderPanel({ availableElectrodes, customMontages, persistCusto
           Pick any two leads to display the bipolar difference (A − B) between them — any pair, regardless of standard montage.
         </div>
 
-        {/* Pair picker */}
-        <div style={{display:"flex",alignItems:"flex-end",gap:8,marginBottom:14}}>
-          <div><div style={microLabel}>Electrode A</div>
-            <select value={elA} onChange={e=>setElA(e.target.value)} style={{...selStyle,width:110}}>
-              <option value="">—</option>
-              {electrodes.map(el => <option key={el} value={el}>{el}</option>)}
-            </select></div>
+        {/* Pair picker — dotted dropdowns: green = electrode has EEG data in this EDF */}
+        <div style={{display:"flex",alignItems:"flex-end",gap:8,marginBottom:6}}>
+          <ElectrodeSelect label="Electrode A" value={elA} onChange={setElA} electrodes={electrodes} dataSet={dataSet}/>
           <span style={{fontSize:16,color:"#555",paddingBottom:4}}>−</span>
-          <div><div style={microLabel}>Electrode B</div>
-            <select value={elB} onChange={e=>setElB(e.target.value)} style={{...selStyle,width:110}}>
-              <option value="">—</option>
-              {electrodes.map(el => <option key={el} value={el}>{el}</option>)}
-            </select></div>
+          <ElectrodeSelect label="Electrode B" value={elB} onChange={setElB} electrodes={electrodes} dataSet={dataSet}/>
           <button onClick={addPair} disabled={!elA||!elB||elA===elB} style={{
             padding:"5px 14px",fontSize:11,fontWeight:700,cursor:(!elA||!elB||elA===elB)?"default":"pointer",
             background:(!elA||!elB||elA===elB)?"#111":"#1a4a54",border:`1px solid ${(!elA||!elB||elA===elB)?"#222":"#4a9bab"}`,
             color:(!elA||!elB||elA===elB)?"#444":"#7ec8d9"}}>+ Add</button>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:6,fontSize:9,color:"#555",marginBottom:14}}>
+          <span style={{width:7,height:7,borderRadius:"50%",background:"#22c55e",flexShrink:0}}/>
+          <span>has EEG data in this recording</span>
+          <span style={{width:7,height:7,borderRadius:"50%",border:"1px solid #444",flexShrink:0,marginLeft:8}}/>
+          <span>no signal (listed below, deprioritized)</span>
         </div>
 
         {/* Current pairs */}
@@ -5492,7 +5587,14 @@ function computeGlobalSpectrogram(edfData) {
       if (m > maxMag) maxMag = m;
     }
   }
-  return { cols: COLS, freqs: FREQS, mags, maxMag };
+  // Robust normalization reference (98th percentile). Dividing by the single global max
+  // lets one strong artifact (an eye blink) set a huge max and flatten the rest of the map
+  // to blue. Normalizing to p98 instead spreads ordinary activity across the full colour
+  // range and lets strong artifacts saturate to red — making blinks/EMG easy to spot.
+  const sorted = Float32Array.from(mags).sort();
+  const p98 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.98))] || maxMag;
+  const normRef = p98 > 1e-9 ? p98 : maxMag;
+  return { cols: COLS, freqs: FREQS, mags, maxMag, normRef };
 }
 
 // Thermal colormap (blue→cyan→green→yellow→red) shared by the minimap.
@@ -5546,10 +5648,15 @@ function ReviewScrubBar({ edfData, annotations = [], totalDuration, totalEpochs,
     off.width = spec.cols; off.height = spec.freqs;
     const octx = off.getContext("2d");
     const img = octx.createImageData(spec.cols, spec.freqs);
+    const ref = spec.normRef || spec.maxMag;
     for (let c = 0; c < spec.cols; c++) {
       for (let f = 0; f < spec.freqs; f++) {
-        const t = Math.sqrt(spec.mags[c * spec.freqs + f] / spec.maxMag); // gamma lift
-        const rgb = specHeat(Math.max(0, Math.min(1, t)));
+        // Normalize to the robust p98 reference (clamped), then apply a contrast curve.
+        // Cells at/above p98 saturate to red; a mild gamma keeps mid-range activity vivid —
+        // higher overall colour contrast than the old divide-by-global-max + sqrt.
+        let t = Math.max(0, Math.min(1, spec.mags[c * spec.freqs + f] / ref));
+        t = Math.pow(t, 0.6);
+        const rgb = specHeat(t);
         const y = spec.freqs - 1 - f; // low freq at bottom
         const o = (y * spec.cols + c) * 4;
         img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2]; img.data[o + 3] = 255;
@@ -8460,6 +8567,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
       )}
         {/* Toolbar row — collapsible. Tool & panel buttons; dropdowns now live on the EpochNav row below. */}
         <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexWrap:"wrap",flexShrink:0,justifyContent:"center"}}>
+            <button title={eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit this custom montage" : "Build a custom bipolar montage"}
+              data-tut="Montage builder: Create a bipolar montage from any two electrodes. Saved montages persist and are reusable across recordings."
+              onClick={(e)=>{e.stopPropagation();eeg.setShowMontageBuilder(true);}}
+              style={{...controlBtn(eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX)),color:"#7ec8d9",border:"1px solid #4a9bab"}}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Edit(12)} {eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit Montage" : "Build Montage"}</span>
+            </button>
             <div style={{position:"relative"}}>
               <button data-tut="Show or hide individual channels. The green dot on the right of each row means that channel has signal in this EDF; a hollow dot means no data." onClick={(e)=>{e.stopPropagation();setShowChannelPicker(p=>!p);}} style={{...controlBtn(showChannelPicker),
                 color:eeg.hiddenChannels.size>0?"#F59E0B":"#888",border:`1px solid ${eeg.hiddenChannels.size>0?"#F59E0B40":"#222"}`}}>
@@ -8600,12 +8713,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
               </optgroup>
             )}
           </select>
-          <button title={eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit this custom montage" : "Build a custom bipolar montage"}
-            data-tut="Montage builder: Create a bipolar montage from any two electrodes. Saved montages persist and are reusable across recordings."
-            onClick={()=>eeg.setShowMontageBuilder(true)}
-            style={{padding:"3px 8px",background:"#111",border:"1px solid #4a9bab",borderRadius:2,color:"#7ec8d9",cursor:"pointer",fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>
-            {eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "✎ Edit" : "+ Build"}
-          </button>
+          {/* Montage builder button moved to the toolbar row, in front of Channels */}
           <select title="LFF (Hz)" data-tut="LFF (Low-Frequency Filter): The high-pass cutoff — frequencies below this are attenuated to remove slow drift. Lower values (down to 0.01 Hz) preserve slow waves for research." value={eeg.hpf} onChange={e=>eeg.setHpf(parseFloat(e.target.value))} style={selectStyle}>
             {LFF_OPTIONS.map(v=><option key={v} value={v}>LFF {v===0?"Off":`${v} Hz`}</option>)}
           </select>
