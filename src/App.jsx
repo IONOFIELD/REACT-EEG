@@ -7,6 +7,8 @@ import { buildAnnotationSidecar } from "./sidecar.js";
 import { ANNOTATION_TYPES as ANNOTATION_COLORS, migrateAnnotations } from "./annotations.js";
 // Inter-rater / provenance: pseudonymous (hashed) annotator id + concordant/discordant indicator.
 import { hashAnnotator, agreementByAnnotation } from "./interrater.js";
+// EDF channel signal-presence (σ-based; ignores DC offset). Unit-tested in test/edf-signals.test.js.
+import { signalStats, channelHasSignal } from "./edf-signals.js";
 // Pure DSP kernel (extracted, behaviour-identical, unit-tested in test/dsp.golden.test.js)
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
@@ -35,6 +37,31 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v17.6", items: [
+    "Two new file-derived montages (in the montage dropdown's 'From file' group): Adaptive Double-Banana builds a longitudinal-bipolar montage from the electrodes actually present — collapsing to the classic banana on a 10-20 file and filling in the intermediate chains on high-density recordings; As Recorded shows the file's own signals one trace each, honoring a pre-montaged EDF whose labels already contain derivations (e.g. Fp1-F3)",
+    "Electrode system is now auto-detected from the EDF (counting the scalp electrodes actually present) instead of defaulting to 10-20 — so high-density recordings are correctly labeled 10-10/HD in the Library, the EEG-system options are no longer wrongly greyed out, and existing records are corrected when opened in Review",
+  ]},
+  { version: "v17.5", items: [
+    "Signal-presence check fixed — a channel now counts as having data only if it actually varies (mean-removed σ), not just a nonzero DC baseline; flat/empty channels correctly show no green dot in the Raw EDF list and montage builder. The Raw EDF column now reads σ (µV)",
+    "Moved the Raw EDF button up to the header, beside the green EDF indicator next to the filename",
+    "Toolbar reorganized into two rows: waveform management (Build Montage, Channels, Denoise, ICA Clean, Pattern Table) on top, analysis & review tools below",
+  ]},
+  { version: "v17.4", items: [
+    "Collections sidebar open/close is now one consistent control — the same thin bar on the right edge in both states, only the chevron flips (‹ minimize / › expand)",
+  ]},
+  { version: "v17.3", items: [
+    "Collections sidebar can be minimized to a vertical rail of one-letter collection icons (click a letter to filter; the state is remembered)",
+    "Compliance criteria readout reworked so each rule's name and threshold stack cleanly (no more overlap in the narrow bar), and the criteria list now also appears in the Library sidebar, not just Repository",
+  ]},
+  { version: "v17.2", items: [
+    "NEW Raw EDF inspector (Review toolbar) — a read-only inventory of every signal in the .edf: label, mapped electrode, type, sample rate, units and an RMS-based 'has signal' dot, so you can see exactly what data is available before reading",
+    "Full 10-10 electrode recognition — high-density recordings (Fc3, Fcz, Cp4, …) are now read correctly instead of showing half their channels as 'Other'; the montage builder lists only real EEG leads and a green dot means that electrode actually carries data",
+  ]},
+  { version: "v17.1", items: [
+    "Montage: the Build button moved into the Review toolbar (in front of Channels) and resized to match the other controls; the electrode pickers list 10-10 leads ordered anatomically (circumferential front→back, then parasagittal), data-bearing leads first",
+    "Added a small bottom buffer so the lowest waveform trace isn't clipped at the screen edge",
+    "Bottom navigator spectrogram has much higher colour contrast (robust normalization) so eye blinks and strong artifacts are easy to spot at a glance",
+  ]},
   { version: "v17.0", items: [
     "Inter-rater support — more than one annotator can mark the same segment; each annotation records an opaque (hashed) annotator id, a UTC timestamp, optional confidence and the schema version that wrote it, and segments marked by two or more annotators show a concordant / discordant badge. Annotator labels are pseudonymous and never leave your machine; all fields are optional and backward-compatible",
     "Annotation taxonomy now aligns to the ACNS/ILAE standard — added Seizure, LPD, GPD, LRDA and GRDA as first-class descriptive terms (marked ✦) alongside REACT's spike/sharp/sleep markups; each annotation carries a stable code, and older annotation files migrate automatically with no data loss (schema v15.0). REACT remains non-diagnostic — these are technologist markups, not interpretations",
@@ -205,6 +232,7 @@ const STORAGE_KEYS = {
   BASELINE_MAP_LEGACY: "react-eeg-baselineMap",  // pre-v14, dashed (drop after one release)
   CUSTOM_MONTAGES: "react_eeg_custom_montages",  // user-built bipolar montages [{id,name,pairs}]
   ANNOTATOR: "react_eeg_annotator_label",        // current annotator pseudonym (local only; never exported)
+  COLLECTIONS_COLLAPSED: "react_eeg_collections_collapsed", // collections sidebar minimized to an icon rail
 };
 
 // Current annotator's pseudonymous label (local convenience) and its opaque hashed id.
@@ -2056,7 +2084,7 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
         durationSec: def.durationSec || parsed.totalDuration,
         sampleRate: parsed.sampleRate,
         fileSize: fileSizeMB, sex: def.sex || "", age: def.age,
-        montage: "10-20", status: "pending",
+        montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: true, fileType: "real-public",
         hasEdfData: true,
         notes: `${def.task || ""} (Source: PhysioNet EEGMMIDB ${def.path})`,
@@ -3243,11 +3271,83 @@ function canonicalElectrode(label) {
   return EEG_NAME_TO_CANON.get(s.toUpperCase()) || null;
 }
 
-// Per-signal analysis of a parsed EDF. Maps each signal to an electrode + type, computes a
-// quick RMS to tell whether it actually carries signal (vs flat/empty), and rolls up the set
-// of scalp-EEG electrodes that truly have data. Shared by the montage builder (green dots are
-// strictly EEG-with-data) and the Raw EDF inspector. Pure; safe to memoize on edfData.
-const EEG_SIGNAL_RMS_MIN = 1e-3; // µV — above this a channel is considered to carry real signal
+// Special, file-derived montage keys (handled in useEEGState, not in MONTAGE_DEFS).
+const MONTAGE_ADAPTIVE = "adaptive-banana";
+const MONTAGE_AS_RECORDED = "as-recorded";
+
+// Anterior→posterior 10-10 chains (one per sagittal column) used to build an adaptive
+// longitudinal-bipolar ("double banana") montage from whatever electrodes a file actually
+// has. Sparse files (10-20) collapse to the classic banana; high-density files fill in the
+// intermediate columns automatically.
+const ADAPTIVE_BANANA_COLUMNS = [
+  ["Fp1","AF7","F7","FT7","T7","TP7","P7","PO7","O1"],        // left temporal
+  ["F5","FC5","C5","CP5","P5"],                                // left lateral
+  ["Fp1","AF3","F3","FC3","C3","CP3","P3","PO3","O1"],         // left parasagittal
+  ["F1","FC1","C1","CP1","P1"],                                // left inner
+  ["Fpz","AFz","Fz","FCz","Cz","CPz","Pz","POz","Oz","Iz"],    // midline
+  ["F2","FC2","C2","CP2","P2"],                                // right inner
+  ["Fp2","AF4","F4","FC4","C4","CP4","P4","PO4","O2"],         // right parasagittal
+  ["F6","FC6","C6","CP6","P6"],                                // right lateral
+  ["Fp2","AF8","F8","FT8","T8","TP8","P8","PO8","O2"],         // right temporal
+];
+
+// Build a longitudinal-bipolar montage (array of "A-B" pairs) from the electrodes present in
+// the file. Tolerant of modern↔legacy temporal naming (T7↔T3 etc.) and of missing electrodes
+// (it just bridges to the next present one down the column).
+function buildAdaptiveBanana(presentElectrodes) {
+  const byAlias = new Map();
+  for (const e of (presentElectrodes || [])) { const k = aliasKey(e); if (!byAlias.has(k)) byAlias.set(k, e); }
+  const resolve = (name) => byAlias.get(aliasKey(name)) || null;
+  const out = [];
+  for (const col of ADAPTIVE_BANANA_COLUMNS) {
+    const chain = col.map(resolve).filter(Boolean);
+    for (let i = 0; i + 1 < chain.length; i++) {
+      const pair = `${chain[i]}-${chain[i + 1]}`;
+      if (!out.includes(pair)) out.push(pair);
+    }
+  }
+  return out;
+}
+
+// Clean an EDF signal label to a display channel name: strip "EEG "/"ECG " prefix and trailing
+// dots, keep any "-Ref" derivation (so a pre-montaged file's labels are honored verbatim).
+function cleanEdfLabel(l) {
+  return String(l || "").trim().replace(/^(EEG|ECG|EKG|EOG|EMG)\s+/i, "").replace(/\.+$/, "").trim();
+}
+// "As recorded" montage = the file's own signals, one trace each, exactly as stored.
+function asRecordedChannels(edfData) {
+  return (edfData?.channelLabels || []).map(cleanEdfLabel).filter(Boolean);
+}
+
+// Classify a recording's electrode system from the EDF by counting the distinct scalp-EEG
+// electrodes actually present (recognized 10-10 names), so a high-density file isn't mislabeled
+// "10-20" just because that's the import default. Returns "10-20" | "hd-40" | "10-10" | null.
+function detectEdfSystem(edfData) {
+  const labels = edfData?.channelLabels || [];
+  const seen = new Set();
+  for (const l of labels) { const e = canonicalElectrode(l); if (e && !NON_EEG_LEADS.has(e)) seen.add(e); }
+  const n = seen.size;
+  if (n === 0) return null;
+  if (n <= 21) return "10-20";
+  if (n <= 40) return "hd-40";
+  return "10-10";
+}
+// Does the file ship derivations in its labels (a pre-montaged EDF, e.g. "Fp1-F3")?
+function edfHasDerivedLabels(edfData) {
+  return (edfData?.channelLabels || []).some(l => {
+    const c = cleanEdfLabel(l);
+    return /^[A-Za-z]+\d*-[A-Za-z]+\d*$/.test(c); // electrode-electrode, e.g. Fp1-F3
+  });
+}
+
+// Per-signal analysis of a parsed EDF. Maps each signal to an electrode + type and measures
+// whether it actually carries a fluctuating signal — i.e. mean-removed standard deviation
+// (AC activity), NOT raw RMS. Raw RMS includes any DC offset, so a flat/constant channel
+// (no real EEG, but a nonzero baseline) would falsely read as "has data". Using σ + a
+// require-it-varies check means a flat or absent channel correctly shows no data.
+// Rolls up the scalp-EEG electrodes that truly have signal. Shared by the montage builder
+// (green dots are strictly EEG-with-data) and the Raw EDF inspector. Pure; memoize on edfData.
+// Signal-presence math lives in ./edf-signals.js (unit-tested).
 function analyzeEdfSignals(edfData) {
   const labels = edfData?.channelLabels || [];
   const cd = edfData?.channelData || [];
@@ -3256,13 +3356,10 @@ function analyzeEdfSignals(edfData) {
   const presentEeg = []; const seenEeg = new Set(); const withData = new Set();
   labels.forEach((label, idx) => {
     const arr = cd[idx];
-    let rms = 0;
-    if (arr && arr.length) {
-      const n = Math.min(arr.length, 8192); let sum = 0;
-      for (let i = 0; i < n; i++) sum += arr[i] * arr[i];
-      rms = Math.sqrt(sum / n);
-    }
-    const hasSignal = rms > EEG_SIGNAL_RMS_MIN;
+    const physDim = sigs[idx]?.physDim;
+    const { std } = signalStats(arr);
+    // Real signal = varies (σ above the unit-aware floor) AND is not a constant/flat trace.
+    const hasSignal = channelHasSignal(arr, physDim);
     const electrode = canonicalElectrode(label);
     const up = (label || "").toUpperCase();
     let type = "Other";
@@ -3271,7 +3368,7 @@ function analyzeEdfSignals(edfData) {
     else if (electrode) type = "EEG";
     const isEeg = type === "EEG";
     channels.push({
-      idx, label, electrode: isEeg ? electrode : null, type, rms, hasSignal,
+      idx, label, electrode: isEeg ? electrode : null, type, std, hasSignal,
       sampleRate: sigs[idx]?.sampleRate ?? null, physDim: sigs[idx]?.physDim || "", numSamples: sigs[idx]?.numSamples ?? null,
     });
     if (isEeg && electrode && !seenEeg.has(electrode)) { seenEeg.add(electrode); presentEeg.push(electrode); }
@@ -5500,7 +5597,7 @@ function RawEdfPanel({ edfData, channels, filename, onClose, panelPos, setPanelP
           <div style={{ padding: 20, textAlign: "center", color: "#555", fontSize: 11 }}>No EDF loaded.</div>
         ) : (
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10, fontFamily: mono }}>
-            <thead><tr>{["#", "Label", "Electrode", "Type", "Rate", "Units", "RMS", "Data"].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+            <thead><tr>{["#", "Label", "Electrode", "Type", "Rate", "Units", "σ", "Data"].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
             <tbody>
               {channels.map(c => (
                 <tr key={c.idx} style={{ borderBottom: "1px solid #111" }}>
@@ -5510,7 +5607,7 @@ function RawEdfPanel({ edfData, channels, filename, onClose, panelPos, setPanelP
                   <td style={{ ...td, color: typeColor(c.type), fontWeight: 700 }}>{c.type}</td>
                   <td style={td}>{c.sampleRate ?? "—"}</td>
                   <td style={td}>{c.physDim || "—"}</td>
-                  <td style={{ ...td, color: c.hasSignal ? "#aaa" : "#444" }}>{fmt(c.rms, 2)}</td>
+                  <td style={{ ...td, color: c.hasSignal ? "#aaa" : "#444" }}>{fmt(c.std, 2)}</td>
                   <td style={td}>
                     <span title={c.hasSignal ? "carries signal" : "flat / no signal"} style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: c.hasSignal ? "#22c55e" : "transparent", border: c.hasSignal ? "none" : "1px solid #444" }} />
                   </td>
@@ -5521,7 +5618,7 @@ function RawEdfPanel({ edfData, channels, filename, onClose, panelPos, setPanelP
         )}
       </div>
       <div style={{ padding: "6px 12px", borderTop: "1px solid #1a1a1a", fontSize: 8, color: "#444", lineHeight: 1.4 }}>
-        RMS measured over the first ~8k samples per signal. Green = carries signal. Raw inventory of the .edf — de-identified header only, no interpretation.
+        σ = mean-removed signal std-dev over the first ~8k samples (ignores DC offset). Green = the channel actually varies (carries signal); hollow = flat / no data. Raw inventory of the .edf — de-identified header only, no interpretation.
       </div>
     </FloatingPanel>
   );
@@ -6072,6 +6169,10 @@ function useEEGState(totalDuration = 600, edfData = null) {
     });
   }, []);
 
+  // Per-signal EDF analysis (electrodes present + which carry real signal) for the
+  // file-derived montages below.
+  const edfSig = useMemo(() => analyzeEdfSignals(edfData), [edfData]);
+
   const allChannels = useMemo(() => {
     // A custom montage is just the user's saved list of "A-B" pairs fed through the same
     // bipolar-derivation pipeline as the presets (waveformData parses "A-B" → A − B).
@@ -6079,8 +6180,14 @@ function useEEGState(totalDuration = 600, edfData = null) {
       const cm = customMontages.find(m => CUSTOM_MONTAGE_PREFIX + m.id === montage);
       return cm ? cm.pairs.slice() : [];
     }
+    // Adaptive double-banana — longitudinal bipolar chains built from the electrodes that
+    // actually carry signal in THIS file (scales from 10-20 up to high-density).
+    if (montage === MONTAGE_ADAPTIVE) return buildAdaptiveBanana([...edfSig.withData]);
+    // As recorded — the file's own signals, one trace each, exactly as stored (honors a
+    // pre-montaged EDF whose labels already contain derivations).
+    if (montage === MONTAGE_AS_RECORDED) return asRecordedChannels(edfData);
     return getMontageChannels(montage, eegSystem, eegSystem === "custom" ? customElectrodes : null);
-  }, [montage, eegSystem, customElectrodes, customMontages]);
+  }, [montage, eegSystem, customElectrodes, customMontages, edfSig, edfData]);
   // AUX_CHANNELS, EYE_CHANNELS, EYE_LEAD_ALIASES hoisted to CONFIGURATION block at top of file
   // visibilityState now derived from the visibility reducer above; setVisibilityState is gone
 
@@ -6093,6 +6200,11 @@ function useEEGState(totalDuration = 600, edfData = null) {
     if (!edfData || !edfData.channelLabels) return new Set();
     const normed = edfData.channelLabels.map(normEdf);
     const covered = new Set();
+    // "As recorded" channels ARE the raw file signals — match each by its full label.
+    if (montage === MONTAGE_AS_RECORDED) {
+      allChannels.forEach(ch => { if (normed.some(n => n === normCh(ch))) covered.add(ch); });
+      return covered;
+    }
     allChannels.forEach(ch => {
       const isEyeLead = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
       const isEKG = ch === "EKG";
@@ -6120,7 +6232,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
       }
     });
     return covered;
-  }, [edfData, allChannels]);
+  }, [edfData, allChannels, montage]);
 
   // auxWithData: subset for PatternTable LIVE/SIM badges
   const auxWithData = useMemo(() => {
@@ -6215,7 +6327,9 @@ function useEEGState(totalDuration = 600, edfData = null) {
       if (edfData && edfData.channelData) {
         const isEyeLead = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
         const isEKG = ch === "EKG";
-        const isSingleLabel = isEyeLead || isEKG || !ch.includes("-");
+        // "As recorded" traces are raw file signals — match the full label and display as-is
+        // (never re-derive), even when the label itself contains a "-" derivation.
+        const isSingleLabel = montage === MONTAGE_AS_RECORDED || isEyeLead || isEKG || !ch.includes("-");
 
         if (isSingleLabel) {
           // EKG: match ECG label in EDF
@@ -6749,8 +6863,58 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
   const totalCount = (typeof totalRecordCount === "number")
     ? totalRecordCount
     : Object.values(recordsByCollection || {}).reduce((s, arr) => s + arr.length, 0);
+
+  // Collapsed → minimize the sidebar to a vertical rail of one-letter collection icons.
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem(STORAGE_KEYS.COLLECTIONS_COLLAPSED) === "1"; } catch { return false; }
+  });
+  const setCollapsedPersist = (v) => {
+    setCollapsed(v);
+    try { localStorage.setItem(STORAGE_KEYS.COLLECTIONS_COLLAPSED, v ? "1" : "0"); } catch {}
+  };
+
+  // One shared toggle: the same thin right-edge bar in both states, only the chevron flips
+  // (‹ minimize / › expand) so the open/close affordance is identical and predictable.
+  const toggleBar = (
+    <button title={collapsed ? "Expand collections" : "Minimize collections"}
+      aria-label={collapsed ? "Expand collections" : "Minimize collections"}
+      onClick={() => setCollapsedPersist(!collapsed)}
+      style={{ width:14, flexShrink:0, background:"#0a0a0a", borderRight:"1px solid #1a1a1a", borderLeft:"1px solid #141414", borderTop:"none", borderBottom:"none",
+        color:"#666", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, padding:0 }}
+      onMouseEnter={e=>{e.currentTarget.style.background="#111";e.currentTarget.style.color="#7ec8d9";}}
+      onMouseLeave={e=>{e.currentTarget.style.background="#0a0a0a";e.currentTarget.style.color="#666";}}>
+      {collapsed ? "›" : "‹"}
+    </button>
+  );
+
+  if (collapsed) {
+    const railBtn = (active, accent) => ({
+      width: 30, height: 30, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center",
+      fontSize: 12, fontWeight: 700, cursor: "pointer", borderRadius: 2,
+      background: active ? "#1a2a30" : "#111", border: `1px solid ${active ? "#4a9bab" : "#222"}`,
+      color: active ? "#7ec8d9" : (accent || "#888"), fontFamily: "'IBM Plex Mono', monospace",
+    });
+    return (
+      <div style={{display:"flex",height:"100%",flexShrink:0}}>
+        <div style={{width:46,background:"#0a0a0a",display:"flex",flexDirection:"column",alignItems:"center",flexShrink:0,paddingTop:8,gap:6,overflowY:"auto"}}>
+          <button title={`All Recordings (${totalCount})`} onClick={()=>onSelect(null)} style={railBtn(selectedCollectionId===null)}>∗</button>
+          {(collections || []).map(col => {
+            const active = selectedCollectionId === col.id;
+            const letter = ((col.name || "?").trim().charAt(0) || "?").toUpperCase();
+            const count = recordsByCollection?.[col.id]?.length ?? 0;
+            return (
+              <button key={col.id} title={`${col.name}${count ? ` (${count})` : ""}`} onClick={()=>onSelect(col.id)} style={railBtn(active)}>{letter}</button>
+            );
+          })}
+        </div>
+        {toggleBar}
+      </div>
+    );
+  }
+
   return (
-    <div style={{width:200,background:"#0a0a0a",borderRight:"1px solid #1a1a1a",display:"flex",flexDirection:"column",flexShrink:0}}>
+    <div style={{display:"flex",height:"100%",flexShrink:0}}>
+    <div style={{width:200,background:"#0a0a0a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:0}}>
       <div data-tut="Collections: User-defined groups for organizing recordings (e.g. by study, cohort or protocol). Click one to filter the list to just its members." style={{padding:"10px 12px",borderBottom:"1px solid #1a1a1a",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <span style={{fontSize:9,fontWeight:700,color:"#666",letterSpacing:"0.1em"}}>COLLECTIONS</span>
         <button onClick={()=>setShowNew(p=>!p)} title="New collection"
@@ -6812,21 +6976,29 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
             <span style={{fontSize:9,fontWeight:700,color:"#4a9bab",letterSpacing:"0.1em"}}>COMPLIANCE CRITERIA</span>
           </div>
           <div style={{padding:"0 10px 10px"}}>
-            {COMPLIANCE_CRITERIA.map(c => (
-              <div key={c.id} title={c.desc} style={{display:"flex",alignItems:"baseline",gap:6,padding:"3px 2px",borderBottom:"1px solid #0f0f0f"}}>
-                <span style={{color:"#3a6b75",fontSize:9,lineHeight:1.3,flexShrink:0}}>▸</span>
-                <span style={{flex:1,minWidth:0}}>
-                  <div style={{fontSize:10,color:"#bbb",lineHeight:1.25}}>{c.label.replace(/\s*[≥≤].*$/,"").trim() || c.label}</div>
-                </span>
-                <span style={{fontSize:9,color:"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace",flexShrink:0}}>{c.threshold}</span>
-              </div>
-            ))}
+            {COMPLIANCE_CRITERIA.map(c => {
+              // Drop the threshold text baked into the label (e.g. "Duration ≥ 5 min" → "Duration")
+              // so the criterion name and its threshold stack cleanly without colliding.
+              const name = c.label.replace(/\s*[≥≤].*$/, "").trim() || c.label;
+              return (
+                <div key={c.id} title={c.desc} style={{display:"flex",gap:6,padding:"4px 2px",borderBottom:"1px solid #0f0f0f"}}>
+                  <span style={{color:"#3a6b75",fontSize:9,lineHeight:1.5,flexShrink:0}}>▸</span>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:10,color:"#bbb",lineHeight:1.3,wordBreak:"break-word"}}>{name}</div>
+                    <div style={{fontSize:9,color:"#5a8b95",fontFamily:"'IBM Plex Mono', monospace",lineHeight:1.3,wordBreak:"break-word"}}>{c.threshold}</div>
+                  </div>
+                </div>
+              );
+            })}
             <div style={{fontSize:8,color:"#444",lineHeight:1.4,marginTop:6}}>
               Promotion-eligible when no criterion fails. “Unknown” (e.g. impedance not stored) does not block.
             </div>
           </div>
         </div>
       )}
+    </div>
+    {/* Thin minimize bar on the right edge — identical to the expand bar shown when collapsed */}
+    {toggleBar}
     </div>
   );
 }
@@ -6921,7 +7093,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
         durationSec: meta.durationSec || parsed.totalDuration, sampleRate: meta.sampleRate || parsed.sampleRate,
         fileSize: meta.fileSize || Math.round(imp.edfArrayBuffer.byteLength / 1024 / 1024 * 10) / 10,
         sex: meta.sex || "", age: meta.age ?? null,
-        montage: "10-20", status: "pending",
+        montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: false, isImportedPackage: true, fileType: "imported-package",
         hasEdfData: true,
         notes: `Imported from patient package on ${new Date().toISOString().split("T")[0]}`,
@@ -7028,7 +7200,8 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
         onSelect={setSelectedCollectionId} recordsByCollection={recordsByCollection}
         totalRecordCount={records.length}
         onCreateCollection={handleCreateCollection}
-        onDeleteCollection={handleDeleteCollection}/>
+        onDeleteCollection={handleDeleteCollection}
+        showComplianceCriteria/>
     <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden",minWidth:0}}>
       {/* Stats — 4-card grid, slightly tighter than the original */}
       <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:1,background:"#1a1a1a",borderBottom:"1px solid #1a1a1a",flexShrink:0}}>
@@ -8303,6 +8476,16 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // Per-signal EDF analysis (electrode/type/RMS) — drives the montage-builder green dots
   // (strictly EEG-with-data) and the Raw EDF inspector.
   const edfInfo = useMemo(() => analyzeEdfSignals(edfData), [edfData]);
+  // Backfill the electrode system from the actual EDF when a record is opened — corrects older
+  // records (and seeds) that were stamped "10-20" by default but are really higher-density.
+  useEffect(() => {
+    if (!record || !edfData || !setRecords) return;
+    const detected = detectEdfSystem(edfData);
+    if (detected && record.montage !== detected) {
+      setRecords(prev => prev.map(r => r.id === record.id ? { ...r, montage: detected } : r));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [record?.id, edfData]);
   const totalDur = edfData ? edfData.totalDuration : 600;
   const recordSeed = useMemo(() => {
     const fn = record?.filename || "";
@@ -8660,6 +8843,14 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
         <span style={{color:"#333"}}>|</span><span>{edfData ? `${Math.floor(edfData.totalDuration/60)}:${String(Math.floor(edfData.totalDuration%60)).padStart(2,"0")}` : "10:00"}</span>
         <span style={{color:"#333"}}>|</span>
         <span style={{color:edfData?"#10B981":"#ef4444",fontWeight:700}}>{edfData?"EDF":"NO DATA"}</span>
+        {edfData && (
+          <button data-tut="Raw EDF: A read-only inventory of every signal in the .edf — label, electrode, type, sample rate, units and a σ-based 'has signal' dot — so you can see exactly what data is available." onClick={(e)=>{e.stopPropagation();setShowRawEdf(p=>!p);}}
+            title="Raw EDF — inventory of every signal in this file" style={{
+            background:showRawEdf?"#1a2a30":"#111",border:`1px solid ${showRawEdf?"#4a9bab":"#2a2a2a"}`,color:"#7ec8d9",fontSize:9,fontWeight:700,
+            padding:"2px 6px",cursor:"pointer",fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.05em",display:"inline-flex",alignItems:"center",gap:3}}>
+            {I.List(10)} RAW
+          </button>
+        )}
         <div style={{flex:1}}/>
         {record && (
           <div style={{display:"flex",alignItems:"center",gap:8}}>
@@ -8700,8 +8891,10 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
           </div>
         </div>
       )}
-        {/* Toolbar row — collapsible. Tool & panel buttons; dropdowns now live on the EpochNav row below. */}
-        <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexWrap:"wrap",flexShrink:0,justifyContent:"center"}}>
+        {/* Toolbar — two rows: waveform management (top) and analysis/review (bottom). */}
+        <div style={{display:"flex",flexDirection:"column",gap:6,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexShrink:0}}>
+          {/* Row 1 — waveform management */}
+          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
             <button title={eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit this custom montage" : "Build a custom bipolar montage"}
               data-tut="Montage builder: Create a bipolar montage from any two electrodes. Saved montages persist and are reusable across recordings."
               onClick={(e)=>{e.stopPropagation();eeg.setShowMontageBuilder(true);}}
@@ -8759,6 +8952,9 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             <button data-tut="Pattern Table: Opens an NK-style trace configuration where you choose which derivations are drawn and in what order on the page." onClick={(e)=>{e.stopPropagation();setShowPatternTable(true);}} style={controlBtn(showPatternTable)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List()} Pattern Table</span>
             </button>
+          </div>
+          {/* Row 2 — analysis & review */}
+          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
             <button data-tut="qEEG: A quantitative analysis panel showing band powers, peak alpha frequency, theta/beta ratio and left-right asymmetry for the current epoch." onClick={(e)=>{e.stopPropagation();setShowAnalysis(prev => !prev);}} style={controlBtn(showAnalysis)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.BarChart()} qEEG</span>
             </button>
@@ -8767,9 +8963,6 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             </button>
             <button data-tut="Impedance: Shows per-electrode impedance read from the EDF, if the recording stored it. Impedance is a dynamic value measured at acquisition; the compliance cutoff is ≤ 5 kΩ." onClick={(e)=>{e.stopPropagation();setShowRevImpedance(true);}} style={controlBtn()}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Zap(12)} Impedance{edfData?.impedances?.length ? ` (${edfData.impedances.length})` : ""}</span>
-            </button>
-            <button data-tut="Raw EDF: A read-only inventory of every signal in the .edf file — label, mapped electrode, type, sample rate, units and an RMS-based 'has signal' dot — so you can see exactly what data is available before reading." onClick={(e)=>{e.stopPropagation();setShowRawEdf(p=>!p);}} style={controlBtn(showRawEdf)}>
-              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List(12)} Raw EDF</span>
             </button>
             <button data-tut="Data Sheet: Generates a printable single-page summary — metadata, band powers and topography — in a new window, ready to print or save as PDF." onClick={(e)=>{
               e.stopPropagation();
@@ -8808,6 +9001,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             }} style={controlBtn(showClinicalNotes)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Edit()} Notes</span>
             </button>
+          </div>
         </div>
         <div onClick={()=>setToolbarCollapsed(true)}
           onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
@@ -8832,7 +9026,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
           <select title="EEG System" data-tut="EEG System: Chooses the electrode placement standard used to interpret the file (10-20, 10-10, high-density, or a custom lead set)." value={eeg.eegSystem} onChange={e=>eeg.setEegSystem(e.target.value)}
             style={{...selectStyle,width:eeg.eegSystem==="custom"?120:140}}>
             {Object.entries(EEG_SYSTEMS).map(([k,v])=>{
-              const recSys = record?.eegSystem || "10-20";
+              // The recording's system is stored on record.montage (e.g. "10-20"/"hd-40"/"10-10").
+              const recSys = record?.eegSystem || record?.montage || "10-20";
               const disabled = !canViewInSystem(recSys, k);
               return <option key={k} value={k} disabled={disabled}>{v.label}{disabled?" (insufficient data)":""}</option>;
             })}
@@ -8843,8 +9038,14 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
               {I.Edit(10)}
             </button>
           )}
-          <select title="Montage" data-tut="Montage: Sets how channels are derived and arranged — e.g. bipolar longitudinal (banana), referential, or transverse — changing what each trace represents. Custom montages you build appear at the bottom." value={eeg.montage} onChange={e=>eeg.setMontage(e.target.value)} style={{...selectStyle,width:200}}>
+          <select title="Montage: Sets how channels are derived and arranged. Presets, plus file-derived options (adaptive double-banana built from the electrodes present, and 'as recorded' which shows the file's own signals) and any custom montages you build." data-tut="Montage: Sets how channels are derived and arranged — e.g. bipolar longitudinal (banana), referential, or transverse. The 'From file' group adapts to this recording: an adaptive double-banana built from the electrodes present, and 'as recorded' showing the file's own signals. Custom montages you build appear at the bottom." value={eeg.montage} onChange={e=>eeg.setMontage(e.target.value)} style={{...selectStyle,width:200}}>
             {Object.entries(MONTAGE_DEFS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+            {edfData && (
+              <optgroup label="From file">
+                <option value={MONTAGE_ADAPTIVE}>Adaptive Double-Banana</option>
+                <option value={MONTAGE_AS_RECORDED}>As Recorded{edfHasDerivedLabels(edfData) ? " (montaged)" : ""}</option>
+              </optgroup>
+            )}
             {eeg.customMontages.length > 0 && (
               <optgroup label="Custom montages">
                 {eeg.customMontages.map(m=><option key={m.id} value={CUSTOM_MONTAGE_PREFIX+m.id}>{m.name} ({m.pairs.length} ch)</option>)}
