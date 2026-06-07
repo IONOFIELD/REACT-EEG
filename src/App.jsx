@@ -233,6 +233,7 @@ const STORAGE_KEYS = {
   CUSTOM_MONTAGES: "react_eeg_custom_montages",  // user-built bipolar montages [{id,name,pairs}]
   ANNOTATOR: "react_eeg_annotator_label",        // current annotator pseudonym (local only; never exported)
   COLLECTIONS_COLLAPSED: "react_eeg_collections_collapsed", // collections sidebar minimized to an icon rail
+  TABS_MINIMIZED: "react_eeg_tabs_minimized",   // top tab bar compacted to reclaim vertical space
 };
 
 // Current annotator's pseudonymous label (local convenience) and its opaque hashed id.
@@ -1252,10 +1253,12 @@ function getChainBreaks(channelList) {
 function getChannelYPositions(channels, montage, totalHeight) {
   const breaks = getChainBreaks(channels);
   const gapPx = 8; // pixels of extra space between chains
-  // Small bottom buffer so the lowest channel's downward deflection has room and isn't
-  // clipped at the canvas edge. Shared by drawing + hit-testing, so they stay aligned.
-  const bottomPad = 14;
+  // Reserve a blank "buffer lane" at the bottom (≈ 0.8 of a channel, clamped) so the lowest
+  // trace clears the canvas edge instead of being obscured by it. The renderer draws a grey
+  // floor line in this lane. Shared by drawing + hit-testing so they stay aligned.
   const nGaps = breaks.filter(b => b < channels.length).length;
+  const approxCh = totalHeight / Math.max(1, channels.length);
+  const bottomPad = Math.min(Math.max(22, approxCh * 0.8), 46);
   const usableHeight = Math.max(1, totalHeight - nGaps * gapPx - bottomPad);
   const chHeight = usableHeight / channels.length;
   const positions = [];
@@ -1265,7 +1268,7 @@ function getChannelYPositions(channels, montage, totalHeight) {
     const yTop = chHeight * i + cumulativeGap;
     positions.push({ yTop, yCenter: yTop + chHeight / 2, height: chHeight });
   }
-  return { positions, chHeight };
+  return { positions, chHeight, bottomPad };
 }
 
 // Helper: get channels for a montage + system combination
@@ -2784,7 +2787,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
     ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, W, H);
 
     const labelWidth = 72, plotW = W - labelWidth - 16, plotX = labelWidth;
-    const { positions: chPositions } = getChannelYPositions(channels, montage, H);
+    const { positions: chPositions, bottomPad } = getChannelYPositions(channels, montage, H);
     const samplesPerEpoch = sampleRate * epochSec;
 
     // Grid — one vertical line per second. Slightly brighter than before so the
@@ -2861,6 +2864,16 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
       ctx.moveTo(sweepX, 0);
       ctx.lineTo(sweepX, H);
       ctx.stroke();
+    }
+
+    // ── Bottom buffer lane — a grey floor line in the reserved blank space below the last
+    // channel, so the lowest trace is clearly separated from the time axis / canvas edge. ──
+    if (chPositions.length) {
+      const last = chPositions[chPositions.length - 1];
+      const lastBottom = last.yTop + last.height;
+      const floorY = Math.min(lastBottom + bottomPad * 0.45, H - 16 - 3);
+      ctx.strokeStyle = "#3a3a3a"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(plotX, floorY + 0.5); ctx.lineTo(W, floorY + 0.5); ctx.stroke();
     }
 
     // ── Time axis (absolute file time) ──
@@ -3276,19 +3289,26 @@ const MONTAGE_ADAPTIVE = "adaptive-banana";
 const MONTAGE_AS_RECORDED = "as-recorded";
 
 // Anterior→posterior 10-10 chains (one per sagittal column) used to build an adaptive
-// longitudinal-bipolar ("double banana") montage from whatever electrodes a file actually
-// has. Sparse files (10-20) collapse to the classic banana; high-density files fill in the
-// intermediate columns automatically.
+// longitudinal-bipolar ("double banana") montage from whatever electrodes a file actually has.
+// Ordered the way clinical longitudinal montages are READ: band by band from the temporal
+// (circumferential) perimeter inward to the midline, and within each band LEFT then RIGHT
+// (L-temporal, R-temporal, L-parasagittal, R-parasagittal, … midline last). Sparse files
+// (10-20) collapse to the classic banana; high-density files fill in the intermediate bands.
 const ADAPTIVE_BANANA_COLUMNS = [
-  ["Fp1","AF7","F7","FT7","T7","TP7","P7","PO7","O1"],        // left temporal
-  ["F5","FC5","C5","CP5","P5"],                                // left lateral
-  ["Fp1","AF3","F3","FC3","C3","CP3","P3","PO3","O1"],         // left parasagittal
-  ["F1","FC1","C1","CP1","P1"],                                // left inner
-  ["Fpz","AFz","Fz","FCz","Cz","CPz","Pz","POz","Oz","Iz"],    // midline
-  ["F2","FC2","C2","CP2","P2"],                                // right inner
-  ["Fp2","AF4","F4","FC4","C4","CP4","P4","PO4","O2"],         // right parasagittal
-  ["F6","FC6","C6","CP6","P6"],                                // right lateral
-  ["Fp2","AF8","F8","FT8","T8","TP8","P8","PO8","O2"],         // right temporal
+  // Temporal / circumferential band
+  ["Fp1","AF7","F7","FT7","T7","TP7","P7","PO7","O1"],        // L temporal
+  ["Fp2","AF8","F8","FT8","T8","TP8","P8","PO8","O2"],        // R temporal
+  // Lateral band (…5/6 line)
+  ["F5","FC5","C5","CP5","P5"],                                // L lateral
+  ["F6","FC6","C6","CP6","P6"],                                // R lateral
+  // Parasagittal band (…3/4 line)
+  ["Fp1","AF3","F3","FC3","C3","CP3","P3","PO3","O1"],         // L parasagittal
+  ["Fp2","AF4","F4","FC4","C4","CP4","P4","PO4","O2"],         // R parasagittal
+  // Paramedian band (…1/2 line)
+  ["F1","FC1","C1","CP1","P1"],                                // L paramedian
+  ["F2","FC2","C2","CP2","P2"],                                // R paramedian
+  // Midline (…z line) — last
+  ["Fpz","AFz","Fz","FCz","Cz","CPz","Pz","POz","Oz","Iz"],
 ];
 
 // Build a longitudinal-bipolar montage (array of "A-B" pairs) from the electrodes present in
@@ -6173,6 +6193,21 @@ function useEEGState(totalDuration = 600, edfData = null) {
   // file-derived montages below.
   const edfSig = useMemo(() => analyzeEdfSignals(edfData), [edfData]);
 
+  // Auto-select the most appropriate default montage for each newly-opened EDF: a standard
+  // 10-20 file → the classic longitudinal banana; a high-density file → the adaptive
+  // double-banana built from the electrodes actually present (so all the data is shown, not
+  // just 19 leads). Runs once per file (tracked by edfData identity); the user can change it
+  // afterward, and the choice resets to the appropriate default when a different file opens.
+  const autoMontageRef = useRef(null);
+  useEffect(() => {
+    if (!edfData || autoMontageRef.current === edfData) return;
+    autoMontageRef.current = edfData;
+    const sys = detectEdfSystem(edfData) || "10-20";
+    setEegSystem(sys);
+    setMontage(sys === "10-20" ? "bipolar-longitudinal" : MONTAGE_ADAPTIVE);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edfData]);
+
   const allChannels = useMemo(() => {
     // A custom montage is just the user's saved list of "A-B" pairs fed through the same
     // bipolar-derivation pipeline as the presets (waveformData parses "A-B" → A − B).
@@ -6873,17 +6908,18 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
     try { localStorage.setItem(STORAGE_KEYS.COLLECTIONS_COLLAPSED, v ? "1" : "0"); } catch {}
   };
 
-  // One shared toggle: the same thin right-edge bar in both states, only the chevron flips
-  // (‹ minimize / › expand) so the open/close affordance is identical and predictable.
-  const toggleBar = (
-    <button title={collapsed ? "Expand collections" : "Minimize collections"}
-      aria-label={collapsed ? "Expand collections" : "Minimize collections"}
+  // The collections show/hide toggle is a square folder icon — same size in both states —
+  // clicking it minimizes the bar to an icon rail or restores it.
+  const folderToggle = (
+    <button title={collapsed ? "Show collections" : "Hide collections"}
+      aria-label={collapsed ? "Show collections" : "Hide collections"}
       onClick={() => setCollapsedPersist(!collapsed)}
-      style={{ width:14, flexShrink:0, background:"#0a0a0a", borderRight:"1px solid #1a1a1a", borderLeft:"1px solid #141414", borderTop:"none", borderBottom:"none",
-        color:"#666", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, padding:0 }}
-      onMouseEnter={e=>{e.currentTarget.style.background="#111";e.currentTarget.style.color="#7ec8d9";}}
-      onMouseLeave={e=>{e.currentTarget.style.background="#0a0a0a";e.currentTarget.style.color="#666";}}>
-      {collapsed ? "›" : "‹"}
+      style={{ width:28, height:28, flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center",
+        cursor:"pointer", borderRadius:2, padding:0,
+        background:"#111", border:"1px solid #4a9bab", color:"#7ec8d9" }}
+      onMouseEnter={e=>{e.currentTarget.style.background="#1a2a30";}}
+      onMouseLeave={e=>{e.currentTarget.style.background="#111";}}>
+      {I.Folder(15)}
     </button>
   );
 
@@ -6895,28 +6931,27 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
       color: active ? "#7ec8d9" : (accent || "#888"), fontFamily: "'IBM Plex Mono', monospace",
     });
     return (
-      <div style={{display:"flex",height:"100%",flexShrink:0}}>
-        <div style={{width:46,background:"#0a0a0a",display:"flex",flexDirection:"column",alignItems:"center",flexShrink:0,paddingTop:8,gap:6,overflowY:"auto"}}>
-          <button title={`All Recordings (${totalCount})`} onClick={()=>onSelect(null)} style={railBtn(selectedCollectionId===null)}>∗</button>
-          {(collections || []).map(col => {
-            const active = selectedCollectionId === col.id;
-            const letter = ((col.name || "?").trim().charAt(0) || "?").toUpperCase();
-            const count = recordsByCollection?.[col.id]?.length ?? 0;
-            return (
-              <button key={col.id} title={`${col.name}${count ? ` (${count})` : ""}`} onClick={()=>onSelect(col.id)} style={railBtn(active)}>{letter}</button>
-            );
-          })}
-        </div>
-        {toggleBar}
+      <div style={{width:46,height:"100%",background:"#0a0a0a",borderRight:"1px solid #1a1a1a",display:"flex",flexDirection:"column",alignItems:"center",flexShrink:0,paddingTop:8,gap:6,overflowY:"auto"}}>
+        {folderToggle}
+        <div style={{width:24,height:1,background:"#1a1a1a",margin:"1px 0"}}/>
+        <button title={`All Recordings (${totalCount})`} onClick={()=>onSelect(null)} style={railBtn(selectedCollectionId===null)}>≡</button>
+        {(collections || []).map(col => {
+          const active = selectedCollectionId === col.id;
+          const letter = ((col.name || "?").trim().charAt(0) || "?").toUpperCase();
+          const count = recordsByCollection?.[col.id]?.length ?? 0;
+          return (
+            <button key={col.id} title={`${col.name}${count ? ` (${count})` : ""}`} onClick={()=>onSelect(col.id)} style={railBtn(active)}>{letter}</button>
+          );
+        })}
       </div>
     );
   }
 
   return (
-    <div style={{display:"flex",height:"100%",flexShrink:0}}>
-    <div style={{width:200,background:"#0a0a0a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:0}}>
-      <div data-tut="Collections: User-defined groups for organizing recordings (e.g. by study, cohort or protocol). Click one to filter the list to just its members." style={{padding:"10px 12px",borderBottom:"1px solid #1a1a1a",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <span style={{fontSize:9,fontWeight:700,color:"#666",letterSpacing:"0.1em"}}>COLLECTIONS</span>
+    <div style={{width:200,height:"100%",background:"#0a0a0a",borderRight:"1px solid #1a1a1a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:0}}>
+      <div data-tut="Collections: User-defined groups for organizing recordings (e.g. by study, cohort or protocol). Click one to filter the list to just its members." style={{padding:"8px 10px",borderBottom:"1px solid #1a1a1a",display:"flex",alignItems:"center",gap:8}}>
+        {folderToggle}
+        <span style={{flex:1,fontSize:9,fontWeight:700,color:"#666",letterSpacing:"0.1em"}}>COLLECTIONS</span>
         <button onClick={()=>setShowNew(p=>!p)} title="New collection"
           data-tut="New collection: Create a named group, then add recordings to it from each row's ⋮ actions menu." style={{
           background:"#111",border:"1px solid #222",color:"#7ec8d9",cursor:"pointer",padding:"2px 6px",fontSize:10,fontWeight:700}}>+
@@ -6996,9 +7031,6 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
           </div>
         </div>
       )}
-    </div>
-    {/* Thin minimize bar on the right edge — identical to the expand bar shown when collapsed */}
-    {toggleBar}
     </div>
   );
 }
@@ -10320,6 +10352,13 @@ function AcquireTab() {
 // ══════════════════════════════════════════════════════════════
 export default function ReactEEGApp() {
   const [activeTab, setActiveTab] = useState("library");
+  const [tabsMinimized, setTabsMinimized] = useState(() => {
+    try { return localStorage.getItem(STORAGE_KEYS.TABS_MINIMIZED) === "1"; } catch { return false; }
+  });
+  const setTabsMinimizedPersist = (v) => {
+    setTabsMinimized(v);
+    try { localStorage.setItem(STORAGE_KEYS.TABS_MINIMIZED, v ? "1" : "0"); } catch {}
+  };
   const [records, setRecords] = useState([]);
   const [reviewRecord, setReviewRecord] = useState(null);
   const [annotationsMap, setAnnotationsMap] = useState({});
@@ -10786,26 +10825,50 @@ export default function ReactEEGApp() {
           </div>
         </div>
 
-        {/* ── Tab Bar ── */}
-        <div style={{display:"flex",gap:0}}>
-          {tabs.map(tab => (
+        {/* ── Tab Bar ── Tabs can only be hidden while in Review (where vertical space is
+            tight). Everywhere else they always show, so you can never get stuck without nav. */}
+        {(activeTab !== "review" || !tabsMinimized) && (
+        <div style={{display:"flex",gap:0,alignItems:"stretch",borderTop:"1px solid #141414"}}>
+          {tabs.map(tab => {
+            const active = activeTab === tab.id;
+            return (
             <button key={tab.id} data-tut={tab.tut} onClick={() => setActiveTab(tab.id)} style={{
               flex:1, padding:"14px 20px", borderRadius:0,
-              background: activeTab === tab.id ? "#1a1a1a" : "transparent",
-              border: "none",
-              borderBottom: activeTab === tab.id ? "2px solid #7ec8d9" : "2px solid transparent",
-              color: activeTab === tab.id ? "#e0e0e0" : "#555",
+              background: active ? "rgba(126,200,217,0.12)" : "transparent",
+              border: "none", borderTop: active ? "2px solid #7ec8d9" : "2px solid transparent",
+              borderBottom: active ? "2px solid #7ec8d9" : "2px solid transparent",
+              color: active ? "#eaf6f9" : "#777",
               cursor: "pointer", transition: "all 0.1s",
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 10,
-            }}>
-              <span style={{color: activeTab === tab.id ? "#7ec8d9" : "#444"}}>{tab.icon}</span>
+              display: "flex", alignItems: "center", justifyContent: "center", gap:10,
+            }}
+              onMouseEnter={e=>{ if(!active) e.currentTarget.style.background="#141414"; }}
+              onMouseLeave={e=>{ if(!active) e.currentTarget.style.background="transparent"; }}>
+              <span style={{color: active ? "#7ec8d9" : "#555"}}>{tab.icon}</span>
               <div style={{textAlign:"left"}}>
-                <div style={{fontSize:15,fontWeight:700,letterSpacing:"0.1em",fontFamily:"'Rajdhani', sans-serif"}}>{tab.label}</div>
-                <div style={{fontSize:9,color: activeTab === tab.id ? "#666" : "#333",fontWeight:500,fontFamily:"'Rajdhani', sans-serif"}}>{tab.desc}</div>
+                <div style={{fontSize:15,fontWeight:700,letterSpacing:"0.1em",fontFamily:"'Rajdhani', sans-serif",color: active ? "#7ec8d9" : "inherit"}}>{tab.label}</div>
+                <div style={{fontSize:9,color: active ? "#7a8a90" : "#444",fontWeight:500,fontFamily:"'Rajdhani', sans-serif"}}>{tab.desc}</div>
               </div>
             </button>
-          ))}
+            );
+          })}
         </div>
+        )}
+        {/* Hide/Show toggle — only in Review (the only tab where reclaiming the tab-bar height
+            matters). A narrow, centered pill with visible text. */}
+        {activeTab === "review" && (
+        <div style={{display:"flex",justifyContent:"center",background:"#0c0c0c",borderTop:"1px solid #161616",borderBottom:"1px solid #1a1a1a"}}>
+          <button onClick={()=>setTabsMinimizedPersist(!tabsMinimized)}
+            aria-label={tabsMinimized ? "Show tab bar" : "Hide tab bar"}
+            title={tabsMinimized ? "Show the navigation tabs" : "Hide the navigation tabs to free up space"}
+            style={{width:"33.3333%",height:17,padding:0,background:"transparent",border:"none",borderRadius:0,cursor:"pointer",
+              display:"flex",alignItems:"center",justifyContent:"center",gap:6,userSelect:"none"}}
+            onMouseEnter={e=>{e.currentTarget.style.background="#161616";}}
+            onMouseLeave={e=>{e.currentTarget.style.background="transparent";}}>
+            <span style={{fontSize:9,color:"#7ec8d9",lineHeight:1}}>{tabsMinimized ? "▼" : "▲"}</span>
+            <span style={{fontSize:9,fontWeight:700,letterSpacing:"0.14em",color:"#9fb4bb",fontFamily:"'Rajdhani', sans-serif"}}>{tabsMinimized ? "SHOW TABS" : "HIDE TABS"}</span>
+          </button>
+        </div>
+        )}
         </div>
       </header>
 
