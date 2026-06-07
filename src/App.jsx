@@ -1571,7 +1571,7 @@ function parseEDFFile(arrayBuffer) {
       patientId, recordingId, startDate, startTime,
       numRecords, recordDuration, numSignals: dataSigs.length,
       totalDuration, sampleRate,
-      signals: dataSigs.map(s => ({ label: s.label, numSamples: s.numSamples, sampleRate: s.sampleRate })),
+      signals: dataSigs.map(s => ({ label: s.label, numSamples: s.numSamples, sampleRate: s.sampleRate, physDim: s.physDim })),
       channelData,
       channelLabels: dataSigs.map(s => s.label),
       edfAnnotations,  // EDF+ TAL annotations parsed from the file (may be empty)
@@ -3216,6 +3216,70 @@ const electrodeRank = (name) => (name in ELECTRODE_RANK ? ELECTRODE_RANK[name] :
 // which only offers 10-10 EEG nomenclature.
 const NON_EEG_LEADS = new Set(["LEOG1", "LEOG2", "REOG1", "REOG2", "LOC1", "LOC2", "ROC1", "ROC2", "EKG", "ECG", "EOG", "EMG"]);
 
+// Modern 10-10 ↔ legacy 10-20 temporal aliases (same physical site). Used to dedupe the
+// builder list so e.g. T7 (in the file) and T3 (the legacy name) aren't both shown.
+const TEMPORAL_ALIAS = { T7: "T3", T8: "T4", P7: "T5", P8: "T6" };
+const aliasKey = (n) => TEMPORAL_ALIAS[n] || n;
+
+// Full 10-10 EEG name recognizer. ELECTRODE_2D only carries the ~40 electrodes that have 2D
+// scalp positions (for topo), so labels like "Fc3.", "Cz..", "Cp4." were going unrecognized.
+// Build the canonical set from the complete 10-10 display order ∪ ELECTRODE_2D keys so every
+// standard scalp lead in a high-density EDF is correctly identified as EEG.
+const EEG_NAME_TO_CANON = (() => {
+  const m = new Map();
+  for (const n of [...ELECTRODE_DISPLAY_ORDER, ...Object.keys(ELECTRODE_2D)]) {
+    if (NON_EEG_LEADS.has(n)) continue;
+    const key = n.toUpperCase();
+    if (!m.has(key)) m.set(key, n);
+  }
+  return m;
+})();
+// Map an EDF signal label to a canonical 10-10 electrode name, or null if it isn't scalp EEG.
+// Handles "EEG " prefixes, trailing dots (PhysioNet "Fc3."), and "-REF"/"-LE" suffixes.
+function canonicalElectrode(label) {
+  if (!label) return null;
+  let s = String(label).trim().replace(/^(EEG|REF)\s+/i, "");
+  s = s.split(/[\s\-]/)[0].replace(/\./g, "");   // token before space/dash, drop dots
+  return EEG_NAME_TO_CANON.get(s.toUpperCase()) || null;
+}
+
+// Per-signal analysis of a parsed EDF. Maps each signal to an electrode + type, computes a
+// quick RMS to tell whether it actually carries signal (vs flat/empty), and rolls up the set
+// of scalp-EEG electrodes that truly have data. Shared by the montage builder (green dots are
+// strictly EEG-with-data) and the Raw EDF inspector. Pure; safe to memoize on edfData.
+const EEG_SIGNAL_RMS_MIN = 1e-3; // µV — above this a channel is considered to carry real signal
+function analyzeEdfSignals(edfData) {
+  const labels = edfData?.channelLabels || [];
+  const cd = edfData?.channelData || [];
+  const sigs = edfData?.signals || [];
+  const channels = [];
+  const presentEeg = []; const seenEeg = new Set(); const withData = new Set();
+  labels.forEach((label, idx) => {
+    const arr = cd[idx];
+    let rms = 0;
+    if (arr && arr.length) {
+      const n = Math.min(arr.length, 8192); let sum = 0;
+      for (let i = 0; i < n; i++) sum += arr[i] * arr[i];
+      rms = Math.sqrt(sum / n);
+    }
+    const hasSignal = rms > EEG_SIGNAL_RMS_MIN;
+    const electrode = canonicalElectrode(label);
+    const up = (label || "").toUpperCase();
+    let type = "Other";
+    if (/ECG|EKG/.test(up)) type = "EKG";
+    else if (/EOG|EYE|LOC|ROC|PG\d/.test(up) || (electrode && NON_EEG_LEADS.has(electrode))) type = "EOG";
+    else if (electrode) type = "EEG";
+    const isEeg = type === "EEG";
+    channels.push({
+      idx, label, electrode: isEeg ? electrode : null, type, rms, hasSignal,
+      sampleRate: sigs[idx]?.sampleRate ?? null, physDim: sigs[idx]?.physDim || "", numSamples: sigs[idx]?.numSamples ?? null,
+    });
+    if (isEeg && electrode && !seenEeg.has(electrode)) { seenEeg.add(electrode); presentEeg.push(electrode); }
+    if (isEeg && electrode && hasSignal) withData.add(electrode);
+  });
+  return { channels, presentEeg, withData };
+}
+
 // Single-select electrode dropdown for the montage builder. Mirrors the Channels button:
 // each row shows a green dot when that electrode has EEG data in the loaded EDF (hollow when
 // not). Electrodes with data are listed first; no-data electrodes are deprioritized below a
@@ -3269,7 +3333,7 @@ function ElectrodeSelect({ label, value, onChange, electrodes, dataSet }) {
   );
 }
 
-function MontageBuilderPanel({ availableElectrodes, customMontages, persistCustomMontages, montage, setMontage, onClose }) {
+function MontageBuilderPanel({ availableElectrodes, dataElectrodes, customMontages, persistCustomMontages, montage, setMontage, onClose }) {
   const dialogRef = useRef(null);
   useFocusTrap(dialogRef, true, onClose);
   const editing = montage.startsWith(CUSTOM_MONTAGE_PREFIX)
@@ -3279,13 +3343,18 @@ function MontageBuilderPanel({ availableElectrodes, customMontages, persistCusto
   const [elA, setElA] = useState("");
   const [elB, setElB] = useState("");
   // Electrodes the user can pick — strictly 10-10 EEG nomenclature (EOG/EKG excluded).
-  // `dataSet` = electrodes that actually carry EEG signal in this EDF (green dot). The picker
-  // universe = those-with-data ∪ the standard 10-20 set, so common leads are always offered;
+  // `dataSet` = electrodes that actually carry EEG SIGNAL in this EDF (green dot) — a channel
+  // that is merely present but flat/empty does NOT get a green dot. The picker universe =
+  // all present EEG electrodes ∪ the standard 10-20 set, so common leads are always offered;
   // no-data leads show a hollow dot and are deprioritized to the bottom of each list.
   const present = (availableElectrodes || []).filter(e => !NON_EEG_LEADS.has(e));
-  const dataSet = new Set(present);
-  const electrodes = Array.from(new Set([...present, ...ELECTRODE_SETS["10-20"]]))
-    .filter(e => !NON_EEG_LEADS.has(e) && (dataSet.has(e) || electrodeRank(e) < ELECTRODE_DISPLAY_ORDER.length))
+  const dataSet = dataElectrodes instanceof Set ? dataElectrodes : new Set(present);
+  // Always offer the standard 10-20 leads too, but skip any whose physical site is already
+  // represented by a present electrode (e.g. don't add legacy T3 when the file has T7).
+  const presentKeys = new Set(present.map(aliasKey));
+  const extras = ELECTRODE_SETS["10-20"].filter(e => !NON_EEG_LEADS.has(e) && !presentKeys.has(aliasKey(e)));
+  const electrodes = Array.from(new Set([...present, ...extras]))
+    .filter(e => !NON_EEG_LEADS.has(e))
     .sort((a, b) => (electrodeRank(a) - electrodeRank(b)) || a.localeCompare(b));
 
   const addPair = () => {
@@ -5392,6 +5461,67 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos })
             )}
           </>
         )}
+      </div>
+    </FloatingPanel>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// RAW EDF INSPECTOR — peek at every signal actually in the .edf
+// ══════════════════════════════════════════════════════════════
+// A read-only inventory so the user can see the full picture of what the file contains
+// before reading: every signal's label, mapped electrode, type, sample rate, units, and a
+// quick RMS with a green "has signal" dot (vs flat/empty). De-identified header only.
+function RawEdfPanel({ edfData, channels, filename, onClose, panelPos, setPanelPos }) {
+  const mono = "'IBM Plex Mono', monospace";
+  const fmt = (n, d = 1) => (n == null || isNaN(n)) ? "—" : Number(n).toFixed(d);
+  const typeColor = (t) => t === "EEG" ? "#7ec8d9" : t === "EOG" ? "#F59E0B" : t === "EKG" ? "#f472b6" : "#666";
+  const th = { textAlign: "left", padding: "4px 8px", color: "#555", fontWeight: 700, fontSize: 8, letterSpacing: "0.06em", borderBottom: "1px solid #1a1a1a", position: "sticky", top: 0, background: "#0c0c0c" };
+  const td = { padding: "3px 8px", color: "#888", whiteSpace: "nowrap" };
+  const eegCount = channels.filter(c => c.type === "EEG").length;
+  const dataCount = channels.filter(c => c.hasSignal).length;
+  return (
+    <FloatingPanel title="RAW EDF" titleColor="#7ec8d9"
+      onClose={onClose} panelPos={panelPos} setPanelPos={setPanelPos}
+      defaultPos={() => ({ x: Math.round(window.innerWidth / 2 - 270), y: 56 })}
+      width={540} maxHeight="80vh" zIndex={86}>
+      <div style={{ padding: "8px 12px", borderBottom: "1px solid #1a1a1a", fontSize: 10, color: "#888", fontFamily: mono, display: "flex", flexWrap: "wrap", gap: "2px 14px" }}>
+        <span style={{ color: "#7ec8d9" }}>{filename || "—"}</span>
+        <span>start {edfData?.startDate || "—"} {edfData?.startTime || ""}</span>
+        <span>dur {fmt(edfData?.totalDuration, 0)}s</span>
+        <span>base {edfData?.sampleRate || "—"} Hz</span>
+        <span>signals {channels.length}</span>
+        <span>records {edfData?.numRecords ?? "—"}</span>
+        <span style={{ color: "#22c55e" }}>{eegCount} EEG · {dataCount} with signal</span>
+        {edfData?.impedances?.length ? <span style={{ color: "#facc15" }}>impedance: {edfData.impedances.length} ch</span> : null}
+      </div>
+      <div style={{ flex: 1, overflow: "auto" }}>
+        {channels.length === 0 ? (
+          <div style={{ padding: 20, textAlign: "center", color: "#555", fontSize: 11 }}>No EDF loaded.</div>
+        ) : (
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10, fontFamily: mono }}>
+            <thead><tr>{["#", "Label", "Electrode", "Type", "Rate", "Units", "RMS", "Data"].map(h => <th key={h} style={th}>{h}</th>)}</tr></thead>
+            <tbody>
+              {channels.map(c => (
+                <tr key={c.idx} style={{ borderBottom: "1px solid #111" }}>
+                  <td style={td}>{c.idx + 1}</td>
+                  <td style={{ ...td, color: "#ccc" }}>{c.label}</td>
+                  <td style={td}>{c.electrode || "—"}</td>
+                  <td style={{ ...td, color: typeColor(c.type), fontWeight: 700 }}>{c.type}</td>
+                  <td style={td}>{c.sampleRate ?? "—"}</td>
+                  <td style={td}>{c.physDim || "—"}</td>
+                  <td style={{ ...td, color: c.hasSignal ? "#aaa" : "#444" }}>{fmt(c.rms, 2)}</td>
+                  <td style={td}>
+                    <span title={c.hasSignal ? "carries signal" : "flat / no signal"} style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: c.hasSignal ? "#22c55e" : "transparent", border: c.hasSignal ? "none" : "1px solid #444" }} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      <div style={{ padding: "6px 12px", borderTop: "1px solid #1a1a1a", fontSize: 8, color: "#444", lineHeight: 1.4 }}>
+        RMS measured over the first ~8k samples per signal. Green = carries signal. Raw inventory of the .edf — de-identified header only, no interpretation.
       </div>
     </FloatingPanel>
   );
@@ -8170,6 +8300,9 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
     openReview: onSelectRecord } = useAppStore();
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
+  // Per-signal EDF analysis (electrode/type/RMS) — drives the montage-builder green dots
+  // (strictly EEG-with-data) and the Raw EDF inspector.
+  const edfInfo = useMemo(() => analyzeEdfSignals(edfData), [edfData]);
   const totalDur = edfData ? edfData.totalDuration : 600;
   const recordSeed = useMemo(() => {
     const fn = record?.filename || "";
@@ -8201,6 +8334,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   const [showCompliance, setShowCompliance] = useState(false);
   const [compliancePanelPos, setCompliancePanelPos] = useState({ x: null, y: null });
   const [showRevImpedance, setShowRevImpedance] = useState(false);
+  const [showRawEdf, setShowRawEdf] = useState(false);
+  const [rawEdfPanelPos, setRawEdfPanelPos] = useState({ x: null, y: null });
   const [showSpectrogram, setShowSpectrogram] = useState(false);
   const [spectrogramPanelPos, setSpectrogramPanelPos] = useState({ x: null, y: null });
   const [showChannelPicker, setShowChannelPicker] = useState(false);
@@ -8633,6 +8768,9 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             <button data-tut="Impedance: Shows per-electrode impedance read from the EDF, if the recording stored it. Impedance is a dynamic value measured at acquisition; the compliance cutoff is ≤ 5 kΩ." onClick={(e)=>{e.stopPropagation();setShowRevImpedance(true);}} style={controlBtn()}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Zap(12)} Impedance{edfData?.impedances?.length ? ` (${edfData.impedances.length})` : ""}</span>
             </button>
+            <button data-tut="Raw EDF: A read-only inventory of every signal in the .edf file — label, mapped electrode, type, sample rate, units and an RMS-based 'has signal' dot — so you can see exactly what data is available before reading." onClick={(e)=>{e.stopPropagation();setShowRawEdf(p=>!p);}} style={controlBtn(showRawEdf)}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.List(12)} Raw EDF</span>
+            </button>
             <button data-tut="Data Sheet: Generates a printable single-page summary — metadata, band powers and topography — in a new window, ready to print or save as PDF." onClick={(e)=>{
               e.stopPropagation();
               if (!record) return;
@@ -8785,6 +8923,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
           onClose={()=>setShowRevImpedance(false)} onAccept={()=>setShowRevImpedance(false)}/>
       )}
 
+      {/* Raw EDF inspector — full signal inventory */}
+      {showRawEdf && (
+        <RawEdfPanel edfData={edfData} channels={edfInfo.channels} filename={filename}
+          onClose={()=>setShowRawEdf(false)} panelPos={rawEdfPanelPos} setPanelPos={setRawEdfPanelPos}/>
+      )}
+
       {/* Floating differential comparison panel (baseline → comparison) */}
       {showCompare && (
         <ComparePanel records={records} edfFileStore={edfFileStore}
@@ -8822,11 +8966,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
 
       {eeg.showMontageBuilder && (
         <MontageBuilderPanel
-          availableElectrodes={(() => {
-            const seen = new Set(); const out = [];
-            (edfData?.channelLabels || []).forEach(l => { const e = extractElectrodeName(l); if (e && !seen.has(e)) { seen.add(e); out.push(e); } });
-            return out;
-          })()}
+          availableElectrodes={edfInfo.presentEeg}
+          dataElectrodes={edfInfo.withData}
           customMontages={eeg.customMontages} persistCustomMontages={eeg.persistCustomMontages}
           montage={eeg.montage} setMontage={eeg.setMontage}
           onClose={()=>eeg.setShowMontageBuilder(false)}/>
