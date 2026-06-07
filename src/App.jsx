@@ -37,6 +37,15 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v17.7", items: [
+    "FIXED a persistent high-frequency artifact pinned to the left (and right) edge of every epoch — filters were applied to each epoch's isolated slice, which forced the first/last sample of every trace to the channel baseline. Each epoch is now filtered with a guard band of real neighbouring signal and then cropped, so the visible window is transient-free (only the true file start, where no prior data exists, can still reflect)",
+    "Adaptive Double-Banana now orders its chains clinically — by band, alternating left/right with midline last (L-temporal → R-temporal → L-parasagittal → R-parasagittal → … → midline), like a standard HD longitudinal display",
+    "The most appropriate montage is auto-selected when a file opens (Adaptive Double-Banana for high-density files, classic Double Banana for 10-20) instead of always defaulting to the 10-20 banana",
+    "↑ / ↓ arrow keys now raise / lower the waveform sensitivity (matching the on-screen +/- buttons); ←/→ still scroll",
+    "Review tab bar can be hidden to reclaim vertical space — when minimized, compact LIBRARY / REPOSITORY buttons flank the SHOW TABS control so you can still jump tabs without expanding",
+    "Build Montage button no longer stays lit — it now highlights only while the builder panel is open, like the other toolbar buttons",
+    "Collections sidebar show/hide is now a fixed-size folder icon; added a grey floor line + larger bottom buffer under the lowest trace; clearer active-tab highlight",
+  ]},
   { version: "v17.6", items: [
     "Two new file-derived montages (in the montage dropdown's 'From file' group): Adaptive Double-Banana builds a longitudinal-bipolar montage from the electrodes actually present — collapsing to the classic banana on a 10-20 file and filling in the intermediate chains on high-density recordings; As Recorded shows the file's own signals one trace each, honoring a pre-montaged EDF whose labels already contain derivations (e.g. Fp1-F3)",
     "Electrode system is now auto-detected from the EDF (counting the scalp electrodes actually present) instead of defaulting to 10-20 — so high-density recordings are correctly labeled 10-10/HD in the Library, the EEG-system options are no longer wrongly greyed out, and existing records are corrected when opened in Review",
@@ -299,6 +308,13 @@ const ICA_MAX_ITERATIONS = 50;
 const SENSITIVITY_MIN = 1;
 const SENSITIVITY_MAX = 30;
 const SENSITIVITY_BASE = 73.5;     // mm/μV scaling factor (IFCN-style)
+// Seconds of REAL neighbouring signal fetched on each side of the visible epoch so the
+// HP/LP/notch/wavelet filters settle on actual data before the window we display. Without it,
+// filtering each epoch's isolated slice forces the first/last filtered sample to the channel
+// baseline (the zero-phase odd reflect-pad), painting a fixed high-frequency comb at the left
+// (and right) edge of every epoch. Cropped off after filtering. 3 s covers the 1 Hz default
+// HP time constant with margin; only the true file start (no prior data) can still reflect.
+const FILTER_GUARD_SEC = 3;
 const CHAIN_BREAK_GAP_PX = 8;
 const SPLASH_DURATION_MS = 2800;
 const NOTES_DEBOUNCE_MS = 1000;
@@ -1640,6 +1656,40 @@ function getEDFEpochData(edfData, channelIndex, epochStart, epochSec, targetSr) 
     return out;
   }
   return slice;
+}
+
+// Like getEDFEpochData, but also returns `guardSec` seconds of REAL neighbouring signal on each
+// side of the epoch (clamped at the file edges), so filters can settle on real data. Returns
+// { data, lead, len }: `data` is the guard-extended window, the visible epoch is data[lead .. lead+len).
+// Filter `data`, then crop to [lead, lead+len) to display a transient-free epoch. Two electrodes
+// fetched with identical params share the same lead/len, so bipolar pairs subtract aligned.
+function getEDFEpochWindow(edfData, channelIndex, epochStart, epochSec, targetSr, guardSec) {
+  if (!edfData?.channelData || channelIndex >= edfData.channelData.length) return null;
+  const sigSr = edfData.signals[channelIndex]?.sampleRate || edfData.sampleRate;
+  const raw = edfData.channelData[channelIndex];
+  const coreStart = Math.floor(epochStart * sigSr);
+  if (coreStart >= raw.length) return null;
+  const coreLenSrc = Math.floor(epochSec * sigSr);
+  const guardSrc = Math.max(0, Math.floor((guardSec || 0) * sigSr));
+  const winStart = Math.max(0, coreStart - guardSrc);
+  const leadSrc = coreStart - winStart;
+  const winEnd = Math.min(raw.length, coreStart + coreLenSrc + guardSrc);
+  let win = raw.slice(winStart, winEnd);
+  if (sigSr !== targetSr && targetSr > 0) {
+    if (sigSr > targetSr && win.length >= 8) win = applyLowPass(win, targetSr / 2.5, sigSr, 4);
+    const ratio = sigSr / targetSr;                 // source samples per target sample
+    const totalTgt = Math.max(1, Math.round(win.length / ratio));
+    const out = new Float32Array(totalTgt);
+    for (let i = 0; i < totalTgt; i++) {
+      const si = i * ratio, lo = Math.floor(si), hi = Math.min(lo + 1, win.length - 1);
+      out[i] = win[lo] * (1 - (si - lo)) + win[hi] * (si - lo);
+    }
+    const lead = Math.min(Math.round(leadSrc / ratio), totalTgt - 1);
+    const len = Math.min(Math.floor(epochSec * targetSr), totalTgt - lead);
+    return { data: out, lead, len };
+  }
+  const len = Math.min(coreLenSrc, win.length - leadSrc);
+  return { data: win, lead: leadSrc, len };
 }
 
 // ── EDF Writer ──
@@ -6322,41 +6372,46 @@ function useEEGState(totalDuration = 600, edfData = null) {
   // so they don't bias the average). Computed once per epoch and reused by the average-reference
   // montage and by the partial-derivation fallback below. Returns null when fewer than 4 scalp
   // electrodes are available, since an average over too few channels isn't meaningful.
+  // Common average reference, computed over the SAME guard-extended window the electrodes use
+  // (so electrode − CAR stays aligned before cropping). Returns { data, lead, len } or null.
   const avgRefSignal = useMemo(() => {
     if (!edfData || !edfData.channelData || !edfData.channelLabels) return null;
-    const n = Math.round(sampleRate * epochSec);
-    if (n <= 0) return null;
-    const sum = new Float32Array(n);
-    let count = 0;
+    let sum = null, lead = 0, len = 0, count = 0;
     edfData.channelLabels.forEach((label, idx) => {
       if (!extractElectrodeName(label)) return; // scalp EEG electrodes only
-      const d = getEDFEpochData(edfData, idx, epochStart, epochSec, sampleRate);
-      if (!d) return;
-      const m = Math.min(n, d.length);
-      for (let i = 0; i < m; i++) sum[i] += d[i];
+      const w = getEDFEpochWindow(edfData, idx, epochStart, epochSec, sampleRate, FILTER_GUARD_SEC);
+      if (!w) return;
+      if (!sum) { sum = new Float32Array(w.data.length); lead = w.lead; len = w.len; }
+      const m = Math.min(sum.length, w.data.length);
+      for (let i = 0; i < m; i++) sum[i] += w.data[i];
       count++;
     });
-    if (count < 4) return null;
-    for (let i = 0; i < n; i++) sum[i] /= count;
-    return sum;
+    if (!sum || count < 4) return null;
+    for (let i = 0; i < sum.length; i++) sum[i] /= count;
+    return { data: sum, lead, len };
   }, [edfData, epochStart, epochSec, sampleRate]);
 
-  // Subtract the common average reference from a raw electrode epoch (electrode − CAR). Returns
-  // a new Float32Array, or null if no average is available (caller decides the fallback).
-  const reReferenceToAverage = (d1) => {
-    if (!d1 || !avgRefSignal) return null;
-    const out = new Float32Array(d1.length);
-    const m = Math.min(d1.length, avgRefSignal.length);
-    for (let i = 0; i < d1.length; i++) out[i] = d1[i] - (i < m ? avgRefSignal[i] : 0);
+  // Subtract the common average reference from a guard-extended electrode window (electrode − CAR).
+  // Returns a new Float32Array of the same length, or null if no average is available.
+  const reReferenceToAverage = (extData) => {
+    if (!extData || !avgRefSignal) return null;
+    const a = avgRefSignal.data;
+    const out = new Float32Array(extData.length);
+    const m = Math.min(extData.length, a.length);
+    for (let i = 0; i < extData.length; i++) out[i] = extData[i] - (i < m ? a[i] : 0);
     return out;
   };
 
   const waveformData = useMemo(() => {
+    const Nep = Math.round(sampleRate * epochSec);
+    // Fetch a guard-extended window for an electrode (real signal padding each side of the epoch).
+    const win = (idx) => getEDFEpochWindow(edfData, idx, epochStart, epochSec, sampleRate, FILTER_GUARD_SEC);
     return channels.map((ch) => {
       const fullIdx = allChannels.indexOf(ch);
-      let raw;
-      let isPartial = false;    // bipolar ref missing AND no average available → truly unreferenced
-      let isAvgFallback = false; // bipolar ref missing → re-referenced to the common average instead
+      let ext;                    // guard-extended signal (filtered as a whole, then cropped)
+      let lead = 0, len = Nep;    // visible epoch lives at ext[lead .. lead+len)
+      let isPartial = false;      // bipolar ref missing AND no average available → truly unreferenced
+      let isAvgFallback = false;  // bipolar ref missing → re-referenced to the common average instead
 
       // Use real EDF data if available
       if (edfData && edfData.channelData) {
@@ -6377,15 +6432,18 @@ function useEEGState(totalDuration = 600, edfData = null) {
             return false;
           });
           if (edfIdx >= 0) {
-            raw = getEDFEpochData(edfData, edfIdx, epochStart, epochSec, sampleRate);
-            // ECG channels in many EDF files are stored in mV — convert to µV for display
-            if (raw && isEKG) {
-              let maxAbs = 0;
-              for (let i = 0; i < raw.length; i++) { const a = Math.abs(raw[i]); if (a > maxAbs) maxAbs = a; }
-              if (maxAbs > 0 && maxAbs < 10) { // values < 10 likely in mV, scale to µV
-                const scaled = new Float32Array(raw.length);
-                for (let i = 0; i < raw.length; i++) scaled[i] = raw[i] * 1000;
-                raw = scaled;
+            const w = win(edfIdx);
+            if (w) {
+              ext = w.data; lead = w.lead; len = w.len;
+              // ECG channels in many EDF files are stored in mV — convert to µV for display
+              if (isEKG) {
+                let maxAbs = 0;
+                for (let i = 0; i < ext.length; i++) { const a = Math.abs(ext[i]); if (a > maxAbs) maxAbs = a; }
+                if (maxAbs > 0 && maxAbs < 10) { // values < 10 likely in mV, scale to µV
+                  const scaled = new Float32Array(ext.length);
+                  for (let i = 0; i < ext.length; i++) scaled[i] = ext[i] * 1000;
+                  ext = scaled;
+                }
               }
             }
           }
@@ -6401,19 +6459,19 @@ function useEEGState(totalDuration = 600, edfData = null) {
             // Average-reference montage — electrode minus the common average. Falls back to the
             // raw electrode only when too few channels exist for a meaningful average.
             if (idx1 >= 0) {
-              const d1 = getEDFEpochData(edfData, idx1, epochStart, epochSec, sampleRate);
-              raw = reReferenceToAverage(d1) || d1;
+              const w = win(idx1);
+              if (w) { ext = reReferenceToAverage(w.data) || w.data; lead = w.lead; len = w.len; }
             }
           } else if (isCzRef) {
-            if (idx1 >= 0) raw = getEDFEpochData(edfData, idx1, epochStart, epochSec, sampleRate);
+            if (idx1 >= 0) { const w = win(idx1); if (w) { ext = w.data; lead = w.lead; len = w.len; } }
           } else if (parts.length === 2) {
             const idx2 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[1]));
             if (idx1 >= 0 && idx2 >= 0) {
-              const d1 = getEDFEpochData(edfData, idx1, epochStart, epochSec, sampleRate);
-              const d2 = getEDFEpochData(edfData, idx2, epochStart, epochSec, sampleRate);
-              if (d1 && d2) {
-                raw = new Float32Array(d1.length);
-                for (let i = 0; i < d1.length; i++) raw[i] = d1[i] - (i < d2.length ? d2[i] : 0);
+              const w1 = win(idx1), w2 = win(idx2);
+              if (w1 && w2) {
+                // Both fetched with identical params → same lead/length, so they subtract aligned.
+                ext = new Float32Array(w1.data.length); lead = w1.lead; len = w1.len;
+                for (let i = 0; i < ext.length; i++) ext[i] = w1.data[i] - (i < w2.data.length ? w2.data[i] : 0);
               }
             } else if (idx1 >= 0) {
               // Reference electrode missing in the EDF. Rather than show this electrode
@@ -6422,10 +6480,13 @@ function useEEGState(totalDuration = 600, edfData = null) {
               // common-mode artifact while preserving the electrode's local activity. If there
               // aren't enough scalp electrodes for a meaningful average, fall back to the raw
               // single electrode and flag it as truly partial/unreferenced.
-              const d1 = getEDFEpochData(edfData, idx1, epochStart, epochSec, sampleRate);
-              const avg = reReferenceToAverage(d1);
-              if (avg) { raw = avg; isAvgFallback = true; }
-              else { raw = d1; isPartial = true; }
+              const w = win(idx1);
+              if (w) {
+                lead = w.lead; len = w.len;
+                const avg = reReferenceToAverage(w.data);
+                if (avg) { ext = avg; isAvgFallback = true; }
+                else { ext = w.data; isPartial = true; }
+              }
             }
           }
         }
@@ -6434,19 +6495,23 @@ function useEEGState(totalDuration = 600, edfData = null) {
       // Fall back: no matching EDF channel → flat line.
       // (Synthetic signal generation was removed — all displayed signals must come
       // from a real EDF in edfData.channelData.)
-      if (!raw) raw = new Float32Array(sampleRate * epochSec);
+      if (!ext) { ext = new Float32Array(Nep); lead = 0; len = Nep; }
 
       const chHpf = channelHpf[ch] !== undefined ? channelHpf[ch] : hpf;
       const chLpf = channelLpf[ch] !== undefined ? channelLpf[ch] : lpf;
-      if (chHpf > 0) raw = applyHighPass(raw, chHpf, sampleRate);
-      if (chLpf > 0) raw = applyLowPass(raw, chLpf, sampleRate);
-      if (notch > 0) raw = applyNotch(raw, notch, sampleRate);
+      // Filter the guard-extended window so the IIR/zero-phase filters settle on real
+      // neighbouring data, THEN crop to the visible epoch — no edge transient pinned to the
+      // window boundary. (At the true file start lead=0, so only that one edge can still reflect.)
+      if (chHpf > 0) ext = applyHighPass(ext, chHpf, sampleRate);
+      if (chLpf > 0) ext = applyLowPass(ext, chLpf, sampleRate);
+      if (notch > 0) ext = applyNotch(ext, notch, sampleRate);
       // Wavelet denoising (EEG channels only)
       if (waveletDenoise && !AUX_CHANNELS.has(ch)) {
         const levels = sampleRate >= 256 ? 5 : 4;
-        const wResult = applyWaveletDenoise(raw, levels);
-        raw = wResult.data;
+        ext = applyWaveletDenoise(ext, levels).data;
       }
+      // Crop the guard padding off, leaving exactly the visible epoch.
+      const raw = (lead > 0 || len < ext.length) ? ext.slice(lead, lead + len) : ext;
       // Stamp derivation flags for the canvas label to surface
       if (isPartial) raw.__partial = true;
       if (isAvgFallback) raw.__avgRef = true;
@@ -6637,8 +6702,10 @@ function useEEGState(totalDuration = 600, edfData = null) {
       const secStep = epochSec > 0 ? 1 / epochSec : 1;
       if (e.key === "d") setCurrentEpoch(p => Math.min(p + secStep, totalEpochs - 1));
       if (e.key === "a") setCurrentEpoch(p => Math.max(p - secStep, 0));
-      if (e.key === "=") setSensitivity(p => Math.min(p + 1, SENSITIVITY_MAX));
-      if (e.key === "-") setSensitivity(p => Math.max(p - 1, SENSITIVITY_MIN));
+      // Sensitivity: =/- and Up/Down arrows mirror the on-screen +/- buttons.
+      // (Left/Right arrows are reserved for hold-to-scroll in ReviewTab.)
+      if (e.key === "=" || e.key === "ArrowUp") { e.preventDefault(); setSensitivity(p => Math.min(p + 1, SENSITIVITY_MAX)); }
+      if (e.key === "-" || e.key === "ArrowDown") { e.preventDefault(); setSensitivity(p => Math.max(p - 1, SENSITIVITY_MIN)); }
       if (e.key === " " || e.code === "Space") {
         e.preventDefault();          // prevent page scroll on the spacebar
         setIsPlaying(p => !p);
@@ -8929,8 +8996,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
           <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
             <button title={eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit this custom montage" : "Build a custom bipolar montage"}
               data-tut="Montage builder: Create a bipolar montage from any two electrodes. Saved montages persist and are reusable across recordings."
-              onClick={(e)=>{e.stopPropagation();eeg.setShowMontageBuilder(true);}}
-              style={{...controlBtn(eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX)),color:"#7ec8d9",border:"1px solid #4a9bab"}}>
+              onClick={(e)=>{e.stopPropagation();eeg.setShowMontageBuilder(p=>!p);}}
+              style={controlBtn(eeg.showMontageBuilder)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Edit(12)} {eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit Montage" : "Build Montage"}</span>
             </button>
             <div style={{position:"relative"}}>
@@ -9097,7 +9164,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
           <select title="Epoch length" data-tut="Epoch length: How many seconds of EEG are shown per page. Shorter epochs zoom in on detail; longer epochs show more context at once." value={eeg.epochSec} onChange={e=>eeg.setEpochSec(parseInt(e.target.value))} style={selectStyle}>
             {[5,10,15,20,30].map(v=><option key={v} value={v}>Epoch {v}s</option>)}
           </select>
-          <span title="Sensitivity (mm/μV)" data-tut="Sensitivity: Vertical gain of the traces in mm/µV. Increase to amplify low-voltage signals, decrease to keep high-amplitude traces from overlapping." style={{display:"inline-flex",alignItems:"center",gap:4}}>
+          <span title="Sensitivity (mm/μV) — ↑/↓ arrow keys" data-tut="Sensitivity: Vertical gain of the traces in mm/µV. Increase to amplify low-voltage signals, decrease to keep high-amplitude traces from overlapping. Adjust with the ↑/↓ arrow keys." style={{display:"inline-flex",alignItems:"center",gap:4}}>
             <button onClick={()=>eeg.setSensitivity(p=>Math.max(p-1,SENSITIVITY_MIN))} style={controlBtn()} title="Decrease sensitivity">{I.ZoomOut()}</button>
             <span style={{fontSize:11,color:"#888",minWidth:32,textAlign:"center"}}>Sens {eeg.sensitivity}</span>
             <button onClick={()=>eeg.setSensitivity(p=>Math.min(p+1,SENSITIVITY_MAX))} style={controlBtn()} title="Increase sensitivity">{I.ZoomIn()}</button>
@@ -10854,19 +10921,39 @@ export default function ReactEEGApp() {
         </div>
         )}
         {/* Hide/Show toggle — only in Review (the only tab where reclaiming the tab-bar height
-            matters). A narrow, centered pill with visible text. */}
+            matters). When minimized, the centered SHOW-TABS pill is flanked by compact LIBRARY /
+            REPOSITORY buttons sitting exactly where their full tabs were, so you can still jump to
+            the other tabs without first expanding the bar. Three equal thirds align with the tabs. */}
         {activeTab === "review" && (
-        <div style={{display:"flex",justifyContent:"center",background:"#0c0c0c",borderTop:"1px solid #161616",borderBottom:"1px solid #1a1a1a"}}>
+        <div style={{display:"flex",alignItems:"stretch",justifyContent:tabsMinimized?"stretch":"center",background:"#0c0c0c",borderTop:"1px solid #161616",borderBottom:"1px solid #1a1a1a"}}>
+          {tabsMinimized && (
+            <button onClick={()=>setActiveTab("library")} title="Go to Library"
+              style={{flex:1,height:17,padding:0,background:"transparent",border:"none",borderRight:"1px solid #161616",borderRadius:0,cursor:"pointer",
+                display:"flex",alignItems:"center",justifyContent:"center",userSelect:"none"}}
+              onMouseEnter={e=>{e.currentTarget.style.background="#161616";}}
+              onMouseLeave={e=>{e.currentTarget.style.background="transparent";}}>
+              <span style={{fontSize:9,fontWeight:700,letterSpacing:"0.14em",color:"#6c8088",fontFamily:"'Rajdhani', sans-serif"}}>LIBRARY</span>
+            </button>
+          )}
           <button onClick={()=>setTabsMinimizedPersist(!tabsMinimized)}
             aria-label={tabsMinimized ? "Show tab bar" : "Hide tab bar"}
             title={tabsMinimized ? "Show the navigation tabs" : "Hide the navigation tabs to free up space"}
-            style={{width:"33.3333%",height:17,padding:0,background:"transparent",border:"none",borderRadius:0,cursor:"pointer",
+            style={{...(tabsMinimized?{flex:1}:{width:"33.3333%"}),height:17,padding:0,background:"transparent",border:"none",borderRadius:0,cursor:"pointer",
               display:"flex",alignItems:"center",justifyContent:"center",gap:6,userSelect:"none"}}
             onMouseEnter={e=>{e.currentTarget.style.background="#161616";}}
             onMouseLeave={e=>{e.currentTarget.style.background="transparent";}}>
             <span style={{fontSize:9,color:"#7ec8d9",lineHeight:1}}>{tabsMinimized ? "▼" : "▲"}</span>
             <span style={{fontSize:9,fontWeight:700,letterSpacing:"0.14em",color:"#9fb4bb",fontFamily:"'Rajdhani', sans-serif"}}>{tabsMinimized ? "SHOW TABS" : "HIDE TABS"}</span>
           </button>
+          {tabsMinimized && (
+            <button onClick={()=>setActiveTab("repository")} title="Go to Repository"
+              style={{flex:1,height:17,padding:0,background:"transparent",border:"none",borderLeft:"1px solid #161616",borderRadius:0,cursor:"pointer",
+                display:"flex",alignItems:"center",justifyContent:"center",userSelect:"none"}}
+              onMouseEnter={e=>{e.currentTarget.style.background="#161616";}}
+              onMouseLeave={e=>{e.currentTarget.style.background="transparent";}}>
+              <span style={{fontSize:9,fontWeight:700,letterSpacing:"0.14em",color:"#6c8088",fontFamily:"'Rajdhani', sans-serif"}}>REPOSITORY</span>
+            </button>
+          )}
         </div>
         )}
         </div>
