@@ -59,6 +59,7 @@ Subject IDs follow a guided format like FB-001, SC-042, or OT-003. The app inclu
 - Average Reference
 - Each montage has system-specific channel derivations
 - Trace count changes when switching between 10-20, HD-40, and 10-10
+- **Custom Montage Builder** — build a bipolar montage from any two leads (A − B), regardless of standard pairings. Saved montages persist in the browser and are reusable across recordings; they appear at the bottom of the montage dropdown with a Build/Edit button beside it.
 
 ### Filters (Real DSP)
 - LFF (High-Pass): Off, 0.1, 0.3, 0.5, 1, 1.6, 5, 10 Hz
@@ -97,6 +98,7 @@ Subject IDs follow a guided format like FB-001, SC-042, or OT-003. The app inclu
 ### Device Management (Acquire Tab)
 - Input Source dropdown grouped by protocol
 - BrainFlow: OpenBCI Cyton 8/16ch, Ganglion, g.tec Unicorn, ANT Neuro eego, Neurosity Crown, Muse 2, BrainBit, Enophone
+- WebSocket bridge: **piEEG (Raspberry Pi HAT) 8/16ch** — a local Python/BrainFlow → WebSocket bridge streams samples and impedance into the browser, recorded straight to EDF. Configure the bridge URL (default `ws://localhost:8765`) in the device panel.
 - LSL: Generic auto-discover, Natus Xltek, Nihon Kohden, BioSemi ActiveTwo via LSL bridge
 - File Import: EDF / EDF+ (BDF/BDF+ planned — 24-bit decode not yet implemented; BDF files will be rejected)
 - Simulated: 19ch and 32ch test signal generators
