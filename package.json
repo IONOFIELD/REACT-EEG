@@ -1,13 +1,15 @@
 {
   "name": "react-build-v11",
   "private": true,
-  "version": "16.6.0",
+  "version": "17.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "build:single": "vite build --mode singlefile",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "jszip": "^3.10.1",
@@ -17,6 +19,7 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0",
-    "vite-plugin-singlefile": "^2.3.3"
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "^2.1.9"
   }
 }

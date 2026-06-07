@@ -1,5 +1,17 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useReducer, createContext, useContext } from "react";
 import JSZip from "jszip";
+import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";
+import { buildAnnotationSidecar } from "./sidecar.js";
+// ACNS/ILAE annotation taxonomy + migration (ANNOTATION_TYPES aliased to the long-standing
+// ANNOTATION_COLORS name so existing call sites are unchanged).
+import { ANNOTATION_TYPES as ANNOTATION_COLORS, migrateAnnotations } from "./annotations.js";
+// Inter-rater / provenance: pseudonymous (hashed) annotator id + concordant/discordant indicator.
+import { hashAnnotator, agreementByAnnotation } from "./interrater.js";
+// Pure DSP kernel (extracted, behaviour-identical, unit-tested in test/dsp.golden.test.js)
+import {
+  butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
+  applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
+} from "./dsp.js";
 
 // ══════════════════════════════════════════════════════════════
 // REACT EEG — Unified Platform
@@ -14,10 +26,8 @@ import JSZip from "jszip";
 // Block ends at "── END CONFIGURATION ──" marker further down.
 // ══════════════════════════════════════════════════════════════
 
-// ── App identity / versioning ──
-const APP_VERSION = "v16.6";
-const PIPELINE_VERSION = "react-pipeline-1.0.0";
-const SCHEMA_VERSION = "v14.1"; // record-shape version; bump on breaking schema changes
+// ── App identity / versioning ── (APP_VERSION / PIPELINE_VERSION / SCHEMA_VERSION now
+// imported from ./version.js so App.jsx and dsp.js share one source of truth.)
 const DEBUG = false;
 const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 
@@ -25,6 +35,18 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v17.0", items: [
+    "Inter-rater support — more than one annotator can mark the same segment; each annotation records an opaque (hashed) annotator id, a UTC timestamp, optional confidence and the schema version that wrote it, and segments marked by two or more annotators show a concordant / discordant badge. Annotator labels are pseudonymous and never leave your machine; all fields are optional and backward-compatible",
+    "Annotation taxonomy now aligns to the ACNS/ILAE standard — added Seizure, LPD, GPD, LRDA and GRDA as first-class descriptive terms (marked ✦) alongside REACT's spike/sharp/sleep markups; each annotation carries a stable code, and older annotation files migrate automatically with no data loss (schema v15.0). REACT remains non-diagnostic — these are technologist markups, not interpretations",
+    "DSP pipeline is now unit-tested — the core filters and band-power maths run against golden reference vectors so the signal path can't silently regress",
+    "NEW Montage Builder — build a custom bipolar montage from ANY two leads (A − B) right in Review; saved montages persist and are reusable across recordings, and appear at the bottom of the montage dropdown",
+    "Topographic map overhaul — clear metric title + units, a labelled colour bar (min/mid/max), a min·mean·max readout, hover-an-electrode values, left↔right asymmetry plus θ/β and slow/fast ratios, and a Relative-% ↔ Absolute-power toggle",
+    "Floating panels can now be dragged from anywhere on the box, not just the title bar (buttons, inputs, canvases and links still work normally)",
+    "Larger, more legible band-power text in the cross-file Comparison panel",
+    "Impedance is no longer entered at import (it's a dynamic value, not a single number) — it's read from the EDF when present and shown via a new Impedance button in Review; compliance keeps the ≤ 5 kΩ cutoff and reports “Unknown” (non-failing) when a file has none",
+    "Repository now shows a permanent COMPLIANCE CRITERIA checklist in the left bar so the promotion requirements are always visible",
+    "Groundwork for live piEEG acquisition — piEEG (Pi HAT) added to the device list with a real WebSocket-bridge streaming path (samples + impedance) that records straight to EDF",
+  ]},
   { version: "v16.6", items: [
     "Removed the eyes-state field — over any awake recording the eyes are effectively always mixed (people blink and look around even on an eyes-closed task), so a single file-level label wasn't meaningful. Dropped from the Library column, the import form, the data sheet, and the compliance checks",
   ]},
@@ -162,13 +184,65 @@ const COMPLIANCE_PHI_PATTERNS = [
   { name: "Phone", re: /\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b/ },
 ];
 
+// Single source of truth for the repository-compliance criteria. checkProtocolCompliance()
+// emits one check per id below (labels mirror these), and the Repository sidebar renders this
+// list verbatim so users always see exactly what compliance requires.
+const COMPLIANCE_CRITERIA = [
+  { id: "duration",        label: "Duration ≥ 5 min",                 threshold: "≥ 5 min",              desc: "Minimum recording length for a valid study." },
+  { id: "channels",        label: "Channel count ≥ 19",               threshold: "≥ 19 channels",        desc: "Full 10-20 electrode coverage." },
+  { id: "impedances",      label: "Impedances ≤ 5 kΩ",                threshold: "≤ 5 kΩ",               desc: "Per-electrode contact quality. Dynamic value — “Unknown” when the EDF doesn’t store it." },
+  { id: "activations",     label: "Activation procedures documented", threshold: "documented",           desc: "Hyperventilation / photic / sleep noted (or explicitly “none”)." },
+  { id: "conditions",      label: "Recording conditions documented",  threshold: "posture + environment", desc: "Patient posture and environment recorded." },
+  { id: "hardware",        label: "Hardware tag present",             threshold: "make + model",         desc: "Acquisition device manufacturer and model identified." },
+  { id: "deidentification",label: "De-identification verified",       threshold: "no PHI in header",     desc: "No SSN / MRN / email / phone patterns in the EDF header." },
+];
+
 // ── Persistence: legacy localStorage keys (migrated to IDB on first load) ──
 const STORAGE_KEYS = {
   LIBRARY: "react_eeg_library",
   NOTES_PREFIX: "react_eeg_notes_",
   BASELINE_MAP: "react_eeg_baseline_map",        // canonical
   BASELINE_MAP_LEGACY: "react-eeg-baselineMap",  // pre-v14, dashed (drop after one release)
+  CUSTOM_MONTAGES: "react_eeg_custom_montages",  // user-built bipolar montages [{id,name,pairs}]
+  ANNOTATOR: "react_eeg_annotator_label",        // current annotator pseudonym (local only; never exported)
 };
+
+// Current annotator's pseudonymous label (local convenience) and its opaque hashed id.
+// Only the HASH is ever written onto annotations or exported — never the label.
+function getAnnotatorLabel() {
+  try { return localStorage.getItem(STORAGE_KEYS.ANNOTATOR) || ""; } catch { return ""; }
+}
+function setAnnotatorLabel(label) {
+  try { localStorage.setItem(STORAGE_KEYS.ANNOTATOR, label || ""); } catch {}
+}
+function currentAnnotatorId() {
+  return hashAnnotator(getAnnotatorLabel());
+}
+// Optional, backward-compatible provenance stamped onto each newly created annotation.
+// annotatorId/confidence are omitted when absent so older readers and old files are unaffected.
+function annotationProvenance(confidence) {
+  const id = currentAnnotatorId();
+  return {
+    ...(id ? { annotatorId: id } : {}),
+    createdAtUtc: new Date().toISOString(),
+    ...(confidence ? { confidence } : {}),
+    schemaVersion: SCHEMA_VERSION,
+  };
+}
+
+// Custom montage keys are stored on the `montage` state as "cm:<id>" so they never collide
+// with the preset MONTAGE_DEFS keys.
+const CUSTOM_MONTAGE_PREFIX = "cm:";
+function loadCustomMontages() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.CUSTOM_MONTAGES);
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr.filter(m => m && m.id && Array.isArray(m.pairs)) : [];
+  } catch { return []; }
+}
+function saveCustomMontages(list) {
+  try { localStorage.setItem(STORAGE_KEYS.CUSTOM_MONTAGES, JSON.stringify(list)); } catch {}
+}
 
 // ── DSP defaults ──
 // Filter cutoff options offered in the UI dropdowns. Extended in v14.8 to support
@@ -389,6 +463,12 @@ function migrateRecord(record) {
     if (r.complianceResult === undefined) r.complianceResult = null;
     r.schemaVersion = "v14.1";
   }
+  // v14.1 → v15.0: annotation taxonomy gained stable ACNS codes. Annotations live in
+  // annotationsMap (migrated by migrateAnnotations at each load site), not on the record,
+  // so there is no record-field change here — just re-stamp the schema version.
+  if (r.schemaVersion === "v14.1") {
+    r.schemaVersion = "v15.0";
+  }
   return r;
 }
 
@@ -505,11 +585,7 @@ async function buildPatientPackageZip({ subjectHash, records, annotationsMap, cl
     const base = r.filename.replace(/\.edf$/i, "");
     const anns = annotationsMap?.[r.filename] || [];
     if (anns.length > 0) {
-      annotFolder.file(`${base}_annotations.json`, JSON.stringify({
-        schemaVersion: SCHEMA_VERSION, pipelineVersion: PIPELINE_VERSION, appVersion: APP_VERSION,
-        sourceFilename: r.filename, exportedAt: new Date().toISOString(),
-        annotationCount: anns.length, annotations: anns,
-      }, null, 2));
+      annotFolder.file(`${base}_annotations.json`, JSON.stringify(buildAnnotationSidecar(anns, r.filename), null, 2));
     }
     const notes = clinicalNotesMap?.[r.filename];
     if (notes) notesFolder.file(`${base}_notes.txt`, notes);
@@ -578,7 +654,7 @@ async function parsePatientPackageZip(file) {
     if (annotFile) {
       try {
         const parsed = JSON.parse(await annotFile.async("text"));
-        annotations = Array.isArray(parsed) ? parsed : (parsed.annotations || []);
+        annotations = migrateAnnotations(Array.isArray(parsed) ? parsed : (parsed.annotations || []));
       } catch (e) { /* malformed annotations — skip */ }
     }
 
@@ -894,8 +970,10 @@ function checkProtocolCompliance(record, edfData = null) {
   else if (chCount >= COMPLIANCE_MIN_CHANNELS) push("channels", "Channel count ≥ 19", "pass", chCount, COMPLIANCE_MIN_CHANNELS, `${chCount} channels.`);
   else push("channels", "Channel count ≥ 19", "fail", chCount, COMPLIANCE_MIN_CHANNELS, `Only ${chCount} channels — minimum is 19.`);
 
-  // 3. Impedances ≤ 5 kΩ (acquired records only; library imports rarely store this)
-  const imps = record?.impedances || record?.acquiredImpedances || null;
+  // 3. Impedances ≤ 5 kΩ. Impedance is a dynamic, per-electrode value — it is read from
+  // the EDF when the recording stored it, otherwise from an acquired record. Standard EDF
+  // rarely carries impedance, so "unknown" (below) is the common, non-failing outcome.
+  const imps = edfData?.impedances || record?.impedances || record?.acquiredImpedances || null;
   if (!imps || (Array.isArray(imps) && imps.length === 0)) {
     push("impedances", "Impedances ≤ 5 kΩ", "unknown", null, COMPLIANCE_MAX_IMPEDANCE_KOHM, "Impedance data not stored with this record.");
   } else {
@@ -1190,18 +1268,8 @@ function canViewInSystem(recordingSystem, viewSystem) {
   return (SYSTEM_HIERARCHY[recordingSystem] || 1) >= (SYSTEM_HIERARCHY[viewSystem] || 1);
 }
 
-// ── Annotation types ──
-const ANNOTATION_COLORS = [
-  { name: "Spike", color: "#EF4444" },
-  { name: "Sharp Wave", color: "#F59E0B" },
-  { name: "Seizure", color: "#DC2626" },
-  { name: "Artifact", color: "#6B7280" },
-  { name: "Arousal", color: "#8B5CF6" },
-  { name: "Sleep Spindle", color: "#3B82F6" },
-  { name: "K-Complex", color: "#14B8A6" },
-  { name: "Eye Movement", color: "#EC4899" },
-  { name: "Note", color: "#10B981" },
-];
+// ── Annotation types ── now defined in ./annotations.js (ANNOTATION_TYPES, imported above
+// as ANNOTATION_COLORS) with stable ACNS/ILAE codes + migration.
 
 // Muted slate used for event markers parsed FROM the EDF+ file itself (TAL records
 // like PhysioNet's T0/T1/T2), so they read as recording-embedded events rather than
@@ -1263,7 +1331,16 @@ const DEVICE_CATALOG = [
   // OpenBCI hardware (BrainFlow)
   { id: "openbci-cyton-8", name: "OpenBCI Cyton", protocol: "brainflow", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, boardId: 0, port: "COM3" },
   { id: "openbci-cyton-16", name: "OpenBCI Cyton + Daisy", protocol: "brainflow", channels: 16, maxSr: 125, resolution: "24-bit", wireless: false, boardId: 2, port: "COM3" },
+  // piEEG (Raspberry Pi HAT) — streamed to the browser over a local WebSocket bridge.
+  { id: "pieeg-8", name: "piEEG (Pi HAT, 8ch)", protocol: "websocket", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:8765" },
+  { id: "pieeg-16", name: "piEEG-16 (Pi HAT, 16ch)", protocol: "websocket", channels: 16, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:8765" },
 ];
+
+// piEEG default electrode order (matches the bridge's channel ordering).
+const PIEEG_CHANNEL_MAP = {
+  "pieeg-8":  ["Fp1","Fp2","C3","C4","P3","P4","O1","O2"],
+  "pieeg-16": ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6"],
+};
 
 // ── Connection states ──
 const CONN = { disconnected: 0, connecting: 1, connected: 2, impedance: 3, ready: 4, error: -1 };
@@ -1407,6 +1484,7 @@ function parseEDFFile(arrayBuffer) {
       sigs.push({
         label,
         isAnnotation,
+        physDim: readStr(offPhysDim + i * 8, 8),
         physMin: readFloat(offPhysMin + i * 8, 8),
         physMax: readFloat(offPhysMax + i * 8, 8),
         digMin:  readInt(offDigMin + i * 8, 8),
@@ -1463,6 +1541,29 @@ function parseEDFFile(arrayBuffer) {
     const sampleRate = dataSigs[0]?.sampleRate || 256;
     const totalDuration = numRecords * recordDuration;
 
+    // ── Best-effort impedance extraction ──
+    // Standard EDF has no impedance field, but some exporters add dedicated per-electrode
+    // impedance signals (label contains "imp"/"impedance", or the physical dimension is
+    // ohm/kΩ). When present, surface them as { name, value(kΩ) } so Review can display them
+    // and the compliance cutoff can evaluate them. Absent → undefined (the common case).
+    const impedances = [];
+    dataSigs.forEach((s, di) => {
+      const lab = (s.label || "").toLowerCase();
+      const dim = (s.physDim || "").toLowerCase();
+      const isImp = /imp(edance)?/.test(lab) || /ohm|kohm|kω|\bω\b/.test(dim);
+      if (!isImp) return;
+      const arr = channelData[di];
+      if (!arr || arr.length === 0) return;
+      let sum = 0; for (let n = 0; n < arr.length; n++) sum += arr[n];
+      let val = sum / arr.length;
+      // Normalize plain ohms → kΩ
+      if (/ohm/.test(dim) && !/k/.test(dim) && val > 1000) val = val / 1000;
+      const cleaned = (s.label || "").replace(/imp(edance)?/ig, "").replace(/[:\-_]/g, " ").trim();
+      const elec = extractElectrodeName(cleaned) || cleaned || `Ch${di + 1}`;
+      const v = Math.round(val * 10) / 10;
+      impedances.push({ name: elec, value: v, status: v <= 5 ? "good" : v <= 10 ? "fair" : "poor" });
+    });
+
     return {
       patientId, recordingId, startDate, startTime,
       numRecords, recordDuration, numSignals: dataSigs.length,
@@ -1471,6 +1572,7 @@ function parseEDFFile(arrayBuffer) {
       channelData,
       channelLabels: dataSigs.map(s => s.label),
       edfAnnotations,  // EDF+ TAL annotations parsed from the file (may be empty)
+      ...(impedances.length ? { impedances } : {}),
     };
   } catch (e) {
     return { error: { code: "EDF_PARSE_FAILED", stage: "parse", message: e?.message || String(e) } };
@@ -1581,217 +1683,7 @@ function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSe
 // ── Filters ──
 // ── Butterworth filter design (cascaded biquad sections) ──
 // Compute biquad coefficients for Nth-order Butterworth via bilinear transform
-function butterworthCoeffs(cutoff, sr, order, type) {
-  if (cutoff <= 0 || cutoff >= sr / 2) return [];
-  const wc = Math.tan(Math.PI * cutoff / sr); // pre-warped cutoff
-  const wc2 = wc * wc;
-  const sections = [];
-  const nPairs = Math.floor(order / 2);
-  for (let k = 0; k < nPairs; k++) {
-    const theta = Math.PI * (2 * k + 1) / (2 * order);
-    const gamma = 2 * Math.sin(theta); // damping factor for this pole pair
-    if (type === "low") {
-      const a0 = 1 + gamma * wc + wc2;
-      sections.push({
-        b0: wc2 / a0, b1: 2 * wc2 / a0, b2: wc2 / a0,
-        a1: 2 * (wc2 - 1) / a0, a2: (1 - gamma * wc + wc2) / a0
-      });
-    } else {
-      const a0 = 1 + gamma * wc + wc2;
-      sections.push({
-        b0: 1 / a0, b1: -2 / a0, b2: 1 / a0,
-        a1: 2 * (wc2 - 1) / a0, a2: (1 - gamma * wc + wc2) / a0
-      });
-    }
-  }
-  if (order % 2 === 1) {
-    if (type === "low") {
-      const a0 = 1 + wc;
-      sections.push({ b0: wc / a0, b1: wc / a0, b2: 0, a1: (wc - 1) / a0, a2: 0 });
-    } else {
-      const a0 = 1 + wc;
-      sections.push({ b0: 1 / a0, b1: -1 / a0, b2: 0, a1: (wc - 1) / a0, a2: 0 });
-    }
-  }
-  return sections;
-}
-
-// Apply cascaded biquad filter sections
-function applyBiquadCascade(data, sections) {
-  let buf = data;
-  for (const s of sections) {
-    const N = buf.length;
-    const out = new Float32Array(N);
-    // Initialize with steady-state to reduce transient
-    out[0] = s.b0 * buf[0];
-    if (N > 1) out[1] = s.b0 * buf[1] + s.b1 * buf[0] - s.a1 * out[0];
-    for (let i = 2; i < N; i++)
-      out[i] = s.b0 * buf[i] + s.b1 * buf[i-1] + s.b2 * buf[i-2] - s.a1 * out[i-1] - s.a2 * out[i-2];
-    buf = out;
-  }
-  return buf;
-}
-
-// Forward-backward (zero-phase) Butterworth filter with edge padding
-function applyButterworthFilter(data, cutoff, sr, order, type) {
-  const sections = butterworthCoeffs(cutoff, sr, order, type);
-  if (sections.length === 0) return data;
-  const N = data.length;
-  if (N < 4) return data;
-  // Pad length scales with filter time constant: ~3 cycles at cutoff frequency
-  const cycleLen = Math.ceil(sr / Math.max(cutoff, 0.1));
-  const padLen = Math.min(cycleLen * 3, Math.floor(N / 2) - 1);
-  if (padLen < 2) return applyBiquadCascade(data, sections);
-  const totalLen = N + 2 * padLen;
-  const padded = new Float32Array(totalLen);
-  // Reflect-pad start: mirror around data[0]
-  for (let i = 0; i < padLen; i++) {
-    const srcIdx = Math.min(padLen - i, N - 1);
-    padded[i] = 2 * data[0] - data[srcIdx];
-  }
-  for (let i = 0; i < N; i++) padded[padLen + i] = data[i];
-  // Reflect-pad end: mirror around data[N-1]
-  for (let i = 0; i < padLen; i++) {
-    const srcIdx = Math.max(N - 2 - i, 0);
-    padded[padLen + N + i] = 2 * data[N - 1] - data[srcIdx];
-  }
-  let result = applyBiquadCascade(padded, sections);
-  result.reverse();
-  result = applyBiquadCascade(result, sections);
-  result.reverse();
-  return result.slice(padLen, padLen + N);
-}
-
-function applyHighPass(data, cutoff, sr, order = 3) {
-  if (cutoff <= 0) return data;
-  // Zero-phase (forward-backward), matching the low-pass path so HPF and LPF do
-  // not introduce inconsistent phase distortion — important for reading waveform
-  // morphology and event timing. applyButterworthFilter's reflect-padding damps
-  // the forward-backward edge transient that motivated the old single-pass code.
-  // Effective order = 2 × `order` (filtfilt doubling).
-  return applyButterworthFilter(data, cutoff, sr, order, "high");
-}
-function applyLowPass(data, cutoff, sr, order = 3) {
-  if (cutoff <= 0) return data;
-  return applyButterworthFilter(data, cutoff, sr, order, "low");
-}
-function applyNotch(data, freq, sr, q = 30) {
-  if (freq <= 0) return data;
-  const w0 = (2 * Math.PI * freq) / sr, alpha = Math.sin(w0) / (2 * q);
-  const b0 = 1, b1 = -2 * Math.cos(w0), b2 = 1, a0 = 1 + alpha, a1 = -2 * Math.cos(w0), a2 = 1 - alpha;
-  const out = new Float32Array(data.length); out[0] = data[0]; out[1] = data[1];
-  for (let i = 2; i < data.length; i++)
-    out[i] = (b0/a0)*data[i] + (b1/a0)*data[i-1] + (b2/a0)*data[i-2] - (a1/a0)*out[i-1] - (a2/a0)*out[i-2];
-  return out;
-}
-
-// ── Discrete Wavelet Transform (Daubechies-4) denoising ──
-function applyWaveletDenoise(data, levels = 4) {
-  const N = data.length;
-  if (N < 16) return { data, log: null };
-  // Db4 (orthonormal) filter coefficients. Analysis is decimated correlation
-  // a[i]=Σ_j h[j]·x[2i+j]; the perfect-reconstruction inverse is its transpose,
-  // which scatter-adds with the SAME h/g (not time-reversed). The previous code
-  // used reversed filters in synthesis, which broke reconstruction — a clean
-  // signal came back distorted. (g is the QMF highpass: g[n]=(-1)^n·h[3-n].)
-  const h = [0.4829629131445341, 0.8365163037378079, 0.2241438680420134, -0.1294095225512604];
-  const g = [h[3], -h[2], h[1], -h[0]];
-
-  // Symmetric (mirror) boundary handling. The transform itself uses fast periodic
-  // (circular) convolution, which wraps the end of the epoch onto the start and
-  // creates edge artifacts when the two ends differ in level. To avoid that we
-  // mirror-extend the signal by `pad` samples on each side, run the perfect-
-  // reconstruction periodic transform on the padded signal, then crop back — so
-  // the wrap-around discontinuity lives in the discarded padding, not the data.
-  const pad = Math.min(Math.floor(N / 2), Math.max(16, (1 << levels) * 2));
-  const M = N + 2 * pad;
-  const work = new Float32Array(M);
-  // whole-sample mirror with no edge repeat (period 2N-2): …c b a b c…
-  const reflect = (i) => {
-    if (N === 1) return 0;
-    const period = 2 * N - 2;
-    let k = ((i % period) + period) % period;
-    return k < N ? k : period - k;
-  };
-  for (let j = 0; j < M; j++) work[j] = data[reflect(j - pad)];
-
-  // Forward DWT — multi-level decomposition (on the mirror-padded signal)
-  const details = [];
-  let approx = new Float32Array(work);
-  for (let lev = 0; lev < levels; lev++) {
-    const len = approx.length;
-    if (len < 8) break;
-    const halfLen = Math.floor(len / 2);
-    const newApprox = new Float32Array(halfLen);
-    const detail = new Float32Array(halfLen);
-    for (let i = 0; i < halfLen; i++) {
-      let lo = 0, hi = 0;
-      for (let j = 0; j < 4; j++) {
-        const idx = (2 * i + j) % len;
-        lo += h[j] * approx[idx];
-        hi += g[j] * approx[idx];
-      }
-      newApprox[i] = lo;
-      detail[i] = hi;
-    }
-    details.push(detail);
-    approx = newApprox;
-  }
-
-  // Estimate noise from finest detail level via MAD
-  const finest = details[0];
-  const sorted = Array.from(finest).map(Math.abs).sort((a, b) => a - b);
-  const mad = sorted[Math.floor(sorted.length / 2)] / 0.6745;
-  const threshold = mad * Math.sqrt(2 * Math.log(M)); // universal threshold on padded length
-
-  // Soft thresholding on detail coefficients + logging
-  let totalCoeffs = 0, zeroedCoeffs = 0, energyBefore = 0, energyAfter = 0;
-  const perLevel = [];
-  for (let lev = 0; lev < details.length; lev++) {
-    const d = details[lev];
-    let levZeroed = 0;
-    for (let i = 0; i < d.length; i++) {
-      totalCoeffs++;
-      energyBefore += d[i] * d[i];
-      const abs = Math.abs(d[i]);
-      d[i] = abs > threshold ? Math.sign(d[i]) * (abs - threshold) : 0;
-      energyAfter += d[i] * d[i];
-      if (d[i] === 0) { levZeroed++; zeroedCoeffs++; }
-    }
-    perLevel.push({ level: lev, coefficients: d.length, zeroed: levZeroed });
-  }
-
-  // Inverse DWT — multi-level reconstruction
-  let recon = approx;
-  for (let lev = details.length - 1; lev >= 0; lev--) {
-    const detail = details[lev];
-    const outLen = detail.length * 2;
-    const out = new Float32Array(outLen);
-    for (let i = 0; i < detail.length; i++) {
-      for (let j = 0; j < 4; j++) {
-        const idx = (2 * i + j) % outLen;
-        out[idx] += h[j] * recon[i] + g[j] * detail[i]; // transpose synthesis (same h/g)
-      }
-    }
-    recon = out;
-  }
-
-  // Crop the central region back to the original length (discarding the mirror
-  // padding, where the periodic wrap-around artifact now lives).
-  const result = new Float32Array(N);
-  for (let i = 0; i < N; i++) { const k = pad + i; result[i] = k < recon.length ? recon[k] : 0; }
-  return {
-    data: result,
-    log: {
-      method: "wavelet-db4-soft", pipelineVersion: PIPELINE_VERSION,
-      levels: details.length, threshold: +threshold.toFixed(4),
-      noiseEstimateMAD: +mad.toFixed(4),
-      energyRemovedPct: energyBefore > 0 ? +((1 - energyAfter / energyBefore) * 100).toFixed(2) : 0,
-      totalCoefficients: totalCoeffs, zeroedCoefficients: zeroedCoeffs,
-      perLevel, timestamp: Date.now(),
-    }
-  };
-}
+// Butterworth + biquad + HP/LP/notch + wavelet denoise now live in ./dsp.js (imported above).
 
 // ── Simplified FastICA for artifact removal ──
 /**
@@ -2454,8 +2346,12 @@ function useDraggablePanel(panelPos, setPanelPos, defaultPos) {
   }, []);
 
   const onMouseDown = (e) => {
+    // Allow dragging from anywhere on the panel body, but never hijack interaction
+    // with controls, canvases (topo hover/click), scrollables, or links.
     const tag = e.target.tagName;
-    if (tag === "BUTTON" || tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA") return;
+    if (tag === "BUTTON" || tag === "SELECT" || tag === "INPUT" || tag === "TEXTAREA"
+        || tag === "CANVAS" || tag === "A" || tag === "OPTION") return;
+    if (e.target.closest && e.target.closest("button, select, input, textarea, canvas, a, [data-no-drag]")) return;
     const r = panelRef.current?.getBoundingClientRect();
     if (!r) return;
     dragOffRef.current = { x: e.clientX - r.left, y: e.clientY - r.top };
@@ -2484,15 +2380,15 @@ function FloatingPanel({
 }) {
   const { panelRef, dragging, onMouseDown } = useDraggablePanel(panelPos, setPanelPos, defaultPos);
   return (
-    <div ref={panelRef} style={{
+    <div ref={panelRef} onMouseDown={onMouseDown} style={{
       position: "fixed", left: panelPos.x, top: panelPos.y, width, ...(maxHeight ? { maxHeight } : {}),
       background, border, borderRadius,
       display: "flex", flexDirection: "column", zIndex,
-      cursor: dragging ? "grabbing" : "default", userSelect: dragging ? "none" : "auto",
+      cursor: dragging ? "grabbing" : "move", userSelect: dragging ? "none" : "auto",
       ...(boxShadow ? { boxShadow } : {}),
       ...(fontFamily ? { fontFamily } : {}),
     }}>
-      <div onMouseDown={onMouseDown} style={{
+      <div style={{
         padding: "8px 12px", borderBottom: "1px solid #1a1a1a", cursor: "grab",
         display: "flex", alignItems: "center", justifyContent: "space-between",
         ...(headerBg ? { background: headerBg } : {}),
@@ -3281,6 +3177,126 @@ function CustomElectrodePicker({ customElectrodes, setCustomElectrodes, onClose 
 }
 
 // ══════════════════════════════════════════════════════════════
+// MONTAGE BUILDER — build a custom bipolar montage from any two leads
+// ══════════════════════════════════════════════════════════════
+function MontageBuilderPanel({ availableElectrodes, customMontages, persistCustomMontages, montage, setMontage, onClose }) {
+  const dialogRef = useRef(null);
+  useFocusTrap(dialogRef, true, onClose);
+  const editing = montage.startsWith(CUSTOM_MONTAGE_PREFIX)
+    ? customMontages.find(m => CUSTOM_MONTAGE_PREFIX + m.id === montage) : null;
+  const [name, setName] = useState(editing?.name || "");
+  const [pairs, setPairs] = useState(editing ? editing.pairs.slice() : []);
+  const [elA, setElA] = useState("");
+  const [elB, setElB] = useState("");
+  // Electrodes the user can pick — those actually present in the loaded EDF, else the 10-20 set.
+  const electrodes = (availableElectrodes && availableElectrodes.length) ? availableElectrodes : ELECTRODE_SETS["10-20"];
+
+  const addPair = () => {
+    if (!elA || !elB || elA === elB) return;
+    const p = `${elA}-${elB}`;
+    setPairs(prev => prev.includes(p) ? prev : [...prev, p]);
+  };
+  const removePair = (p) => setPairs(prev => prev.filter(x => x !== p));
+  const move = (i, dir) => setPairs(prev => {
+    const n = prev.slice(); const j = i + dir;
+    if (j < 0 || j >= n.length) return prev;
+    [n[i], n[j]] = [n[j], n[i]]; return n;
+  });
+
+  const save = () => {
+    if (!pairs.length) return;
+    const nm = name.trim() || `Custom (${pairs.length} ch)`;
+    if (editing) {
+      persistCustomMontages(customMontages.map(m => m.id === editing.id ? { ...m, name: nm, pairs: pairs.slice() } : m));
+      setMontage(CUSTOM_MONTAGE_PREFIX + editing.id);
+    } else {
+      const id = "u" + Date.now().toString(36);
+      persistCustomMontages([...customMontages, { id, name: nm, pairs: pairs.slice() }]);
+      setMontage(CUSTOM_MONTAGE_PREFIX + id);
+    }
+    onClose();
+  };
+  const deleteMontage = () => {
+    if (!editing) return;
+    if (!confirm(`Delete custom montage "${editing.name}"?`)) return;
+    persistCustomMontages(customMontages.filter(m => m.id !== editing.id));
+    setMontage("bipolar-longitudinal");
+    onClose();
+  };
+
+  const selStyle = { background:"#0a0a0a",border:"1px solid #2a2a2a",color:"#ddd",fontSize:12,padding:"4px 6px",outline:"none",fontFamily:"'IBM Plex Mono', monospace" };
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center"}}
+      onClick={(e)=>{if(e.target===e.currentTarget)onClose();}}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="montage-builder-title" style={{background:"#0c0c0c",border:"1px solid #222",padding:"20px 24px",width:480,maxWidth:"92vw",maxHeight:"88vh",overflow:"auto",borderRadius:2}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
+          <span id="montage-builder-title" style={{fontSize:13,fontWeight:700,color:"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace"}}>
+            {editing ? "Edit Custom Montage" : "Build Custom Montage"}
+          </span>
+          <button onClick={onClose} aria-label="Close" style={{background:"none",border:"none",color:"#666",cursor:"pointer"}}>{I.X()}</button>
+        </div>
+        <div style={{fontSize:10,color:"#555",marginBottom:14,lineHeight:1.4}}>
+          Pick any two leads to display the bipolar difference (A − B) between them — any pair, regardless of standard montage.
+        </div>
+
+        {/* Pair picker */}
+        <div style={{display:"flex",alignItems:"flex-end",gap:8,marginBottom:14}}>
+          <div><div style={microLabel}>Electrode A</div>
+            <select value={elA} onChange={e=>setElA(e.target.value)} style={{...selStyle,width:110}}>
+              <option value="">—</option>
+              {electrodes.map(el => <option key={el} value={el}>{el}</option>)}
+            </select></div>
+          <span style={{fontSize:16,color:"#555",paddingBottom:4}}>−</span>
+          <div><div style={microLabel}>Electrode B</div>
+            <select value={elB} onChange={e=>setElB(e.target.value)} style={{...selStyle,width:110}}>
+              <option value="">—</option>
+              {electrodes.map(el => <option key={el} value={el}>{el}</option>)}
+            </select></div>
+          <button onClick={addPair} disabled={!elA||!elB||elA===elB} style={{
+            padding:"5px 14px",fontSize:11,fontWeight:700,cursor:(!elA||!elB||elA===elB)?"default":"pointer",
+            background:(!elA||!elB||elA===elB)?"#111":"#1a4a54",border:`1px solid ${(!elA||!elB||elA===elB)?"#222":"#4a9bab"}`,
+            color:(!elA||!elB||elA===elB)?"#444":"#7ec8d9"}}>+ Add</button>
+        </div>
+
+        {/* Current pairs */}
+        <div style={{border:"1px solid #1a1a1a",marginBottom:14,maxHeight:200,overflow:"auto"}}>
+          {pairs.length === 0 ? (
+            <div style={{padding:"16px",textAlign:"center",fontSize:10,color:"#555"}}>No channels yet — add a pair above.</div>
+          ) : pairs.map((p, i) => (
+            <div key={p} style={{display:"flex",alignItems:"center",gap:8,padding:"5px 10px",borderBottom:"1px solid #111"}}>
+              <span style={{fontSize:9,color:"#444",width:20}}>{i+1}</span>
+              <span style={{flex:1,fontSize:12,fontFamily:"'IBM Plex Mono', monospace",color:"#9fd3e0"}}>{p}</span>
+              <button onClick={()=>move(i,-1)} disabled={i===0} title="Move up" style={{background:"none",border:"none",color:i===0?"#333":"#888",cursor:i===0?"default":"pointer",fontSize:12}}>▲</button>
+              <button onClick={()=>move(i,1)} disabled={i===pairs.length-1} title="Move down" style={{background:"none",border:"none",color:i===pairs.length-1?"#333":"#888",cursor:i===pairs.length-1?"default":"pointer",fontSize:12}}>▼</button>
+              <button onClick={()=>removePair(p)} title="Remove" style={{background:"none",border:"none",color:"#f87171",cursor:"pointer",fontSize:13,fontWeight:700}}>×</button>
+            </div>
+          ))}
+        </div>
+
+        {/* Name + actions */}
+        <div style={{marginBottom:14}}>
+          <div style={microLabel}>Montage name</div>
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder={`Custom (${pairs.length} ch)`}
+            style={{...selStyle,width:"100%"}}/>
+        </div>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div>
+            {editing && <button onClick={deleteMontage} style={{...controlBtn(),color:"#f87171",border:"1px solid #5a2020",fontSize:10}}>Delete</button>}
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <button onClick={onClose} style={{...controlBtn(),fontSize:10}}>Cancel</button>
+            <button onClick={save} disabled={!pairs.length} style={{
+              padding:"5px 18px",fontSize:11,fontWeight:700,cursor:pairs.length?"pointer":"default",
+              background:pairs.length?"#1a4a54":"#111",border:`1px solid ${pairs.length?"#4a9bab":"#222"}`,
+              color:pairs.length?"#7ec8d9":"#444"}}>{editing ? "Save Changes" : "Save Montage"}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
 // EEG CONTROLS BAR — shared between REVIEW and RECORD
 // ══════════════════════════════════════════════════════════════
 function EEGControls({ montage, setMontage, eegSystem, setEegSystem, recordingSystem, hpf, setHpf, lpf, setLpf, notch, setNotch,
@@ -3628,32 +3644,7 @@ function extractElectrodeName(rawLabel) {
   return null;
 }
 
-function computeBands(data, sr) {
-  if (!data || data.length < 64) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
-  const N = Math.min(512, data.length);
-  const fR = sr / N;
-  const bands = { delta: [0.5, 4], theta: [4, 8], alpha: [8, 13], beta: [13, 30], gamma: [30, 50] };
-  const powers = {};
-  let total = 0;
-  Object.entries(bands).forEach(([name, [fL, fH]]) => {
-    let bp = 0;
-    const kL = Math.max(1, Math.round(fL / fR));
-    const kH = Math.min(Math.floor(N / 2), Math.round(fH / fR));
-    for (let k = kL; k <= kH; k++) {
-      let re = 0, im = 0;
-      for (let n = 0; n < N; n++) {
-        const angle = (2 * Math.PI * k * n) / N;
-        re += data[n] * Math.cos(angle);
-        im -= data[n] * Math.sin(angle);
-      }
-      bp += (re * re + im * im) / (N * N);
-    }
-    powers[name] = bp;
-    total += bp;
-  });
-  powers.total = total;
-  return powers;
-}
+// computeBands now lives in ./dsp.js (imported above).
 
 /**
  * Compute summary qEEG metrics for one parsed EDF recording. Used by the Subject
@@ -3779,9 +3770,28 @@ function valueToColor(val, min, max, mode = "voltage") {
   return `rgb(${r}, ${g}, ${b})`;
 }
 
+// Format a topographic value compactly for labels/readouts.
+function fmtTopo(v) {
+  if (v === null || v === undefined || isNaN(v)) return "—";
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 0.01 || a >= 10000)) return v.toExponential(1);
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 1) return v.toFixed(1);
+  return v.toFixed(2);
+}
+
 function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
   const [displayMode, setDisplayMode] = useState("voltage");
+  const [scaleMode, setScaleMode] = useState("relative"); // relative (%) | absolute (µV²)
+  const [hoverElec, setHoverElec] = useState(null);
   const canvasRef = useRef(null);
+
+  const isVoltageMode = displayMode === "voltage";
+  const isAbsolute = !isVoltageMode && scaleMode === "absolute";
+  const unit = isVoltageMode ? "µV" : isAbsolute ? "µV²" : "%";
+  const metricLabel = isVoltageMode
+    ? "RMS amplitude"
+    : `${displayMode.charAt(0).toUpperCase() + displayMode.slice(1)} ${isAbsolute ? "absolute power" : "relative power"}`;
 
   const electrodeValues = useMemo(() => {
     if (!waveformData || !channels) return {};
@@ -3791,22 +3801,65 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
       if (!elec || !ELECTRODE_2D[elec] || ch === "EKG") return;
       const data = waveformData[i];
       if (!data || data.length === 0) return;
-      if (displayMode === "voltage") {
+      if (isVoltageMode) {
         let sum = 0;
         for (let j = 0; j < data.length; j++) sum += data[j] * data[j];
         vals[elec] = Math.sqrt(sum / data.length);
       } else {
         const bands = computeBands(data, sampleRate);
         const total = bands.total || 1;
-        if (displayMode === "alpha") vals[elec] = (bands.alpha / total) * 100;
-        else if (displayMode === "theta") vals[elec] = (bands.theta / total) * 100;
-        else if (displayMode === "delta") vals[elec] = (bands.delta / total) * 100;
-        else if (displayMode === "beta") vals[elec] = (bands.beta / total) * 100;
-        else if (displayMode === "gamma") vals[elec] = (bands.gamma / total) * 100;
+        const raw = bands[displayMode] || 0;
+        vals[elec] = isAbsolute ? raw : (raw / total) * 100;
       }
     });
     return vals;
-  }, [waveformData, channels, sampleRate, displayMode]);
+  }, [waveformData, channels, sampleRate, displayMode, isVoltageMode, isAbsolute]);
+
+  // Global qEEG ratios + L/R asymmetry summary, independent of the selected map metric.
+  const stats = useMemo(() => {
+    const vals = Object.values(electrodeValues);
+    let min = null, max = null, mean = null;
+    if (vals.length) {
+      min = Math.min(...vals); max = Math.max(...vals);
+      mean = vals.reduce((s, v) => s + v, 0) / vals.length;
+    }
+    // L vs R asymmetry on the currently-mapped metric: (meanL − meanR) / (meanL + meanR)
+    let sumL = 0, nL = 0, sumR = 0, nR = 0;
+    Object.entries(electrodeValues).forEach(([name, v]) => {
+      const pos = ELECTRODE_2D[name]; if (!pos) return;
+      if (pos.x < 0.49) { sumL += v; nL++; } else if (pos.x > 0.51) { sumR += v; nR++; }
+    });
+    const mL = nL ? sumL / nL : 0, mR = nR ? sumR / nR : 0;
+    const asym = (mL + mR) !== 0 ? (mL - mR) / (mL + mR) : null;
+    // θ/β and slow/fast from band power summed across all scalp electrodes
+    let sd = 0, st = 0, sa = 0, sb = 0;
+    if (waveformData && channels) {
+      channels.forEach((ch, i) => {
+        const elec = getElectrodeFromChannel(ch);
+        if (!elec || !ELECTRODE_2D[elec] || ch === "EKG") return;
+        const data = waveformData[i]; if (!data || data.length === 0) return;
+        const bnd = computeBands(data, sampleRate);
+        sd += bnd.delta; st += bnd.theta; sa += bnd.alpha; sb += bnd.beta;
+      });
+    }
+    const thetaBeta = sb > 0 ? st / sb : null;
+    const slowFast = (sa + sb) > 0 ? (sd + st) / (sa + sb) : null;
+    return { min, max, mean, asym, thetaBeta, slowFast };
+  }, [electrodeValues, waveformData, channels, sampleRate]);
+
+  // Map canvas-pixel coordinates to the nearest electrode (for hover readout).
+  const pickElectrodeAt = (mx, my) => {
+    const size = 280, cx = size / 2, cy = size / 2, radius = size * 0.44;
+    let best = null, bestD = 16; // px threshold
+    Object.entries(electrodeValues).forEach(([name, val]) => {
+      const pos = ELECTRODE_2D[name]; if (!pos) return;
+      const ex = cx + (pos.x - 0.5) / 0.47 * radius;
+      const ey = cy + (pos.y - 0.5) / 0.47 * radius;
+      const d = Math.hypot(mx - ex, my - ey);
+      if (d < bestD) { bestD = d; best = { name, value: val }; }
+    });
+    return best;
+  };
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -3903,11 +3956,13 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
       if (!pos) return;
       const ex = cx + (pos.x - 0.5) / 0.47 * radius;
       const ey = cy + (pos.y - 0.5) / 0.47 * radius;
-      ctx.fillStyle = "#000";
+      const isHover = hoverElec && hoverElec.name === name;
+      ctx.fillStyle = isHover ? "#fff" : "#000";
       ctx.beginPath();
-      ctx.arc(ex, ey, 3, 0, Math.PI * 2);
+      ctx.arc(ex, ey, isHover ? 4 : 3, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = "#ccc";
+      if (isHover) { ctx.strokeStyle = "#000"; ctx.lineWidth = 1; ctx.stroke(); }
+      ctx.fillStyle = isHover ? "#fff" : "#ccc";
       ctx.font = "bold 8px 'IBM Plex Mono', monospace";
       ctx.textAlign = "center";
       ctx.fillText(name, ex, ey - 6);
@@ -3922,19 +3977,22 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
     }
     ctx.strokeStyle = "#444";
     ctx.strokeRect(barX, barY, barW, barH);
-    ctx.fillStyle = "#888";
+    // Colorbar tick labels: max (top), mid, min (bottom)
+    ctx.fillStyle = "#999";
     ctx.font = "8px 'IBM Plex Mono', monospace";
     ctx.textAlign = "left";
-    ctx.fillText(vMax.toFixed(1), barX + barW + 2, barY + 6);
-    ctx.fillText(vMin.toFixed(1), barX + barW + 2, barY + barH);
-  }, [electrodeValues, displayMode]);
+    const vMid = (vMin + vMax) / 2;
+    ctx.fillText(fmtTopo(vMax), barX + barW + 2, barY + 6);
+    ctx.fillText(fmtTopo(vMid), barX + barW + 2, barY + barH / 2 + 3);
+    ctx.fillText(fmtTopo(vMin), barX + barW + 2, barY + barH);
+  }, [electrodeValues, displayMode, hoverElec]);
 
   return (
     <FloatingPanel
       title="TOPOGRAPHIC MAP"
       onClose={onClose} panelPos={panelPos} setPanelPos={setPanelPos}
       defaultPos={() => ({ x: 20, y: Math.round(window.innerHeight * 0.1) })}
-      width={310} zIndex={80}
+      width={340} zIndex={80}
     >
       <div style={{ display: "flex", gap: 4, padding: "6px 12px", borderBottom: "1px solid #1a1a1a", flexWrap: "wrap" }}>
         {["voltage", "delta", "theta", "alpha", "beta", "gamma"].map(mode => (
@@ -3946,12 +4004,67 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
           }}>{mode === "voltage" ? "RMS" : mode.charAt(0).toUpperCase() + mode.slice(1)}</button>
         ))}
       </div>
-      <div style={{ padding: "8px 12px", display: "flex", justifyContent: "center" }}>
-        <canvas ref={canvasRef} style={{ display: "block" }} />
+
+      {/* Metric title + units, and relative/absolute scale toggle (band modes only) */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "6px 12px 0" }}>
+        <span style={{ fontSize: 10, color: "#9fd3e0", fontWeight: 700 }}>{metricLabel} <span style={{ color: "#556" }}>({unit})</span></span>
+        {!isVoltageMode && (
+          <div style={{ display: "flex", border: "1px solid #222" }}>
+            {["relative", "absolute"].map(m => (
+              <button key={m} onClick={() => setScaleMode(m)} style={{
+                padding: "2px 7px", fontSize: 8, fontWeight: 700, cursor: "pointer", borderRadius: 0, border: "none",
+                background: scaleMode === m ? "#1a2a30" : "#0c0c0c",
+                color: scaleMode === m ? "#7ec8d9" : "#555",
+              }}>{m === "relative" ? "Rel %" : "Abs"}</button>
+            ))}
+          </div>
+        )}
       </div>
-      <div style={{ padding: "4px 12px 8px", fontSize: 8, color: "#444", textAlign: "center" }}>
-        {displayMode === "voltage" ? "RMS voltage (\u00B5V)" : `${displayMode.charAt(0).toUpperCase() + displayMode.slice(1)} relative power (%)`}
-        {" | IDW interpolation p=2.5"}
+
+      <div style={{ padding: "6px 12px", display: "flex", justifyContent: "center" }}>
+        <canvas ref={canvasRef} style={{ display: "block" }}
+          onMouseMove={(e) => {
+            const r = e.currentTarget.getBoundingClientRect();
+            setHoverElec(pickElectrodeAt(e.clientX - r.left, e.clientY - r.top));
+          }}
+          onMouseLeave={() => setHoverElec(null)} />
+      </div>
+
+      {/* Hover readout */}
+      <div style={{ padding: "0 12px", height: 14, textAlign: "center", fontSize: 9, fontFamily: "'IBM Plex Mono', monospace", color: "#7ec8d9" }}>
+        {hoverElec ? `${hoverElec.name}: ${fmtTopo(hoverElec.value)} ${unit}` : <span style={{ color: "#444" }}>hover an electrode for its value</span>}
+      </div>
+
+      {/* Min / mean / max */}
+      <div style={{ display: "flex", justifyContent: "space-around", padding: "6px 12px 4px", borderTop: "1px solid #141414", fontFamily: "'IBM Plex Mono', monospace" }}>
+        {[["MIN", stats.min], ["MEAN", stats.mean], ["MAX", stats.max]].map(([lab, v]) => (
+          <div key={lab} style={{ textAlign: "center" }}>
+            <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>{lab}</div>
+            <div style={{ fontSize: 11, color: "#ccc" }}>{fmtTopo(v)}<span style={{ fontSize: 8, color: "#556" }}> {unit}</span></div>
+          </div>
+        ))}
+      </div>
+
+      {/* Asymmetry + ratios (qEEG screening) */}
+      <div style={{ display: "flex", justifyContent: "space-around", padding: "4px 12px 8px", fontFamily: "'IBM Plex Mono', monospace" }}>
+        <div style={{ textAlign: "center" }} title="(meanL \u2212 meanR)/(meanL + meanR) of the mapped metric. + = left-dominant.">
+          <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>ASYM L\u2013R</div>
+          <div style={{ fontSize: 11, color: stats.asym === null ? "#555" : Math.abs(stats.asym) > 0.15 ? "#facc15" : "#ccc" }}>
+            {stats.asym === null ? "\u2014" : (stats.asym > 0 ? "+" : "") + stats.asym.toFixed(2)}
+          </div>
+        </div>
+        <div style={{ textAlign: "center" }} title="Theta/Beta power ratio across scalp electrodes">
+          <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>\u03B8/\u03B2</div>
+          <div style={{ fontSize: 11, color: "#ccc" }}>{fmtTopo(stats.thetaBeta)}</div>
+        </div>
+        <div style={{ textAlign: "center" }} title="(Delta+Theta)/(Alpha+Beta) \u2014 slow-to-fast power ratio">
+          <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>SLOW/FAST</div>
+          <div style={{ fontSize: 11, color: "#ccc" }}>{fmtTopo(stats.slowFast)}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: "0 12px 8px", fontSize: 8, color: "#444", textAlign: "center" }}>
+        IDW interpolation p=2.5 \u00B7 {Object.keys(electrodeValues).length} electrodes
       </div>
     </FloatingPanel>
   );
@@ -5090,12 +5203,12 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos })
                 const c = Math.abs(d) < (unit === "%" ? 2 : unit === "Hz" ? 0.3 : 0.15) ? "#555"
                   : inverted ? (d > 0 ? "#f87171" : "#4ade80") : (d > 0 ? "#4ade80" : "#f87171");
                 return (
-                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 1 }}>
-                    <span style={{ fontSize: 8, color: "#666", width: 68, flexShrink: 0 }}>{label}</span>
-                    <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: mono, width: 44, textAlign: "right" }}>{typeof vA === "number" ? (unit === "%" ? vA.toFixed(1) : vA.toFixed(2)) : vA}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
-                    <span style={{ fontSize: 7, color: "#333" }}>&rarr;</span>
-                    <span style={{ fontSize: 9, color: "#c084fc", fontFamily: mono, width: 44 }}>{typeof vB === "number" ? (unit === "%" ? vB.toFixed(1) : vB.toFixed(2)) : vB}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
-                    <span style={{ fontSize: 9, fontWeight: 700, color: c, fontFamily: mono, flex: 1, textAlign: "right" }}>
+                  <div key={label} style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+                    <span style={{ fontSize: 11, color: "#888", width: 72, flexShrink: 0 }}>{label}</span>
+                    <span style={{ fontSize: 12, color: "#7ec8d9", fontFamily: mono, width: 56, textAlign: "right" }}>{typeof vA === "number" ? (unit === "%" ? vA.toFixed(1) : vA.toFixed(2)) : vA}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
+                    <span style={{ fontSize: 9, color: "#333" }}>&rarr;</span>
+                    <span style={{ fontSize: 12, color: "#c084fc", fontFamily: mono, width: 56 }}>{typeof vB === "number" ? (unit === "%" ? vB.toFixed(1) : vB.toFixed(2)) : vB}{unit === "Hz" ? "" : unit === "%" ? "%" : ""}</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: c, fontFamily: mono, flex: 1, textAlign: "right" }}>
                       {d > 0 ? "+" : ""}{unit === "%" ? d.toFixed(1) + "%" : unit === "Hz" ? d.toFixed(1) + "Hz" : d.toFixed(2)}
                     </span>
                   </div>
@@ -5105,13 +5218,13 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos })
               const slowB = (b.bands.delta + b.bands.theta), fastB = (b.bands.alpha + b.bands.beta) || 0.0001;
               return (
                 <div style={{ marginBottom: 6 }}>
-                  <div style={{ fontSize: 8, color: "#555", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 4 }}>SPECTRAL POWER CHANGE</div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 3, marginBottom: 3 }}>
-                    <span style={{ fontSize: 7, color: "#333", width: 68, flexShrink: 0 }}></span>
-                    <span style={{ fontSize: 7, color: "#7ec8d9", fontFamily: mono, width: 44, textAlign: "right" }}>FILE A</span>
-                    <span style={{ fontSize: 7, color: "#333", width: 8 }}></span>
-                    <span style={{ fontSize: 7, color: "#c084fc", fontFamily: mono, width: 44 }}>FILE B</span>
-                    <span style={{ fontSize: 7, color: "#666", fontFamily: mono, flex: 1, textAlign: "right" }}>CHANGE</span>
+                  <div style={{ fontSize: 11, color: "#666", fontWeight: 700, letterSpacing: "0.08em", marginBottom: 6 }}>SPECTRAL POWER CHANGE</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 4 }}>
+                    <span style={{ fontSize: 9, color: "#333", width: 72, flexShrink: 0 }}></span>
+                    <span style={{ fontSize: 9, color: "#7ec8d9", fontFamily: mono, width: 56, textAlign: "right" }}>FILE A</span>
+                    <span style={{ fontSize: 9, color: "#333", width: 9 }}></span>
+                    <span style={{ fontSize: 9, color: "#c084fc", fontFamily: mono, width: 56 }}>FILE B</span>
+                    <span style={{ fontSize: 9, color: "#666", fontFamily: mono, flex: 1, textAlign: "right" }}>CHANGE</span>
                   </div>
                   {bandNames.map(band => mkRow(
                     band.charAt(0).toUpperCase() + band.slice(1),
@@ -5193,8 +5306,19 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos })
 // ANNOTATION PANEL — floating draggable overlay
 // ══════════════════════════════════════════════════════════════
 function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setIsAddingAnnotation,
-  selectedAnnotationType, setSelectedAnnotationType, epochStart, epochEnd, epochSec, setCurrentEpoch, filename, onClose,
+  selectedAnnotationType, setSelectedAnnotationType, annotationConfidence, setAnnotationConfidence,
+  epochStart, epochEnd, epochSec, setCurrentEpoch, filename, onClose,
   panelPos, setPanelPos }) {
+  // Pseudonymous annotator label (local only). Re-render on change via local state mirror.
+  const [annotatorLabel, setAnnotatorLabelState] = useState(() => getAnnotatorLabel());
+  const annotatorId = hashAnnotator(annotatorLabel);
+  const updateAnnotator = (v) => { setAnnotatorLabel(v); setAnnotatorLabelState(v); };
+  // Concordant/discordant per annotation (descriptive only — needs ≥2 distinct annotators).
+  const agreement = agreementByAnnotation(annotations);
+  const AG_STYLE = {
+    concordant: { color: "#10b981", label: "concordant" },
+    discordant: { color: "#f59e0b", label: "discordant" },
+  };
   return (
     <FloatingPanel
       title="ANNOTATIONS"
@@ -5212,15 +5336,36 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
           <div style={{...microLabel,marginBottom:6}}>Type</div>
           <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
             {ANNOTATION_COLORS.map((ac,i)=>(
-              <button key={i} onClick={()=>setSelectedAnnotationType(i)} style={{
+              <button key={i} onClick={()=>setSelectedAnnotationType(i)}
+                title={`${ac.desc || ac.name}${ac.standard ? " · ACNS/ILAE standard term" : ""}`} style={{
                 padding:"3px 8px",borderRadius:0,fontSize:9,fontWeight:600,cursor:"pointer",
                 background:selectedAnnotationType===i?ac.color+"30":"#111",
                 border:`1px solid ${selectedAnnotationType===i?ac.color+"60":"#222"}`,
                 color:selectedAnnotationType===i?ac.color:"#666",
-              }}>{ac.name}</button>
+              }}>{ac.name}{ac.standard ? <span aria-hidden style={{opacity:0.5,marginLeft:3}}>✦</span> : null}</button>
             ))}
           </div>
-          <div style={{fontSize:10,color:"#444",marginTop:6}}>Click on the waveform to place</div>
+          {/* Optional confidence (descriptive, not a probability) */}
+          <div style={{...microLabel,margin:"8px 0 4px"}}>Confidence (optional)</div>
+          <div style={{display:"flex",gap:4}}>
+            {[["low","Low"],["med","Med"],["high","High"]].map(([v,lab])=>(
+              <button key={v} onClick={()=>setAnnotationConfidence&&setAnnotationConfidence(annotationConfidence===v?null:v)} style={{
+                padding:"3px 8px",borderRadius:0,fontSize:9,fontWeight:600,cursor:"pointer",
+                background:annotationConfidence===v?"#1a2a30":"#111",
+                border:`1px solid ${annotationConfidence===v?"#4a9bab":"#222"}`,
+                color:annotationConfidence===v?"#7ec8d9":"#666",
+              }}>{lab}</button>
+            ))}
+          </div>
+          {/* Annotator pseudonym — only the hashed id is ever stored/exported */}
+          <div style={{...microLabel,margin:"8px 0 4px"}}>Annotator (pseudonym)</div>
+          <input value={annotatorLabel} onChange={e=>updateAnnotator(e.target.value)} placeholder="e.g. tech-A"
+            title="Stored as an opaque hash on each annotation — your label is never exported or sent anywhere."
+            style={{width:"100%",background:"#0a0a0a",border:"1px solid #2a2a2a",color:"#ddd",fontSize:11,padding:"4px 6px",outline:"none",fontFamily:"'IBM Plex Mono', monospace",boxSizing:"border-box"}}/>
+          <div style={{fontSize:9,color:"#444",marginTop:3,fontFamily:"'IBM Plex Mono', monospace"}}>
+            {annotatorId ? `id: ${annotatorId}` : "anonymous (no annotator set)"}
+          </div>
+          <div style={{fontSize:10,color:"#444",marginTop:6}}>✦ = ACNS/ILAE standard term · click the waveform to place</div>
         </div>
       )}
       <div style={{flex:1,overflow:"auto",padding:"6px 0"}}>
@@ -5233,9 +5378,15 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
           }} onMouseEnter={e=>e.currentTarget.style.background="#151515"}
              onMouseLeave={e=>e.currentTarget.style.background=(ann.time>=epochStart&&ann.time<epochEnd)?"#111":"transparent"}>
             <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-              <div style={{display:"flex",alignItems:"center",gap:6}}>
+              <div style={{display:"flex",alignItems:"center",gap:6,minWidth:0}}>
                 <div style={{width:8,height:8,borderRadius:0,background:ann.color,flexShrink:0}}/>
                 <span style={{fontSize:11,fontWeight:600,color:ann.color}}>{ann.type}</span>
+                {agreement[ann.id] && (
+                  <span title={`Inter-rater: ${AG_STYLE[agreement[ann.id]].label} (≥2 annotators on this segment)`} style={{
+                    fontSize:8,fontWeight:700,letterSpacing:"0.04em",padding:"1px 4px",borderRadius:0,flexShrink:0,
+                    color:AG_STYLE[agreement[ann.id]].color, border:`1px solid ${AG_STYLE[agreement[ann.id]].color}55`,
+                  }}>{AG_STYLE[agreement[ann.id]].label.toUpperCase()}</span>
+                )}
               </div>
               <button onClick={e=>{e.stopPropagation();setAnnotations(annotations.filter(a=>a.id!==ann.id));}} style={{
                 background:"none",border:"none",color:"#333",cursor:"pointer",padding:2
@@ -5244,6 +5395,8 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
             <div style={{fontSize:10,color:"#555",marginTop:2}}>
               {Math.floor(ann.time/60)}:{String(Math.floor(ann.time%60)).padStart(2,"0")}.{String(Math.round((ann.time%1)*100)).padStart(2,"0")}
               {ann.duration>0&&<span> — {ann.duration.toFixed(1)}s</span>}
+              {ann.confidence&&<span style={{color:"#666"}}> · conf {ann.confidence}</span>}
+              {ann.annotatorId&&<span title="Opaque annotator id" style={{color:"#3a6b75"}}> · {ann.annotatorId}</span>}
             </div>
             {ann.text&&ann.text!==ann.type&&<div style={{fontSize:10,color:"#444",marginTop:2}}>{ann.text}</div>}
           </div>
@@ -5251,16 +5404,9 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
       </div>
       <div style={{padding:"8px 12px",borderTop:"1px solid #1a1a1a"}}>
         <button onClick={()=>{
-          // Annotation sidecar with provenance header — REACT EEG annotation schema v1
-          const sidecar = {
-            schemaVersion: SCHEMA_VERSION,
-            pipelineVersion: PIPELINE_VERSION,
-            appVersion: APP_VERSION,
-            sourceFilename: filename || null,
-            exportedAt: new Date().toISOString(),
-            annotationCount: annotations.length,
-            annotations,
-          };
+          // Annotation sidecar with provenance header — built via the shared sidecar helper
+          // so schema/pipeline/app stamps are identical to the patient-package writer.
+          const sidecar = buildAnnotationSidecar(annotations, filename);
           const blob=new Blob([JSON.stringify(sidecar,null,2)],{type:"application/json"});
           const url=URL.createObjectURL(blob); const a=document.createElement("a");
           a.href=url; a.download=`${filename||"annotations"}_annotations.json`; a.click(); URL.revokeObjectURL(url);
@@ -5657,6 +5803,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
   const [showAnnotationPanel, setShowAnnotationPanel] = useState(true);
   const [hoveredTime, setHoveredTime] = useState(null);
   const [annotationText, setAnnotationText] = useState("");
+  const [annotationConfidence, setAnnotationConfidence] = useState(null); // optional: "low"|"med"|"high"
   // Visibility state (hiddenChannels + forced overrides + cycleState) lives in a reducer —
   // see visibilityReducer at module scope. Setters below dispatch typed actions.
   const [visibility, visibilityDispatch] = useReducer(visibilityReducer, VISIBILITY_INITIAL);
@@ -5677,8 +5824,26 @@ function useEEGState(totalDuration = 600, edfData = null) {
   );
   const [showCustomPicker, setShowCustomPicker] = useState(false);
 
-  const allChannels = useMemo(() => getMontageChannels(montage, eegSystem, eegSystem === "custom" ? customElectrodes : null),
-    [montage, eegSystem, customElectrodes]);
+  // ── User-built bipolar montages (saved & reusable across files) ──
+  const [customMontages, setCustomMontages] = useState(() => loadCustomMontages());
+  const [showMontageBuilder, setShowMontageBuilder] = useState(false);
+  const persistCustomMontages = useCallback((updater) => {
+    setCustomMontages(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      saveCustomMontages(next);
+      return next;
+    });
+  }, []);
+
+  const allChannels = useMemo(() => {
+    // A custom montage is just the user's saved list of "A-B" pairs fed through the same
+    // bipolar-derivation pipeline as the presets (waveformData parses "A-B" → A − B).
+    if (montage.startsWith(CUSTOM_MONTAGE_PREFIX)) {
+      const cm = customMontages.find(m => CUSTOM_MONTAGE_PREFIX + m.id === montage);
+      return cm ? cm.pairs.slice() : [];
+    }
+    return getMontageChannels(montage, eegSystem, eegSystem === "custom" ? customElectrodes : null);
+  }, [montage, eegSystem, customElectrodes, customMontages]);
   // AUX_CHANNELS, EYE_CHANNELS, EYE_LEAD_ALIASES hoisted to CONFIGURATION block at top of file
   // visibilityState now derived from the visibility reducer above; setVisibilityState is gone
 
@@ -6009,8 +6174,8 @@ function useEEGState(totalDuration = 600, edfData = null) {
   const confirmAnnotation = () => {
     if (!annotationDraft) return;
     const t = ANNOTATION_COLORS[selectedAnnotationType];
-    setAnnotations([...annotations, { id: Date.now(), time: annotationDraft.time, duration: annotationDraft.duration,
-      type: t.name, color: t.color, text: annotationText || t.name, channel: -1 }]);
+    setAnnotations([...annotations, { id: Date.now(), code: t.code, time: annotationDraft.time, duration: annotationDraft.duration,
+      type: t.name, color: t.color, text: annotationText || t.name, channel: -1, ...annotationProvenance(annotationConfidence) }]);
     setAnnotationDraft(null); setAnnotationText(""); setIsAddingAnnotation(false);
   };
 
@@ -6101,6 +6266,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
   return {
     canvasRef, containerRef, montage, setMontage, eegSystem, setEegSystem,
     customElectrodes, setCustomElectrodes, showCustomPicker, setShowCustomPicker,
+    customMontages, persistCustomMontages, showMontageBuilder, setShowMontageBuilder,
     hpf, setHpf, lpf, setLpf, notch, setNotch,
     epochSec, setEpochSec: (v) => { setEpochSec(v); setCurrentEpoch(0); },
     currentEpoch, setCurrentEpoch, sensitivity, setSensitivity, sampleRate,
@@ -6109,6 +6275,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
     annotationText, setAnnotationText,
+    annotationConfidence, setAnnotationConfidence,
     hiddenChannels, toggleChannelVisibility, setAvailableElectrodes, visibilityState, cycleVisibility,
     channelSensitivity, adjustChannelSensitivity,
     channelHpf, setChannelHpf, channelLpf, setChannelLpf,
@@ -6337,7 +6504,7 @@ function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenRe
 // TAB: LIBRARY
 // ══════════════════════════════════════════════════════════════
 // ── CollectionsSidebar — left rail used by Library and Repository tabs ──
-function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recordsByCollection, totalRecordCount, onCreateCollection, onRenameCollection, onDeleteCollection }) {
+function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recordsByCollection, totalRecordCount, onCreateCollection, onRenameCollection, onDeleteCollection, showComplianceCriteria = false }) {
   const [showNew, setShowNew] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
@@ -6400,6 +6567,29 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
           );
         })}
       </div>
+
+      {showComplianceCriteria && (
+        <div data-tut="Compliance criteria: The fixed checklist a recording must meet to be promotion-eligible in the repository. A recording is compliant when none of these fail (Unknown is allowed)."
+          style={{borderTop:"1px solid #1a1a1a",background:"#080808",flexShrink:0,maxHeight:"42%",overflowY:"auto"}}>
+          <div style={{padding:"8px 12px 4px",position:"sticky",top:0,background:"#080808"}}>
+            <span style={{fontSize:9,fontWeight:700,color:"#4a9bab",letterSpacing:"0.1em"}}>COMPLIANCE CRITERIA</span>
+          </div>
+          <div style={{padding:"0 10px 10px"}}>
+            {COMPLIANCE_CRITERIA.map(c => (
+              <div key={c.id} title={c.desc} style={{display:"flex",alignItems:"baseline",gap:6,padding:"3px 2px",borderBottom:"1px solid #0f0f0f"}}>
+                <span style={{color:"#3a6b75",fontSize:9,lineHeight:1.3,flexShrink:0}}>▸</span>
+                <span style={{flex:1,minWidth:0}}>
+                  <div style={{fontSize:10,color:"#bbb",lineHeight:1.25}}>{c.label.replace(/\s*[≥≤].*$/,"").trim() || c.label}</div>
+                </span>
+                <span style={{fontSize:9,color:"#7ec8d9",fontFamily:"'IBM Plex Mono', monospace",flexShrink:0}}>{c.threshold}</span>
+              </div>
+            ))}
+            <div style={{fontSize:8,color:"#444",lineHeight:1.4,marginTop:6}}>
+              Promotion-eligible when no criterion fails. “Unknown” (e.g. impedance not stored) does not block.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -7050,7 +7240,8 @@ function RepositoryTab() {
         onSelect={setSelectedCollectionId} recordsByCollection={recordsByCollection}
         totalRecordCount={repoRecords.length}
         onCreateCollection={handleCreateCollection}
-        onDeleteCollection={handleDeleteCollection}/>
+        onDeleteCollection={handleDeleteCollection}
+        showComplianceCriteria/>
       <div style={{display:"flex",flexDirection:"column",flex:1,overflow:"hidden",minWidth:0}}>
         {/* Stats */}
         <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:1,background:"#1a1a1a",borderBottom:"1px solid #1a1a1a"}}>
@@ -7438,8 +7629,6 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
     // Hardware
     hardwareManufacturer:"",hardwareModel:"",adcResolution:"24",
     fdaCleared:false,electrodeType:"gold_cup",applicationMethod:"paste",
-    // Impedance
-    impedanceLog:{},impedanceCheckedAt:null,
   });
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileInfo, setFileInfo] = useState(null);
@@ -7475,7 +7664,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
             }
           }
           if (bundle.annotations && setAnnotationsMap) {
-            setAnnotationsMap(prev => ({ ...prev, [rec.filename]: bundle.annotations }));
+            setAnnotationsMap(prev => ({ ...prev, [rec.filename]: migrateAnnotations(bundle.annotations) }));
           }
           if (bundle.clinicalNotes && setClinicalNotesMap) {
             setClinicalNotesMap(prev => ({ ...prev, [rec.filename]: bundle.clinicalNotes }));
@@ -7659,9 +7848,6 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
         fdaCleared: form.fdaCleared, electrodeType: form.electrodeType,
         applicationMethod: form.applicationMethod,
       },
-      // Impedance
-      impedanceLog: Object.keys(form.impedanceLog).length > 0 ? form.impedanceLog : null,
-      impedanceCheckedAt: form.impedanceCheckedAt,
     };
 
     // Helper: convert EDF+ TAL annotations to the app's annotation shape and
@@ -7812,29 +7998,10 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
       </div>
     </div>
 
-    {/* ── IMPEDANCE LOG ── */}
-    <div style={{borderTop:"1px solid #1a1a1a",paddingTop:12,marginBottom:16}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
-        <span style={{fontSize:10,color:"#4a9bab",fontWeight:700,letterSpacing:"0.1em"}}>IMPEDANCE LOG (kΩ)</span>
-        <button type="button" onClick={()=>setForm(p=>({...p,impedanceCheckedAt:new Date().toISOString()}))} style={{padding:"3px 8px",fontSize:9,background:"#111",border:"1px solid #222",color:"#7ec8d9",cursor:"pointer"}}>Set Timestamp</button>
-      </div>
-      {form.impedanceCheckedAt && <div style={{fontSize:9,color:"#555",marginBottom:6}}>Checked: {new Date(form.impedanceCheckedAt).toLocaleString()}</div>}
-      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:"4px 8px"}}>
-        {["Fp1","Fp2","F7","F3","Fz","F4","F8","T3","C3","Cz","C4","T4","T5","P3","Pz","P4","T6","O1","O2","A1","A2"].map(ch=>{
-          const val = form.impedanceLog[ch] ?? "";
-          const numVal = parseFloat(val);
-          const pass = !isNaN(numVal) && numVal <= 5;
-          const fail = !isNaN(numVal) && numVal > 5;
-          return <div key={ch} style={{display:"flex",alignItems:"center",gap:3}}>
-            <span style={{fontSize:8,color:fail?"#f87171":pass?"#22c55e":"#555",fontWeight:700,width:22}}>{ch}</span>
-            <input type="number" step="0.1" min="0" max="99" value={val}
-              onChange={e=>setForm(p=>({...p,impedanceLog:{...p.impedanceLog,[ch]:e.target.value}}))}
-              style={{...inputStyle,padding:"2px 4px",fontSize:10,width:"100%",borderColor:fail?"#ef444440":pass?"#22c55e40":"#2a2a2a"}}
-              placeholder="—"/>
-          </div>
-        })}
-      </div>
-    </div>
+    {/* Impedance is a dynamic, per-electrode value measured at acquisition — a single
+        number entered at import time isn't meaningful, so it is no longer collected here.
+        When a recording carries impedance, it is read from the EDF and shown via the
+        Impedance button in Review. The compliance cutoff still applies (≤ 5 kΩ). */}
 
     {/* Read-only file metadata — shown after EDF file selection */}
     {selectedFile && fileInfo && (
@@ -7926,6 +8093,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   const [topoPanelPos, setTopoPanelPos] = useState({ x: null, y: null });
   const [showCompliance, setShowCompliance] = useState(false);
   const [compliancePanelPos, setCompliancePanelPos] = useState({ x: null, y: null });
+  const [showRevImpedance, setShowRevImpedance] = useState(false);
   const [showSpectrogram, setShowSpectrogram] = useState(false);
   const [spectrogramPanelPos, setSpectrogramPanelPos] = useState({ x: null, y: null });
   const [showChannelPicker, setShowChannelPicker] = useState(false);
@@ -8050,7 +8218,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
     if (!eeg.annotationDraft) return;
     const t = ANNOTATION_COLORS[eeg.selectedAnnotationType];
     setAnnotations([...annotations, { id: Date.now(), time: eeg.annotationDraft.time, duration: eeg.annotationDraft.duration,
-      type: t.name, color: t.color, text: eeg.annotationText || t.name, channel: -1 }]);
+      code: t.code, type: t.name, color: t.color, text: eeg.annotationText || t.name, channel: -1, ...annotationProvenance(eeg.annotationConfidence) }]);
     eeg.setAnnotationDraft(null); eeg.setAnnotationText(""); eeg.setIsAddingAnnotation(false);
   };
 
@@ -8349,6 +8517,9 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             <button data-tut="Compliance: Checks this recording's duration, channel count, impedances and PHI against protocol standards. The number in the label is how many checks failed." onClick={(e)=>{e.stopPropagation();setShowCompliance(prev => !prev);}} style={controlBtn(showCompliance)}>
               <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Shield()} Compliance{record?.complianceResult?.failCount > 0 ? ` (${record.complianceResult.failCount})` : ""}</span>
             </button>
+            <button data-tut="Impedance: Shows per-electrode impedance read from the EDF, if the recording stored it. Impedance is a dynamic value measured at acquisition; the compliance cutoff is ≤ 5 kΩ." onClick={(e)=>{e.stopPropagation();setShowRevImpedance(true);}} style={controlBtn()}>
+              <span style={{display:"flex",alignItems:"center",gap:4}}>{I.Zap(12)} Impedance{edfData?.impedances?.length ? ` (${edfData.impedances.length})` : ""}</span>
+            </button>
             <button data-tut="Data Sheet: Generates a printable single-page summary — metadata, band powers and topography — in a new window, ready to print or save as PDF." onClick={(e)=>{
               e.stopPropagation();
               if (!record) return;
@@ -8421,9 +8592,20 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
               {I.Edit(10)}
             </button>
           )}
-          <select title="Montage" data-tut="Montage: Sets how channels are derived and arranged — e.g. bipolar longitudinal (banana), referential, or transverse — changing what each trace represents." value={eeg.montage} onChange={e=>eeg.setMontage(e.target.value)} style={{...selectStyle,width:200}}>
+          <select title="Montage" data-tut="Montage: Sets how channels are derived and arranged — e.g. bipolar longitudinal (banana), referential, or transverse — changing what each trace represents. Custom montages you build appear at the bottom." value={eeg.montage} onChange={e=>eeg.setMontage(e.target.value)} style={{...selectStyle,width:200}}>
             {Object.entries(MONTAGE_DEFS).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
+            {eeg.customMontages.length > 0 && (
+              <optgroup label="Custom montages">
+                {eeg.customMontages.map(m=><option key={m.id} value={CUSTOM_MONTAGE_PREFIX+m.id}>{m.name} ({m.pairs.length} ch)</option>)}
+              </optgroup>
+            )}
           </select>
+          <button title={eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "Edit this custom montage" : "Build a custom bipolar montage"}
+            data-tut="Montage builder: Create a bipolar montage from any two electrodes. Saved montages persist and are reusable across recordings."
+            onClick={()=>eeg.setShowMontageBuilder(true)}
+            style={{padding:"3px 8px",background:"#111",border:"1px solid #4a9bab",borderRadius:2,color:"#7ec8d9",cursor:"pointer",fontSize:10,fontWeight:700,whiteSpace:"nowrap"}}>
+            {eeg.montage.startsWith(CUSTOM_MONTAGE_PREFIX) ? "✎ Edit" : "+ Build"}
+          </button>
           <select title="LFF (Hz)" data-tut="LFF (Low-Frequency Filter): The high-pass cutoff — frequencies below this are attenuated to remove slow drift. Lower values (down to 0.01 Hz) preserve slow waves for research." value={eeg.hpf} onChange={e=>eeg.setHpf(parseFloat(e.target.value))} style={selectStyle}>
             {LFF_OPTIONS.map(v=><option key={v} value={v}>LFF {v===0?"Off":`${v} Hz`}</option>)}
           </select>
@@ -8462,6 +8644,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
         <AnnotationPanel annotations={annotations} setAnnotations={setAnnotations}
           isAddingAnnotation={eeg.isAddingAnnotation} setIsAddingAnnotation={eeg.setIsAddingAnnotation}
           selectedAnnotationType={eeg.selectedAnnotationType} setSelectedAnnotationType={eeg.setSelectedAnnotationType}
+          annotationConfidence={eeg.annotationConfidence} setAnnotationConfidence={eeg.setAnnotationConfidence}
           epochStart={eeg.epochStart} epochEnd={eeg.epochEnd} epochSec={eeg.epochSec}
           setCurrentEpoch={eeg.setCurrentEpoch} filename={filename}
           onClose={()=>setShowAnnotations(false)}
@@ -8486,6 +8669,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             setRecords(prev => prev.map(r => r.id === record.id ? { ...r, complianceResult: result } : r));
           }}
           panelPos={compliancePanelPos} setPanelPos={setCompliancePanelPos}/>
+      )}
+
+      {/* Review impedance viewer — read-only, from EDF (if present) */}
+      {showRevImpedance && (
+        <ImpedancePanel impedances={edfData?.impedances || []} readOnly
+          onClose={()=>setShowRevImpedance(false)} onAccept={()=>setShowRevImpedance(false)}/>
       )}
 
       {/* Floating differential comparison panel (baseline → comparison) */}
@@ -8521,6 +8710,18 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
         <CustomElectrodePicker customElectrodes={eeg.customElectrodes}
           setCustomElectrodes={eeg.setCustomElectrodes}
           onClose={()=>eeg.setShowCustomPicker(false)}/>
+      )}
+
+      {eeg.showMontageBuilder && (
+        <MontageBuilderPanel
+          availableElectrodes={(() => {
+            const seen = new Set(); const out = [];
+            (edfData?.channelLabels || []).forEach(l => { const e = extractElectrodeName(l); if (e && !seen.has(e)) { seen.add(e); out.push(e); } });
+            return out;
+          })()}
+          customMontages={eeg.customMontages} persistCustomMontages={eeg.persistCustomMontages}
+          montage={eeg.montage} setMontage={eeg.setMontage}
+          onClose={()=>eeg.setShowMontageBuilder(false)}/>
       )}
 
       {/* Channel context menu */}
@@ -8581,6 +8782,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
 // ══════════════════════════════════════════════════════════════
 const DEVICE_PROTOCOLS = {
   brainflow: { label: "OpenBCI", color: "#3B82F6", desc: "Direct board API" },
+  websocket: { label: "piEEG / WS", color: "#10B981", desc: "Live stream over local WebSocket bridge" },
   simulated: { label: "Simulated", color: "#F59E0B", desc: "Test signals" },
 };
 
@@ -8628,6 +8830,7 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
               sampleRate: dev?.maxSr ? Math.min(256, dev.maxSr) : 256,
               channels: dev?.channels || 19,
               port: dev?.port || "",
+              bridgeUrl: dev?.bridgeUrl || prev.bridgeUrl || "ws://localhost:8765",
             }));
           }} style={{...selectStyle,width:"100%",maxWidth:400,padding:"6px 8px",fontSize:12}}>
             {DEVICE_CATALOG.map(d => (
@@ -8643,6 +8846,14 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
           <div><div style={microLabel}>Port</div>
             <input value={deviceConfig.port} onChange={e=>setDeviceConfig({...deviceConfig,port:e.target.value})}
               placeholder="COM3" style={{...selectStyle,width:80,padding:"5px 8px"}}/></div>
+        )}
+
+        {/* Bridge URL for WebSocket devices (piEEG) */}
+        {selectedDevice && selectedDevice.protocol === "websocket" && (
+          <div><div style={microLabel}>Bridge URL</div>
+            <input value={deviceConfig.bridgeUrl||""} onChange={e=>setDeviceConfig({...deviceConfig,bridgeUrl:e.target.value})}
+              placeholder="ws://localhost:8765" title="Local Python/BrainFlow → WebSocket bridge that streams piEEG samples"
+              style={{...selectStyle,width:180,padding:"5px 8px"}}/></div>
         )}
 
         {/* Action buttons */}
@@ -9086,8 +9297,9 @@ function PatternTable({ eegSystem, montage, channels, allChannels, hiddenChannel
 // ══════════════════════════════════════════════════════════════
 // IMPEDANCE CHECK PANEL
 // ══════════════════════════════════════════════════════════════
-function ImpedancePanel({ impedances, onClose, onAccept }) {
-  const allGood = impedances.every(e => e.status !== "poor");
+function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false }) {
+  const list = Array.isArray(impedances) ? impedances : [];
+  const allGood = list.length > 0 && list.every(e => e.status !== "poor");
   const dialogRef = useRef(null);
   useFocusTrap(dialogRef, true, onClose);
   return (
@@ -9095,14 +9307,20 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
       <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="impedance-modal-title" style={{background:"#111",border:"1px solid #2a2a2a",borderRadius:0,padding:24,width:560,maxHeight:"80vh",overflow:"auto"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
           <div>
-            <h3 id="impedance-modal-title" style={{margin:0,color:"#e0e0e0",fontSize:14,fontWeight:700}}>Impedance Check</h3>
-            <span style={{fontSize:10,color:"#555"}}>All electrodes should be below 10 kΩ for quality recording</span>
+            <h3 id="impedance-modal-title" style={{margin:0,color:"#e0e0e0",fontSize:14,fontWeight:700}}>{readOnly ? "Impedance (from EDF)" : "Impedance Check"}</h3>
+            <span style={{fontSize:10,color:"#555"}}>{readOnly ? "Compliance cutoff is ≤ 5 kΩ per electrode." : "All electrodes should be below 10 kΩ for quality recording"}</span>
           </div>
           <button onClick={onClose} aria-label="Close impedance check" style={{background:"none",border:"none",color:"#666",cursor:"pointer"}}>{I.X()}</button>
         </div>
 
+        {list.length === 0 ? (
+          <div style={{padding:"24px 8px",textAlign:"center",color:"#666",fontSize:12,lineHeight:1.6}}>
+            No impedance data in this recording.<br/>
+            <span style={{fontSize:10,color:"#444"}}>Standard EDF rarely stores impedance; it is a dynamic value captured at acquisition. Compliance reports this as “Unknown”.</span>
+          </div>
+        ) : (
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(120px,1fr))",gap:6,marginBottom:20}}>
-          {impedances.map((e,i) => (
+          {list.map((e,i) => (
             <div key={i} style={{
               background:"#0a0a0a",border:`1px solid ${e.status==="good"?"#1a4a5440":e.status==="fair"?"#854d0e40":"#991b1b40"}`,
               borderRadius:0,padding:"8px 10px",display:"flex",alignItems:"center",justifyContent:"space-between",
@@ -9114,6 +9332,7 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
             </div>
           ))}
         </div>
+        )}
 
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
           <div style={{display:"flex",gap:16,fontSize:10}}>
@@ -9121,6 +9340,9 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
             <span style={{color:"#facc15"}}>● 5-10kΩ Fair</span>
             <span style={{color:"#f87171"}}>● &gt;10kΩ Poor</span>
           </div>
+          {readOnly ? (
+            <button onClick={onClose} style={{padding:"6px 18px",background:"#111",border:"1px solid #333",borderRadius:0,color:"#888",cursor:"pointer",fontSize:11,fontWeight:700}}>Close</button>
+          ) : (
           <div style={{display:"flex",gap:8}}>
             <button onClick={onClose} style={{padding:"6px 14px",background:"#111",border:"1px solid #333",borderRadius:0,color:"#888",cursor:"pointer",fontSize:11,fontWeight:600}}>Re-check</button>
             <button onClick={onAccept} style={{
@@ -9129,6 +9351,7 @@ function ImpedancePanel({ impedances, onClose, onAccept }) {
               color:allGood?"#7ec8d9":"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700
             }}>{allGood?"Accept & Ready":"Accept Anyway"}</button>
           </div>
+          )}
         </div>
       </div>
     </div>
@@ -9164,10 +9387,13 @@ function AcquireTab() {
   // Auto-hide channels that don't match the hardware's available electrodes
   useEffect(() => {
     if (!selectedDevice) return;
-    const hw = OPENBCI_CHANNEL_MAP[selectedDevice.id];
+    const hw = OPENBCI_CHANNEL_MAP[selectedDevice.id] || PIEEG_CHANNEL_MAP[selectedDevice.id];
     if (hw) eeg.setAvailableElectrodes(new Set(hw));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDevice?.id, eeg.montage, eeg.eegSystem]);
+
+  // Close any open bridge socket when the Acquire tab unmounts.
+  useEffect(() => () => { if (wsRef.current) { try { wsRef.current.close(); } catch {} } }, []);
 
   // Use app-level annotations keyed by acquire filename
   const acqFilename = subjectId ? generateFilename(subjectId, studyType, new Date().toISOString().split("T")[0]) : "acquire-session";
@@ -9182,25 +9408,96 @@ function AcquireTab() {
     if (!eeg.annotationDraft) return;
     const t = ANNOTATION_COLORS[eeg.selectedAnnotationType];
     setAnnotations([...annotations, { id: Date.now(), time: eeg.annotationDraft.time, duration: eeg.annotationDraft.duration,
-      type: t.name, color: t.color, text: eeg.annotationText || t.name, channel: -1 }]);
+      code: t.code, type: t.name, color: t.color, text: eeg.annotationText || t.name, channel: -1, ...annotationProvenance(eeg.annotationConfidence) }]);
     eeg.setAnnotationDraft(null); eeg.setAnnotationText(""); eeg.setIsAddingAnnotation(false);
   };
 
   // Device state
   const [connectionState, setConnectionState] = useState(CONN.disconnected);
-  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 125, channels: 16, port: "COM3" });
+  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 125, channels: 16, port: "COM3", bridgeUrl: "ws://localhost:8765" });
   const [impedances, setImpedances] = useState(null);
   const [showImpedance, setShowImpedance] = useState(false);
 
-  // Connection flow — real BrainFlow / LSL hardware integration is not yet implemented,
-  // so every connect attempt resolves to CONN.error until the native bridge lands.
+  // ── Live WebSocket bridge (piEEG and other protocol:"websocket" devices) ──
+  // The browser cannot talk to a Pi HAT / BrainFlow board directly, so a small local
+  // bridge process (Python/BrainFlow → WebSocket) streams frames here. Protocol:
+  //   • text JSON  {type:"samples", data:[[c0,c1,...],...]}  — one inner array per time-frame
+  //   • text JSON  {type:"impedance", values:[kΩ,...]}        — per-channel impedance
+  //   • binary     Float32 buffer, channel-interleaved per frame
+  // We buffer samples while recording and flush them to a real EDF on stop.
+  const wsRef = useRef(null);
+  const liveBufRef = useRef(null);   // { labels:[], data:[[]...], sr }
+  const recordingRef = useRef(false);
+
+  const appendSamples = (rows) => {
+    if (!recordingRef.current) return;          // only capture while recording
+    const buf = liveBufRef.current; if (!buf) return;
+    for (const row of rows) {
+      for (let c = 0; c < buf.data.length; c++) buf.data[c].push(Number(row[c]) || 0);
+    }
+  };
+  const handleWsMessage = (ev) => {
+    const labels = liveBufRef.current?.labels || [];
+    if (typeof ev.data === "string") {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "impedance" || msg.cmd === "impedance") {
+        const vals = msg.values || msg.impedances || [];
+        const imp = vals.map((v, i) => ({ name: labels[i] || `Ch${i + 1}`, value: Math.round(v * 10) / 10, status: v <= 5 ? "good" : v <= 10 ? "fair" : "poor" }));
+        setImpedances(imp.length ? imp : generateImpedances(selectedDevice?.channels || 8));
+        setConnectionState(CONN.impedance); setShowImpedance(true);
+      } else if (msg.type === "samples" && Array.isArray(msg.data)) {
+        appendSamples(msg.data);
+      }
+    } else if (ev.data instanceof ArrayBuffer) {
+      const arr = new Float32Array(ev.data);
+      const ch = labels.length || 1;
+      const rows = [];
+      for (let i = 0; i + ch <= arr.length; i += ch) {
+        const row = new Array(ch);
+        for (let c = 0; c < ch; c++) row[c] = arr[i + c];
+        rows.push(row);
+      }
+      appendSamples(rows);
+    }
+  };
+
+  // Connection flow. WebSocket devices (piEEG) open a real client to the local bridge;
+  // BrainFlow direct-board integration is still pending and resolves to an error.
   const handleConnect = useCallback(() => {
     if (!selectedDevice) return;
     setConnectionState(CONN.connecting);
+
+    if (selectedDevice.protocol === "websocket") {
+      const url = deviceConfig.bridgeUrl || selectedDevice.bridgeUrl || "ws://localhost:8765";
+      const labels = PIEEG_CHANNEL_MAP[selectedDevice.id] || ELECTRODE_SETS["10-20"].slice(0, selectedDevice.channels);
+      liveBufRef.current = { labels, data: labels.map(() => []), sr: deviceConfig.sampleRate || selectedDevice.maxSr || 250 };
+      let ws;
+      try { ws = new WebSocket(url); ws.binaryType = "arraybuffer"; }
+      catch { setConnectionState(CONN.error); notify(`Invalid bridge URL: ${url}`, "error"); return; }
+      wsRef.current = ws;
+      let errored = false, opened = false;
+      const fail = () => {
+        if (errored) return; errored = true; clearTimeout(to);
+        setConnectionState(CONN.error);
+        notify(`piEEG bridge unreachable at ${url}. Start the bridge process and retry.`, "error");
+      };
+      const to = setTimeout(() => { if (ws.readyState !== WebSocket.OPEN) { try { ws.close(); } catch {} fail(); } }, 4000);
+      ws.onopen = () => { opened = true; clearTimeout(to); setConnectionState(CONN.connected); try { ws.send(JSON.stringify({ cmd: "impedance" })); } catch {} };
+      ws.onmessage = handleWsMessage;
+      ws.onerror = () => fail();
+      // Only treat a close as a clean disconnect if we actually had an open session.
+      ws.onclose = () => { clearTimeout(to); if (errored) return; if (opened) setConnectionState(CONN.disconnected); else fail(); };
+      return;
+    }
+
+    // BrainFlow direct-board integration not yet implemented.
     setTimeout(() => { setConnectionState(CONN.error); }, 2000);
-  }, [selectedDevice]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDevice, deviceConfig]);
 
   const handleDisconnect = () => {
+    if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
+    recordingRef.current = false;
     setConnectionState(CONN.disconnected);
     setImpedances(null);
     setShowImpedance(false);
@@ -9232,23 +9529,35 @@ function AcquireTab() {
 
   const startRecording = () => {
     if (!subjectId || connectionState < CONN.ready) return;
+    // Reset the live capture buffer so this recording starts clean.
+    if (liveBufRef.current) liveBufRef.current.data = liveBufRef.current.labels.map(() => []);
+    recordingRef.current = true;
     setIsRecording(true); setIsPaused(false); setElapsedSec(0); eeg.setCurrentEpoch(0);
   };
   const stopRecording = () => {
     setIsRecording(false); setIsPaused(false);
+    recordingRef.current = false;
     if (!subjectId || elapsedSec < 1) return;
 
     const today = new Date().toISOString().split("T")[0];
     const acqFile = generateFilename(subjectId, studyType, today);
-    const sr = deviceConfig.sampleRate || 256;
     const actualDurationSec = elapsedSec;
-    const totalSamples = sr * actualDurationSec;
 
-    // Empty channel data — real hardware integration will replace this with the
-    // streamed sample buffer. For now we save a valid-but-flat EDF so the record
-    // schema stays consistent.
-    const electrodes = ELECTRODE_SETS[eeg.eegSystem] || ELECTRODE_SETS["10-20"];
-    const channelData = electrodes.map(() => new Float32Array(totalSamples));
+    // Prefer the captured live buffer (piEEG/WebSocket). When no real samples were
+    // streamed (e.g. BrainFlow not yet wired), fall back to a valid-but-flat EDF so the
+    // record schema stays consistent.
+    const liveBuf = liveBufRef.current;
+    const hasLive = selectedDevice?.protocol === "websocket" && liveBuf && liveBuf.data.some(a => a.length > 0);
+    let electrodes, channelData, sr;
+    if (hasLive) {
+      electrodes = liveBuf.labels;
+      channelData = liveBuf.data.map(a => Float32Array.from(a));
+      sr = liveBuf.sr || deviceConfig.sampleRate || 250;
+    } else {
+      sr = deviceConfig.sampleRate || 256;
+      electrodes = ELECTRODE_SETS[eeg.eegSystem] || ELECTRODE_SETS["10-20"];
+      channelData = electrodes.map(() => new Float32Array(sr * actualDurationSec));
+    }
 
     // Build EDF binary and parse it back
     const edfBuffer = buildEDFFile({
@@ -9307,6 +9616,7 @@ function AcquireTab() {
   const togglePause = () => {
     const next = !isPaused;
     setIsPaused(next);
+    recordingRef.current = !next && isRecording;  // pause halts live capture
     if (next) setShowAnnotations(true);  // auto-open annotation panel on pause
   };
 
@@ -9481,6 +9791,7 @@ function AcquireTab() {
         <AnnotationPanel annotations={annotations} setAnnotations={setAnnotations}
           isAddingAnnotation={eeg.isAddingAnnotation} setIsAddingAnnotation={eeg.setIsAddingAnnotation}
           selectedAnnotationType={eeg.selectedAnnotationType} setSelectedAnnotationType={eeg.setSelectedAnnotationType}
+          annotationConfidence={eeg.annotationConfidence} setAnnotationConfidence={eeg.setAnnotationConfidence}
           epochStart={eeg.epochStart} epochEnd={eeg.epochEnd} epochSec={eeg.epochSec}
           setCurrentEpoch={eeg.setCurrentEpoch} filename={acqFilename}
           onClose={()=>setShowAnnotations(false)}
