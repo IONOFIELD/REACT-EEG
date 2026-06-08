@@ -2,7 +2,8 @@
 
 Rapid Electroencephalographic Audit of Cortical Trends
 
-De-identified EEG file management, waveform review, and live acquisition platform.
+The newest edition of REACT EEG — a fully fleshed-out library and analysis tool for EEGs:
+de-identified EEG file management, waveform review, and live acquisition.
 
 REACT EEG, LLC - 2026
 

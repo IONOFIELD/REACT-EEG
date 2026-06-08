@@ -3,8 +3,10 @@ import react from '@vitejs/plugin-react'
 import { viteSingleFile } from 'vite-plugin-singlefile'
 
 // Two build modes:
-//   `npm run build`           → standard chunked build for GitHub Pages (base /react-build-v11/)
+//   `npm run build`           → standard chunked build for GitHub Pages (base /REACT-EEG/)
 //   `npm run build:single`    → one self-contained dist-single/index.html for sharing
+// NOTE: the Pages base path must match the GitHub repo name (project site serves at
+// https://<user>.github.io/<repo>/). Repo: IONOFIELD/REACT-EEG.
 export default defineConfig(({ mode }) => {
   const isSingle = mode === 'singlefile'
   return {
@@ -12,7 +14,7 @@ export default defineConfig(({ mode }) => {
       react(),
       ...(isSingle ? [viteSingleFile()] : []),
     ],
-    base: isSingle ? './' : '/react-build-v11/',
+    base: isSingle ? './' : '/REACT-EEG/',
     build: isSingle
       ? {
           outDir: 'dist-single',
