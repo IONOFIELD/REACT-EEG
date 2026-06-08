@@ -1,13 +1,32 @@
 {
   "schemaVersion": "v14.1",
+  "note": "Curated set of real, public-domain human EEG recordings, re-named to REACT's PHI-free convention and header-scrubbed. Two source datasets: PhysioNet EEGMMIDB (64-ch motor/imagery) and PhysioNet eegmat / Zyma et al. (23-ch 10-20 mental-arithmetic). Each file references its dataset via `source`; full citations + licenses are in `sources`. Additional EEGMMIDB EDFs are staged in /seed-edfs-archive/.",
+  "sources": {
+    "eegmmidb": {
+      "name": "PhysioNet EEG Motor Movement/Imagery Dataset (EEGMMIDB) v1.0.0",
+      "url": "https://physionet.org/content/eegmmidb/1.0.0/",
+      "license": "ODC-By 1.0 (Open Data Commons Attribution)",
+      "citation": "Schalk, G., McFarland, D.J., Hinterberger, T., Birbaumer, N., Wolpaw, J.R. BCI2000: A General-Purpose Brain-Computer Interface (BCI) System. IEEE Transactions on Biomedical Engineering 51(6):1034-1043, 2004.",
+      "citationResource": "Goldberger, A.L., Amaral, L.A.N., Glass, L., et al. PhysioBank, PhysioToolkit, and PhysioNet: Components of a New Research Resource for Complex Physiologic Signals. Circulation 101(23):e215-e220, 2000.",
+      "hardware": { "manufacturer": "BCI2000 / g.tec", "model": "g.MOBIlab+", "adcResolution": 16, "fdaCleared": false, "electrodeType": "active", "applicationMethod": "cap" }
+    },
+    "eegmat": {
+      "name": "PhysioNet EEG During Mental Arithmetic Tasks (eegmat) v1.0.0",
+      "url": "https://physionet.org/content/eegmat/1.0.0/",
+      "license": "CC BY 4.0 (Creative Commons Attribution 4.0)",
+      "citation": "Zyma, I.; Tukaev, S.; Seleznov, I.; Kiyono, K.; Popov, A.; Chernykh, M.; Shpenkov, O. Electroencephalograms during Mental Arithmetic Task Performance. Data 2019, 4, 14. https://doi.org/10.3390/data4010014",
+      "citationResource": "Goldberger, A.L., Amaral, L.A.N., Glass, L., et al. PhysioBank, PhysioToolkit, and PhysioNet: Components of a New Research Resource for Complex Physiologic Signals. Circulation 101(23):e215-e220, 2000.",
+      "hardware": { "manufacturer": "Neurocom (XAI-MEDICA, Ukraine)", "model": "Neurocom EEG 23-channel", "adcResolution": 16, "fdaCleared": false, "electrodeType": "Ag/AgCl", "applicationMethod": "10-20 scalp" }
+    }
+  },
   "source": "PhysioNet EEG Motor Movement/Imagery Dataset (EEGMMIDB) v1.0.0",
   "sourceUrl": "https://physionet.org/content/eegmmidb/1.0.0/",
   "license": "ODC-By 1.0 (Open Data Commons Attribution)",
   "citation": "Schalk, G., McFarland, D.J., Hinterberger, T., Birbaumer, N., Wolpaw, J.R. BCI2000: A General-Purpose Brain-Computer Interface (BCI) System. IEEE Transactions on Biomedical Engineering 51(6):1034-1043, 2004.",
-  "note": "Curated set of real human EEG recordings from PhysioNet's EEGMMIDB, re-named to REACT's PHI-free convention. Spans two same-subject sessions (S001 R01/R02 — for Subject Timeline demo), two additional baselines (S004, S007), and one task recording (S010 motor R03). 64-channel BCI2000, ~1-2 minutes each. Additional EDFs are staged in /seed-edfs-archive/ for easy re-addition.",
   "files": [
     {
       "path": "S001R01-eyes-open.edf",
+      "source": "eegmmidb",
       "subjectId": "PHY-S001",
       "studyType": "BL",
       "date": "2025-10-12",
@@ -18,6 +37,7 @@
     },
     {
       "path": "S001R02-eyes-closed.edf",
+      "source": "eegmmidb",
       "subjectId": "PHY-S001",
       "studyType": "FU",
       "date": "2025-12-04",
@@ -28,6 +48,7 @@
     },
     {
       "path": "S004R01-eyes-open.edf",
+      "source": "eegmmidb",
       "subjectId": "PHY-S004",
       "studyType": "BL",
       "date": "2025-09-15",
@@ -38,6 +59,7 @@
     },
     {
       "path": "S007R02-eyes-closed.edf",
+      "source": "eegmmidb",
       "subjectId": "PHY-S007",
       "studyType": "BL",
       "date": "2025-11-20",
@@ -48,11 +70,34 @@
     },
     {
       "path": "S010R03-left-right-fist.edf",
+      "source": "eegmmidb",
       "subjectId": "PHY-S010",
       "studyType": "RT",
       "date": "2026-01-08",
       "task": "Routine EEG with motor task (left/right fist)",
       "durationSec": 124,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "MAT-S00-rest.edf",
+      "source": "eegmat",
+      "subjectId": "MAT-S00",
+      "studyType": "BL",
+      "date": "2025-11-05",
+      "task": "Resting baseline (pre-task)",
+      "durationSec": 60,
+      "sex": "",
+      "age": null
+    },
+    {
+      "path": "MAT-S00-arithmetic.edf",
+      "source": "eegmat",
+      "subjectId": "MAT-S00",
+      "studyType": "RT",
+      "date": "2025-11-05",
+      "task": "Mental arithmetic (serial subtraction)",
+      "durationSec": 60,
       "sex": "",
       "age": null
     }

@@ -40,6 +40,10 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v18.5", items: [
+    "Default library gains two mental-arithmetic recordings (resting baseline + serial-subtraction task, same subject) from the PhysioNet eegmat / Zyma et al. dataset — 23-ch 10-20 @ 500 Hz, de-identified and header-scrubbed. Complements the 64-ch EEGMMIDB seeds with a different paradigm and a lower-density montage",
+    "Seed attribution is now per-dataset: the manifest carries a sources map (EEGMMIDB ODC-By + eegmat CC-BY, with the PhysioNet/Goldberger resource citation), and each record stamps its own dataset, license and hardware. New datasets added to the manifest now reconcile into existing libraries on load instead of only on first launch",
+  ]},
   { version: "v18.4", items: [
     "Spectrogram (STFT) expanded from one-channel-at-a-time to regional scopes — Global, Left/Right hemisphere, and per-lobe (Frontal/Central/Temporal/Parietal/Occipital), built directly from the EDF's scalp electrodes with power averaged across the region. Window lengthened to 30 s for reading frequency/state trends over time; greyscale colormap removed",
     "Added Alpha-Delta Ratio (alpha ÷ delta power) across the qEEG panel, topographic ratio strip, Data Sheet, and the before→after Compare panel — a descriptive state/slowing index (higher = more alert/alpha-dominant, lower = slower)",
@@ -2099,7 +2103,7 @@ const selectStyle = {
  * into a library record. Returns [] if the manifest is unreachable (e.g. single-file
  * builds without server access).
  */
-async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
+async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap, existingPaths = new Set()) {
   const base = (typeof import.meta !== "undefined" && import.meta.env?.BASE_URL) || "/";
   const manifestUrl = `${base}seed-edfs/manifest.json`.replace(/\/+/g, "/").replace(":/", "://");
   let manifest;
@@ -2114,6 +2118,7 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
 
   const records = [];
   for (const def of (manifest.files || [])) {
+    if (existingPaths.has(def.path)) continue; // already in the library — don't duplicate
     try {
       const edfRes = await fetch(`${base}seed-edfs/${def.path}`.replace(/\/+/g, "/").replace(":/", "://"));
       if (!edfRes.ok) { console.warn(`[REACT] Real-seed fetch ${def.path}: ${edfRes.status}`); continue; }
@@ -2140,6 +2145,12 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
         setAnnotationsMap(prev => ({ ...prev, [reactFilename]: converted }));
       }
       const fileSizeMB = Math.round(edfBuffer.byteLength / 1024 / 1024 * 10) / 10;
+      // Resolve the file's source dataset (per-file `source` → manifest.sources entry), falling
+      // back to the legacy top-level fields so single-source manifests still work.
+      const src = (manifest.sources && def.source && manifest.sources[def.source]) || {
+        name: manifest.source, url: manifest.sourceUrl, license: manifest.license, citation: manifest.citation,
+        hardware: { manufacturer: "BCI2000 / g.tec", model: "g.MOBIlab+", adcResolution: 16, fdaCleared: false, electrodeType: "active", applicationMethod: "cap" },
+      };
       records.push({
         id: `SEED-PHY-${Date.now()}-${records.length}`,
         subjectHash: hashSubjectId(def.subjectId),
@@ -2155,7 +2166,7 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
         montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: true, fileType: "real-public",
         hasEdfData: true,
-        notes: `${def.task || ""} (Source: PhysioNet EEGMMIDB ${def.path})`,
+        notes: `${def.task || ""} (Source: ${src.name})`,
         uploadedAt: new Date().toISOString(),
         pipelineVersion: PIPELINE_VERSION,
         schemaVersion: SCHEMA_VERSION,
@@ -2166,8 +2177,8 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap) {
         consciousnessLevel: "awake",
         activationProcedures: ["none"], posture: "seated",
         environmentNoise: "quiet",
-        hardware: { manufacturer:"BCI2000 / g.tec", model:"g.MOBIlab+", adcResolution:16, fdaCleared:false, electrodeType:"active", applicationMethod:"cap" },
-        sourceAttribution: { dataset: manifest.source, url: manifest.sourceUrl, license: manifest.license, originalPath: def.path },
+        hardware: src.hardware || { manufacturer:"BCI2000 / g.tec", model:"g.MOBIlab+", adcResolution:16, fdaCleared:false, electrodeType:"active", applicationMethod:"cap" },
+        sourceAttribution: { dataset: src.name, url: src.url, license: src.license, citation: src.citation, originalPath: def.path },
       });
     } catch (e) {
       console.warn(`[REACT] Real-seed exception for ${def.path}:`, e?.message);
@@ -10813,6 +10824,15 @@ export default function ReactEEGApp() {
         setInitialized(true);
         loadAllEdfsFromDB().then(stored => {
           if (Object.keys(stored).length > 0) setEdfFileStore(prev => ({ ...prev, ...stored }));
+        });
+        // Reconcile any NEW public seed files added to the manifest since this library was
+        // seeded (e.g. a newly-bundled dataset), without disturbing existing records.
+        const seedPaths = new Set(existingRecords.map(r => r.sourceAttribution?.originalPath).filter(Boolean));
+        loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap, seedPaths).then(added => {
+          if (added.length) {
+            debugLog(`[REACT] Added ${added.length} new seed recording(s) from the manifest`);
+            setRecords(prev => [...added, ...prev]);
+          }
         });
       } else {
         debugLog("[REACT] First launch — fetching 10 real public-domain EDFs (PhysioNet EEGMMIDB)...");

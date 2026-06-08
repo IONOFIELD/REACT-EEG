@@ -187,6 +187,28 @@ If your repo name is different from react-eeg, update the base value in vite.con
 - 10-20 head map visualization with electrode positions
 - Spectral analysis with FFT power spectrum per channel
 
+## Data Sources
+
+The bundled demo library (`public/seed-edfs/`) contains **real, public-domain human EEG**,
+re-named to REACT's PHI-free convention and header-scrubbed. Per-file provenance, licenses and
+citations are in [`public/seed-edfs/manifest.json`](public/seed-edfs/manifest.json) (each file
+references its dataset via `source`).
+
+**PhysioNet EEG Motor Movement/Imagery Dataset (EEGMMIDB)** — 64-channel BCI2000, eyes-open /
+eyes-closed baselines and motor/imagery tasks. License: ODC-By 1.0.
+- Schalk, G., McFarland, D.J., Hinterberger, T., Birbaumer, N., Wolpaw, J.R. *BCI2000: A
+  General-Purpose Brain-Computer Interface (BCI) System.* IEEE TBME 51(6):1034-1043, 2004.
+- Goldberger, A.L., et al. *PhysioBank, PhysioToolkit, and PhysioNet.* Circulation
+  101(23):e215-e220, 2000. https://physionet.org/content/eegmmidb/1.0.0/
+
+**PhysioNet EEG During Mental Arithmetic Tasks (eegmat)** — 23-channel 10-20 @ 500 Hz, resting
+baseline and serial-subtraction arithmetic. License: CC BY 4.0.
+- Zyma, I.; Tukaev, S.; Seleznov, I.; Kiyono, K.; Popov, A.; Chernykh, M.; Shpenkov, O.
+  *Electroencephalograms during Mental Arithmetic Task Performance.* Data 2019, 4, 14.
+  https://doi.org/10.3390/data4010014
+- Goldberger, A.L., et al. *PhysioBank, PhysioToolkit, and PhysioNet.* Circulation
+  101(23):e215-e220, 2000. https://physionet.org/content/eegmat/1.0.0/
+
 ## License
 
 Proprietary - REACT EEG, LLC
