@@ -14,6 +14,9 @@ import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
 } from "./dsp.js";
+// Live acquisition WebSocket-bridge frame parser (see bridge/PROTOCOL.md). Unit-tested in
+// test/live-stream.test.js. The mock + Python bridges emit exactly these frames.
+import { decodeMessage, gapBatches } from "./live-stream.js";
 
 // ══════════════════════════════════════════════════════════════
 // REACT EEG — Unified Platform
@@ -37,6 +40,13 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v18.3", items: [
+    "Live acquisition groundwork — the Acquire tab now adopts a versioned handshake from the WebSocket bridge (sample rate, channel count, electrode labels and units) instead of guessing, shows a live rolling waveform + impedance the moment a device connects, and records the incoming stream straight to a real EDF. Verified end-to-end against real EEG with no hardware via a bundled mock bridge that replays a seed .edf",
+    "Frame parsing extracted to a unit-tested module (src/live-stream.js); dropped-batch detection, unit/gain normalisation to µV, and a graceful notice if the bridge disconnects mid-session",
+    "Added bridge/ : the wire-protocol spec, a zero-dependency Node mock bridge (EDF replay), and a Python piEEG/BrainFlow bridge (with synthetic + replay modes) ready to verify on the Raspberry Pi",
+    "Impedance is now shown only when it is genuinely measured — read from the EDF, or sent as a real measurement by a device that supports it. The previous simulated/random impedance values were removed; a device that can't measure impedance reports it honestly and REACT shows “not available” instead of an estimate",
+    "Live waveform now uses a fixed real-time scale (newest sample pinned to the right edge, constant seconds-per-pixel) so it never stretches/compresses while the buffer fills or when recording starts",
+  ]},
   { version: "v17.7", items: [
     "FIXED a persistent high-frequency artifact pinned to the left (and right) edge of every epoch — filters were applied to each epoch's isolated slice, which forced the first/last sample of every trace to the channel baseline. Each epoch is now filtered with a guard band of real neighbouring signal and then cropped, so the visible window is transient-free (only the true file start, where no prior data exists, can still reflect)",
     "Adaptive Double-Banana now orders its chains clinically — by band, alternating left/right with midline last (L-temporal → R-temporal → L-parasagittal → R-parasagittal → … → midline), like a standard HD longitudinal display",
@@ -9338,19 +9348,10 @@ const DEVICE_PROTOCOLS = {
 // DEVICE_CATALOG, CONN, CONN_LABELS defined in CONFIGURATION block at top of file
 
 // ── Impedance simulator ──
-function generateImpedances(channelCount) {
-  const electrodes = ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6","Fz","Cz","Pz","A1","A2",
-    "FC1","FC2","FC5","FC6","CP1","CP2","CP5","CP6","TP7","TP8","FT9","FT10","PO3","PO4","POz","Oz","Iz","AF3","AF4","AF7","AF8",
-    "F1","F2","F5","F6","C1","C2","C5","C6","P1","P2","P5","P6","CPz","FCz","FPz","TP9","TP10","PO7","PO8","P9","P10","Ref","Gnd"];
-  return electrodes.slice(0, channelCount).map(name => ({
-    name, value: Math.round((0.5 + Math.random() * 4.0) * 10) / 10,
-    status: "good",
-  }));
-}
-function generateNoConnectionImpedances(channelCount) {
-  const electrodes = ["Fp1","Fp2","F3","F4","C3","C4","P3","P4","O1","O2","F7","F8","T3","T4","T5","T6","Fz","Cz","Pz","A1","A2"];
-  return electrodes.slice(0, channelCount).map(name => ({ name, value: null, status: "poor" }));
-}
+// NOTE: REACT deliberately has NO impedance generator. Impedance is shown only when it is
+// genuinely measured — read from the EDF (Review) or sent as a real measurement by the
+// acquisition bridge (Acquire). A device that cannot measure it reports impedanceSupported:false
+// and the UI says "not available" rather than displaying an estimate.
 
 // ══════════════════════════════════════════════════════════════
 // DEVICE SELECTOR PANEL
@@ -9846,7 +9847,7 @@ function PatternTable({ eegSystem, montage, channels, allChannels, hiddenChannel
 // ══════════════════════════════════════════════════════════════
 // IMPEDANCE CHECK PANEL
 // ══════════════════════════════════════════════════════════════
-function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false }) {
+function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false, deviceName = null, impedanceSupported = true }) {
   const list = Array.isArray(impedances) ? impedances : [];
   const allGood = list.length > 0 && list.every(e => e.status !== "poor");
   const dialogRef = useRef(null);
@@ -9864,8 +9865,15 @@ function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false }) {
 
         {list.length === 0 ? (
           <div style={{padding:"24px 8px",textAlign:"center",color:"#666",fontSize:12,lineHeight:1.6}}>
-            No impedance data in this recording.<br/>
-            <span style={{fontSize:10,color:"#444"}}>Standard EDF rarely stores impedance; it is a dynamic value captured at acquisition. Compliance reports this as “Unknown”.</span>
+            {readOnly ? (<>
+              No impedance data in this recording.<br/>
+              <span style={{fontSize:10,color:"#444"}}>Standard EDF rarely stores impedance; it is a dynamic value captured at acquisition. Compliance reports this as “Unknown”.</span>
+            </>) : (<>
+              Impedance not available{deviceName ? ` from ${deviceName}` : ""}.<br/>
+              <span style={{fontSize:10,color:"#444"}}>{impedanceSupported
+                ? "The device reports impedance support but sent no measurement."
+                : "This device does not measure electrode impedance. REACT only displays a real measured value — it never estimates or simulates one."}</span>
+            </>)}
           </div>
         ) : (
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(120px,1fr))",gap:6,marginBottom:20}}>
@@ -9905,6 +9913,76 @@ function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false }) {
       </div>
     </div>
   );
+}
+
+// ── Live rolling waveform ──
+// Draws the most recent seconds from the acquisition ring buffer (liveViewRef) as a
+// scrolling multi-channel strip, so you can see the incoming signal (and judge quality)
+// the moment the bridge is connected — before and during recording. Auto-scales each lane
+// to its own recent peak so any channel/gain fills cleanly. Read-only overlay; it does not
+// touch the Review epoch viewer underneath.
+function LiveWaveform({ viewRef, active, recording, droppedRef }) {
+  const canvasRef = useRef(null);
+  useEffect(() => {
+    if (!active) { const cv = canvasRef.current; if (cv) { const c = cv.getContext("2d"); c && c.clearRect(0, 0, cv.width, cv.height); } return; }
+    let raf;
+    const draw = () => {
+      const cv = canvasRef.current, view = viewRef.current;
+      if (cv) {
+        const W = cv.clientWidth || 1, H = cv.clientHeight || 1;
+        if (cv.width !== W) cv.width = W;
+        if (cv.height !== H) cv.height = H;
+        const ctx = cv.getContext("2d");
+        if (!view || view.count === 0) { ctx.clearRect(0, 0, W, H); raf = requestAnimationFrame(draw); return; }
+        ctx.fillStyle = "#050505"; ctx.fillRect(0, 0, W, H);
+        const labels = view.labels, n = labels.length || 1;
+        const labelW = 46, plotW = Math.max(1, W - labelW);
+        const laneH = H / n;
+        const { cap, head, count } = view;
+        // FIXED time scale: the window always spans the full ring (cap samples = LIVE_VIEW_SEC),
+        // with the newest sample pinned to the right edge and each pixel a constant time slice.
+        // The trace fills in from the right as the buffer warms up — it never stretches/compresses,
+        // so the display is true real-time at all times (incl. the moment recording starts).
+        const maxAge = Math.max(1, cap - 1);
+        const xForAge = (age) => labelW + plotW - (age / maxAge) * plotW;  // age 0 = newest = right edge
+        const step = Math.max(1, Math.floor(cap / plotW));
+        const idxAt = (age) => (head - 1 - age + cap * 2) % cap;           // ring index `age` samples back
+        // header: fixed window length + status
+        ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "top"; ctx.textAlign = "left";
+        ctx.fillStyle = recording ? "#EF4444" : "#10B981";
+        ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s window`, labelW + 6, 4);
+        const dropped = droppedRef?.current || 0;
+        if (dropped > 0) { ctx.fillStyle = "#F59E0B"; ctx.textAlign = "right"; ctx.fillText(`${dropped} dropped`, W - 6, 4); ctx.textAlign = "left"; }
+        for (let c = 0; c < n; c++) {
+          const ring = view.ring[c];
+          const yCenter = laneH * (c + 0.5);
+          // robust peak over the filled samples for per-lane auto-scale
+          let peak = 1;
+          for (let j = 0; j < count; j += step) { const a = Math.abs(ring[idxAt(j)]); if (a > peak) peak = a; }
+          const chScale = (laneH * 0.42) / peak;
+          // lane separator + label
+          ctx.strokeStyle = "#141414"; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(labelW, yCenter + laneH / 2); ctx.lineTo(W, yCenter + laneH / 2); ctx.stroke();
+          ctx.fillStyle = "#6c8088"; ctx.font = "600 9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "middle"; ctx.textAlign = "right";
+          ctx.fillText(labels[c], labelW - 6, yCenter);
+          // trace — drawn newest→oldest at fixed time positions (right edge = now)
+          ctx.strokeStyle = "#1a8fff"; ctx.lineWidth = 0.9; ctx.beginPath();
+          let first = true;
+          for (let j = 0; j < count; j += step) {
+            const v = ring[idxAt(j)];
+            const x = xForAge(j);
+            const y = yCenter - v * chScale;
+            if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+      }
+      raf = requestAnimationFrame(draw);
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [active, recording]);
+  return <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 5 }} />;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -9968,45 +10046,83 @@ function AcquireTab() {
   const [showImpedance, setShowImpedance] = useState(false);
 
   // ── Live WebSocket bridge (piEEG and other protocol:"websocket" devices) ──
-  // The browser cannot talk to a Pi HAT / BrainFlow board directly, so a small local
-  // bridge process (Python/BrainFlow → WebSocket) streams frames here. Protocol:
-  //   • text JSON  {type:"samples", data:[[c0,c1,...],...]}  — one inner array per time-frame
-  //   • text JSON  {type:"impedance", values:[kΩ,...]}        — per-channel impedance
-  //   • binary     Float32 buffer, channel-interleaved per frame
-  // We buffer samples while recording and flush them to a real EDF on stop.
+  // The browser cannot talk to a Pi HAT / BrainFlow board directly, so a small local bridge
+  // process (Python/BrainFlow → WebSocket, or bridge/mock-bridge.mjs) streams frames here.
+  // Frame parsing lives in ./live-stream.js (decodeMessage); the wire format is documented in
+  // bridge/PROTOCOL.md. On connect the bridge sends a `hello` we ADOPT (sample rate, channel
+  // count, labels, units) instead of guessing — samples then fill the recording buffer (while
+  // recording) and a rolling view buffer (always, for the live preview).
+  const LIVE_VIEW_SEC = 6;                 // seconds of signal kept for the live preview
+  const MAX_LIVE_REC_SEC = 2 * 60 * 60;    // hard cap on a single live recording (2 h) — guards
+                                           // against the in-memory capture buffer growing unbounded
   const wsRef = useRef(null);
-  const liveBufRef = useRef(null);   // { labels:[], data:[[]...], sr }
+  const liveBufRef = useRef(null);   // recording buffer: { labels, data:[[]...], sr, uvScale }
+  const liveViewRef = useRef(null);  // rolling preview ring: { labels, sr, ring:[Float32Array], head, count, cap }
+  const liveSeqRef = useRef(null);   // last samples `seq` seen (for drop detection)
+  const liveDroppedRef = useRef(0);  // total dropped sample-batches this session
   const recordingRef = useRef(false);
+  const userClosingRef = useRef(false);   // true while the user is intentionally disconnecting
+  const stopRecordingRef = useRef(null);  // late-bound so the cap guard can flush a recording
+  const liveImpedanceSupportedRef = useRef(false); // whether the connected device measures impedance
+  const [liveConfig, setLiveConfig] = useState(null); // adopted hello shown in the UI
+
+  // (Re)allocate buffers for a given channel set + rate (on connect and on hello adoption).
+  const allocLiveBuffers = (labels, sr, uvScale = 1) => {
+    const cap = Math.max(1, Math.round(sr * LIVE_VIEW_SEC));
+    liveBufRef.current = { labels, data: labels.map(() => []), sr, uvScale };
+    liveViewRef.current = { labels, sr, cap, head: 0, count: 0, ring: labels.map(() => new Float32Array(cap)) };
+    liveSeqRef.current = null;
+  };
 
   const appendSamples = (rows) => {
-    if (!recordingRef.current) return;          // only capture while recording
-    const buf = liveBufRef.current; if (!buf) return;
+    const buf = liveBufRef.current, view = liveViewRef.current;
+    if (!buf) return;
+    const nc = buf.data.length;
+    // Guard against an unbounded capture buffer on very long sessions: at the cap, flush what
+    // we have (stop the recording) rather than risk running the tab out of memory.
+    if (recordingRef.current && buf.data[0] && buf.data[0].length >= (buf.sr || 250) * MAX_LIVE_REC_SEC) {
+      recordingRef.current = false;
+      notify(`Recording reached the ${MAX_LIVE_REC_SEC / 3600} h limit — saving.`, "warn");
+      stopRecordingRef.current?.();
+    }
     for (const row of rows) {
-      for (let c = 0; c < buf.data.length; c++) buf.data[c].push(Number(row[c]) || 0);
+      // Recording buffer — only while actively recording (this is what becomes the EDF).
+      if (recordingRef.current) for (let c = 0; c < nc; c++) buf.data[c].push(Number(row[c]) || 0);
+      // Rolling preview ring — always, so the live trace scrolls even before Record.
+      if (view) {
+        for (let c = 0; c < nc; c++) view.ring[c][view.head] = Number(row[c]) || 0;
+        view.head = (view.head + 1) % view.cap;
+        if (view.count < view.cap) view.count++;
+      }
     }
   };
+
   const handleWsMessage = (ev) => {
-    const labels = liveBufRef.current?.labels || [];
-    if (typeof ev.data === "string") {
-      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === "impedance" || msg.cmd === "impedance") {
-        const vals = msg.values || msg.impedances || [];
-        const imp = vals.map((v, i) => ({ name: labels[i] || `Ch${i + 1}`, value: Math.round(v * 10) / 10, status: v <= 5 ? "good" : v <= 10 ? "fair" : "poor" }));
-        setImpedances(imp.length ? imp : generateImpedances(selectedDevice?.channels || 8));
-        setConnectionState(CONN.impedance); setShowImpedance(true);
-      } else if (msg.type === "samples" && Array.isArray(msg.data)) {
-        appendSamples(msg.data);
+    const cfg = liveViewRef.current || liveBufRef.current;
+    const res = decodeMessage(ev.data, { channels: cfg?.labels?.length, labels: cfg?.labels, uvScale: liveBufRef.current?.uvScale });
+    if (res.kind === "hello") {
+      const c = res.config;
+      allocLiveBuffers(c.labels, c.sampleRate, c.uvScale);
+      liveImpedanceSupportedRef.current = !!c.impedanceSupported;
+      setLiveConfig({ device: c.device, sampleRate: c.sampleRate, channels: c.channels, labels: c.labels, protocol: c.protocol, impedanceSupported: !!c.impedanceSupported });
+      if (c.protocol !== 1) notify(`Bridge protocol v${c.protocol} — REACT speaks v1; continuing best-effort.`, "warn");
+      // Only run an impedance step when the device actually measures it. Otherwise go straight
+      // to Ready — REACT never fabricates an impedance reading to fill the gap.
+      if (c.impedanceSupported) { try { wsRef.current?.send(JSON.stringify({ cmd: "impedance" })); } catch {} }
+      else setConnectionState(s => (s >= CONN.ready ? s : CONN.ready));
+    } else if (res.kind === "impedance") {
+      // Display ONLY values the bridge actually measured. Empty/garbage → no reading shown.
+      const imp = (res.impedances || []).filter(e => e && e.value != null);
+      setImpedances(imp.length ? imp : null);
+      if (imp.length) { setConnectionState(s => (s >= CONN.ready ? s : CONN.impedance)); setShowImpedance(true); }
+      else setConnectionState(s => (s >= CONN.ready ? s : CONN.ready));
+    } else if (res.kind === "samples") {
+      if (res.seq != null) {
+        const dropped = gapBatches(liveSeqRef.current, res.seq);
+        if (dropped > 0) { liveDroppedRef.current += dropped; debugLog(`[live] dropped ${dropped} batch(es) (seq ${liveSeqRef.current}→${res.seq})`); }
+        liveSeqRef.current = res.seq;
       }
-    } else if (ev.data instanceof ArrayBuffer) {
-      const arr = new Float32Array(ev.data);
-      const ch = labels.length || 1;
-      const rows = [];
-      for (let i = 0; i + ch <= arr.length; i += ch) {
-        const row = new Array(ch);
-        for (let c = 0; c < ch; c++) row[c] = arr[i + c];
-        rows.push(row);
-      }
-      appendSamples(rows);
+      appendSamples(res.rows);
     }
   };
 
@@ -10018,8 +10134,10 @@ function AcquireTab() {
 
     if (selectedDevice.protocol === "websocket") {
       const url = deviceConfig.bridgeUrl || selectedDevice.bridgeUrl || "ws://localhost:8765";
+      // Fallback channel set used only until the bridge's `hello` is adopted.
       const labels = PIEEG_CHANNEL_MAP[selectedDevice.id] || ELECTRODE_SETS["10-20"].slice(0, selectedDevice.channels);
-      liveBufRef.current = { labels, data: labels.map(() => []), sr: deviceConfig.sampleRate || selectedDevice.maxSr || 250 };
+      allocLiveBuffers(labels, deviceConfig.sampleRate || selectedDevice.maxSr || 250);
+      liveDroppedRef.current = 0; setLiveConfig(null); userClosingRef.current = false;
       let ws;
       try { ws = new WebSocket(url); ws.binaryType = "arraybuffer"; }
       catch { setConnectionState(CONN.error); notify(`Invalid bridge URL: ${url}`, "error"); return; }
@@ -10031,11 +10149,23 @@ function AcquireTab() {
         notify(`piEEG bridge unreachable at ${url}. Start the bridge process and retry.`, "error");
       };
       const to = setTimeout(() => { if (ws.readyState !== WebSocket.OPEN) { try { ws.close(); } catch {} fail(); } }, 4000);
-      ws.onopen = () => { opened = true; clearTimeout(to); setConnectionState(CONN.connected); try { ws.send(JSON.stringify({ cmd: "impedance" })); } catch {} };
+      // On open, ask for the hello. Impedance is only requested afterwards IF the bridge's
+      // hello says the device actually measures it (handled in handleWsMessage).
+      ws.onopen = () => { opened = true; clearTimeout(to); setConnectionState(CONN.connected); try { ws.send(JSON.stringify({ cmd: "hello" })); } catch {} };
       ws.onmessage = handleWsMessage;
       ws.onerror = () => fail();
-      // Only treat a close as a clean disconnect if we actually had an open session.
-      ws.onclose = () => { clearTimeout(to); if (errored) return; if (opened) setConnectionState(CONN.disconnected); else fail(); };
+      // Only treat a close as a clean disconnect if we actually had an open session. An
+      // unexpected drop (bridge died / cable pulled) while we weren't intentionally closing is
+      // surfaced so a live session can't silently stop streaming.
+      ws.onclose = () => {
+        clearTimeout(to); if (errored) return;
+        if (opened) {
+          setConnectionState(CONN.disconnected);
+          if (!userClosingRef.current) notify("piEEG bridge disconnected — stream ended. Reconnect to resume.", "warn");
+          recordingRef.current = false;
+        } else fail();
+        userClosingRef.current = false;
+      };
       return;
     }
 
@@ -10045,6 +10175,7 @@ function AcquireTab() {
   }, [selectedDevice, deviceConfig]);
 
   const handleDisconnect = () => {
+    userClosingRef.current = true;          // suppress the "unexpected disconnect" notice
     if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
     recordingRef.current = false;
     setConnectionState(CONN.disconnected);
@@ -10162,6 +10293,7 @@ function AcquireTab() {
     setLastRecordedFile({ record: newRecord, filename: acqFile });
     setShowPostRecordPrompt(true);
   };
+  stopRecordingRef.current = stopRecording;  // let the buffer-cap guard flush a long recording
   const togglePause = () => {
     const next = !isPaused;
     setIsPaused(next);
@@ -10256,7 +10388,7 @@ function AcquireTab() {
         totalDuration={acqDuration}
         isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
         leftContent={connectionState >= CONN.ready && !isRecording ? (
-          <button onClick={()=>{setShowImpedance(true);setImpedances(generateNoConnectionImpedances(selectedDevice?.channels||19));}} style={{
+          <button onClick={()=>{ if(liveImpedanceSupportedRef.current){ try{wsRef.current?.send(JSON.stringify({cmd:"impedance"}));}catch{} } else setImpedances(null); setShowImpedance(true); }} style={{
             padding:"4px 10px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
             color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
           }}>{I.Ohm(14)} Z</button>
@@ -10277,6 +10409,12 @@ function AcquireTab() {
         )}/>
 
       <div style={{flex:1,display:"flex",overflow:"hidden",position:"relative"}}>
+        {/* Live rolling trace from the bridge ring buffer — overlays the (empty) epoch viewer
+            while connected so you see the incoming signal live, before and during recording. */}
+        {selectedDevice?.protocol === "websocket" && (
+          <LiveWaveform viewRef={liveViewRef} active={connectionState >= CONN.connected}
+            recording={isRecording && !isPaused} droppedRef={liveDroppedRef}/>
+        )}
         <WaveformCanvas eeg={eeg}>
           <AnnotationPopup draft={eeg.annotationDraft} annotationType={eeg.selectedAnnotationType}
             text={eeg.annotationText} setText={eeg.setAnnotationText} onConfirm={eeg.confirmAnnotation}
@@ -10347,9 +10485,12 @@ function AcquireTab() {
           panelPos={annotationPanelPos} setPanelPos={setAnnotationPanelPos}/>
       )}
 
-      {/* Impedance modal */}
-      {showImpedance && impedances && (
-        <ImpedancePanel impedances={impedances} onClose={()=>setShowImpedance(false)} onAccept={handleAcceptImpedance}/>
+      {/* Impedance modal — shows real measured values, or an honest "not available" notice
+          when the connected device doesn't measure impedance (REACT never fabricates one). */}
+      {showImpedance && (
+        <ImpedancePanel impedances={impedances || []} deviceName={liveConfig?.device}
+          impedanceSupported={liveImpedanceSupportedRef.current}
+          onClose={()=>setShowImpedance(false)} onAccept={handleAcceptImpedance}/>
       )}
 
       {/* Channel context menu */}
