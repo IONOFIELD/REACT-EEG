@@ -5025,7 +5025,7 @@ const SPECTRO_SEC = 30;
 
 function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, onClose, panelPos, setPanelPos }) {
   const canvasRef = useRef(null);
-  const [scope, setScope] = useState("global"); // global | left | right | frontal | central | temporal | parietal | occipital | ele:<edfIndex>
+  const [scope, setScope] = useState("global"); // global | left | right | frontal | central | temporal | parietal | occipital
   const [hoverInfo, setHoverInfo] = useState(null);
   const [colorScale, setColorScale] = useState("thermal"); // thermal | viridis
 
@@ -5061,7 +5061,6 @@ function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, on
   }, [edfData]);
 
   const scopeIndices = (sc) => {
-    if (sc.startsWith("ele:")) { const i = parseInt(sc.slice(4), 10); return Number.isFinite(i) ? [i] : []; }
     if (sc === "global") return electrodes.map(e => e.idx);
     if (sc === "left" || sc === "right") { const H = sc === "left" ? "L" : "R"; return electrodes.filter(e => chHemisphere(e.elec) === H).map(e => e.idx); }
     return electrodes.filter(e => chLobe(e.elec) === sc).map(e => e.idx); // a lobe
@@ -5257,19 +5256,14 @@ function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, on
         <label style={{fontSize:10,color:"#666"}}>Scope:</label>
         <select value={scope} onChange={e=>setScope(e.target.value)}
           style={{background:"#111",border:"1px solid #222",color:"#7ec8d9",fontSize:10,padding:"2px 6px"}}>
-          <optgroup label="Aggregate">
-            <option value="global">Global (all EEG)</option>
-            <option value="left">Left hemisphere</option>
-            <option value="right">Right hemisphere</option>
-            <option value="frontal">Frontal</option>
-            <option value="central">Central</option>
-            <option value="temporal">Temporal</option>
-            <option value="parietal">Parietal</option>
-            <option value="occipital">Occipital</option>
-          </optgroup>
-          <optgroup label="Single electrode">
-            {electrodes.map(({elec, idx}) => <option key={idx} value={`ele:${idx}`}>{elec}</option>)}
-          </optgroup>
+          <option value="global">Global (all EEG)</option>
+          <option value="left">Left hemisphere</option>
+          <option value="right">Right hemisphere</option>
+          <option value="frontal">Frontal</option>
+          <option value="central">Central</option>
+          <option value="temporal">Temporal</option>
+          <option value="parietal">Parietal</option>
+          <option value="occipital">Occipital</option>
         </select>
         {stftData?.nChannels != null && (
           <span style={{fontSize:9,color:"#556",fontFamily:"'IBM Plex Mono',monospace"}}>
