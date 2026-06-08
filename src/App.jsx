@@ -40,6 +40,10 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v18.4", items: [
+    "Spectrogram (STFT) expanded from one-channel-at-a-time to regional scopes — Global, Left/Right hemisphere, and per-lobe (Frontal/Central/Temporal/Parietal/Occipital), built directly from the EDF's scalp electrodes with power averaged across the region. Window lengthened to 30 s for reading frequency/state trends over time; greyscale colormap removed",
+    "Added Alpha-Delta Ratio (alpha ÷ delta power) across the qEEG panel, topographic ratio strip, Data Sheet, and the before→after Compare panel — a descriptive state/slowing index (higher = more alert/alpha-dominant, lower = slower)",
+  ]},
   { version: "v18.3", items: [
     "Live acquisition groundwork — the Acquire tab now adopts a versioned handshake from the WebSocket bridge (sample rate, channel count, electrode labels and units) instead of guessing, shows a live rolling waveform + impedance the moment a device connects, and records the incoming stream straight to a real EDF. Verified end-to-end against real EEG with no hardware via a bundled mock bridge that replays a seed .edf",
     "Frame parsing extracted to a unit-tested module (src/live-stream.js); dropped-batch detection, unit/gain normalisation to µV, and a graceful notice if the bridge disconnects mid-session",
@@ -735,7 +739,7 @@ async function parsePatientPackageZip(file) {
 function generateDataSheetHTML(record, edfData) {
   const safe = (s) => String(s ?? "—").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
   const compliance = record?.complianceResult || checkProtocolCompliance(record, edfData || null);
-  const metrics = edfData ? computeRecordMetrics(edfData) : { peakAlphaFreq: null, thetaBetaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
+  const metrics = edfData ? computeRecordMetrics(edfData) : { peakAlphaFreq: null, thetaBetaRatio: null, alphaDeltaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
   const sr = edfData?.sampleRate || record?.sampleRate || 256;
 
   // Global band power (averaged across all data channels)
@@ -960,6 +964,7 @@ ${stackedBar(globalBands, 540, 22)}
 <div class="grid-3">
   ${normPill("Peak alpha frequency", metrics.peakAlphaFreq, "Hz", 8.5, 12.0, v => v?.toFixed(2))}
   ${normPill("Theta / beta ratio",   metrics.thetaBetaRatio, "",   0.5, 2.5,  v => v?.toFixed(2))}
+  ${normPill("Alpha / delta ratio",  metrics.alphaDeltaRatio, "",  0.3, 2.5,  v => v?.toFixed(2))}
   ${normPill("Slowing index (Δ+θ)",  metrics.slowingIndex,   "%",  20,  60,   v => v?.toFixed(1))}
 </div>
 <div style="margin-top:10px">
@@ -3992,13 +3997,13 @@ function extractElectrodeName(rawLabel) {
  * Timeline and Data Sheet to plot patient trends across visits.
  *
  * @param {object} edfData — parsed EDF (channelData + channelLabels + sampleRate)
- * @returns {{ peakAlphaFreq: number|null, thetaBetaRatio: number|null,
+ * @returns {{ peakAlphaFreq: number|null, thetaBetaRatio: number|null, alphaDeltaRatio: number|null,
  *             slowingIndex: number|null, asymmetry: number|null,
  *             slowingByElectrode: object, alphaByElectrode: object }}
  */
 function computeRecordMetrics(edfData) {
   if (!edfData?.channelData || !edfData.channelLabels) {
-    return { peakAlphaFreq: null, thetaBetaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
+    return { peakAlphaFreq: null, thetaBetaRatio: null, alphaDeltaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
   }
   const sr = edfData.sampleRate || 256;
   const occipitalNames = ["O1", "O2", "Oz"];
@@ -4056,12 +4061,16 @@ function computeRecordMetrics(edfData) {
 
   const peakAlphaFreq    = bestAlphaFreq ? +bestAlphaFreq.toFixed(2) : null;
   const thetaBetaRatio   = totalBeta > 0 ? +(totalTheta / totalBeta).toFixed(2) : null;
+  // Alpha-Delta Ratio: alpha power ÷ delta power, summed across electrodes. Descriptive state/
+  // slowing index (higher = more alert/alpha-dominant; lower = slower/delta-dominant) — not a
+  // clinical reading.
+  const alphaDeltaRatio  = totalDelta > 0 ? +(totalAlpha / totalDelta).toFixed(2) : null;
   const slowingIndex     = totalAll > 0 ? +(((totalDelta + totalTheta) / totalAll) * 100).toFixed(1) : null;
   const asymmetry        = (leftAlpha + rightAlpha) > 0
     ? +(((leftAlpha - rightAlpha) / (leftAlpha + rightAlpha)) * 100).toFixed(1)
     : null;
 
-  return { peakAlphaFreq, thetaBetaRatio, slowingIndex, asymmetry, slowingByElectrode, alphaByElectrode };
+  return { peakAlphaFreq, thetaBetaRatio, alphaDeltaRatio, slowingIndex, asymmetry, slowingByElectrode, alphaByElectrode };
 }
 
 function interpolateIDW(x, y, electrodeValues, p = 2) {
@@ -4185,7 +4194,8 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
     }
     const thetaBeta = sb > 0 ? st / sb : null;
     const slowFast = (sa + sb) > 0 ? (sd + st) / (sa + sb) : null;
-    return { min, max, mean, asym, thetaBeta, slowFast };
+    const alphaDelta = sd > 0 ? sa / sd : null;   // alpha ÷ delta — descriptive state/slowing index
+    return { min, max, mean, asym, thetaBeta, slowFast, alphaDelta };
   }, [electrodeValues, waveformData, channels, sampleRate]);
 
   // Map canvas-pixel coordinates to the nearest electrode (for hover readout).
@@ -4397,6 +4407,10 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
         <div style={{ textAlign: "center" }} title="Theta/Beta power ratio across scalp electrodes">
           <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>\u03B8/\u03B2</div>
           <div style={{ fontSize: 11, color: "#ccc" }}>{fmtTopo(stats.thetaBeta)}</div>
+        </div>
+        <div style={{ textAlign: "center" }} title="Alpha/Delta power ratio across scalp electrodes \u2014 higher = more alpha-dominant/alert, lower = slower/delta-dominant (descriptive, state-dependent)">
+          <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>\u03B1/\u03B4</div>
+          <div style={{ fontSize: 11, color: "#ccc" }}>{fmtTopo(stats.alphaDelta)}</div>
         </div>
         <div style={{ textAlign: "center" }} title="(Delta+Theta)/(Alpha+Beta) \u2014 slow-to-fast power ratio">
           <div style={{ fontSize: 7, color: "#555", letterSpacing: "0.08em" }}>SLOW/FAST</div>
@@ -4664,7 +4678,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
     if (aperiodicSlope !== null && aperiodicSlope < -2.5) flags.push({ channel: "ALL", type: "Steep 1/f Slope", value: `${aperiodicSlope} (pathological)`, severity: "high" });
     else if (aperiodicSlope !== null && aperiodicSlope < -2.2) flags.push({ channel: "ALL", type: "Mild 1/f Steepening", value: `${aperiodicSlope}`, severity: "med" });
 
-    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, flags, eyeSync, avgArtifactPct, aperiodicSlope };
+    // Alpha-Delta Ratio (alpha ÷ delta, mean band power) — descriptive state/slowing index.
+    const alphaDeltaRatio = avgBands.delta > 0 ? avgBands.alpha / avgBands.delta : 0;
+
+    return { channelData, avgBands, peakAlphaFreq, asymmetryIndex, thetaBetaRatio, alphaDeltaRatio, flags, eyeSync, avgArtifactPct, aperiodicSlope };
   }, [waveformData, channels, sampleRate]);
 
   if (!analysis) return null;
@@ -4727,10 +4744,11 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
               return <PowerBar key={band} value={val} max={total * 0.6} color={color} label={band.charAt(0).toUpperCase() + band.slice(1, 3)} pct={pct}/>;
             })}
           </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr",gap:3,marginTop:8}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(7, 1fr)",gap:3,marginTop:8}}>
             {[
               {label:"α PEAK",value:`${analysis.peakAlphaFreq.toFixed(1)}`,unit:"Hz",color:analysis.peakAlphaFreq<8.5?"#F59E0B":"#10B981"},
               {label:"θ/β",value:analysis.thetaBetaRatio.toFixed(2),unit:"",color:analysis.thetaBetaRatio>3.5?"#f87171":analysis.thetaBetaRatio>2.5?"#F59E0B":"#10B981"},
+              {label:"α/δ",value:analysis.alphaDeltaRatio.toFixed(2),unit:"",color:"#7ec8d9"},
               {label:"ASYM",value:`${analysis.asymmetryIndex>0?"+":""}${analysis.asymmetryIndex.toFixed(1)}`,unit:"%",color:Math.abs(analysis.asymmetryIndex)>15?"#F59E0B":"#7ec8d9"},
               {label:"1/f",value:analysis.aperiodicSlope!==null?analysis.aperiodicSlope.toFixed(1):"—",unit:"",color:analysis.aperiodicSlope!==null?(analysis.aperiodicSlope<-2.5?"#f87171":analysis.aperiodicSlope<-2.2?"#F59E0B":"#10B981"):"#555"},
               {label:"ART%",value:analysis.avgArtifactPct!==undefined?analysis.avgArtifactPct.toFixed(0):"0",unit:"%",color:analysis.avgArtifactPct>20?"#f87171":analysis.avgArtifactPct>10?"#F59E0B":"#10B981"},
@@ -4874,6 +4892,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
               {[
                 { label: "Peak Alpha Frequency", value: `${analysis.peakAlphaFreq.toFixed(2)} Hz`, note: "Normal range: 9-11 Hz" },
                 { label: "Frontal Theta/Beta Ratio", value: analysis.thetaBetaRatio.toFixed(3), note: "Elevated >3.0 may indicate attentional variance" },
+                { label: "Alpha/Delta Ratio", value: analysis.alphaDeltaRatio.toFixed(3), note: "Alpha ÷ delta power — higher = more alert/alpha-dominant, lower = slower (state-dependent)" },
                 { label: "Alpha Asymmetry Index (R-L)", value: `${analysis.asymmetryIndex>0?"+":""}${analysis.asymmetryIndex.toFixed(2)}%`, note: "Values >15% indicate hemispheric difference" },
                 { label: "Dominant Frequency", value: `${analysis.peakAlphaFreq > 8 ? "Alpha" : analysis.peakAlphaFreq > 4 ? "Theta" : "Delta"} range`, note: `${analysis.peakAlphaFreq.toFixed(1)} Hz` },
               ].map((m, i) => (
@@ -4980,6 +4999,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
             bandPower: analysis.avgBands,
             peakAlphaFrequency: analysis.peakAlphaFreq,
             thetaBetaRatio: analysis.thetaBetaRatio,
+            alphaDeltaRatio: analysis.alphaDeltaRatio,
             asymmetryIndex: analysis.asymmetryIndex,
             flags: analysis.flags,
             eyeSync: analysis.eyeSync,
@@ -4999,13 +5019,55 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
 // ══════════════════════════════════════════════════════════════
 // SPECTROGRAM PANEL — STFT time-frequency decomposition
 // ══════════════════════════════════════════════════════════════
-function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
-  const canvasRef = useRef(null);
-  const [selectedChannel, setSelectedChannel] = useState(0);
-  const [hoverInfo, setHoverInfo] = useState(null);
-  const [colorScale, setColorScale] = useState("thermal"); // thermal | viridis | grayscale
+// Seconds of signal shown by the spectrogram. Decoupled from the Review epoch — a longer
+// window is far more useful for reading state/frequency trends over time.
+const SPECTRO_SEC = 30;
 
-  // Color maps
+function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, onClose, panelPos, setPanelPos }) {
+  const canvasRef = useRef(null);
+  const [scope, setScope] = useState("global"); // global | left | right | frontal | central | temporal | parietal | occipital | ele:<edfIndex>
+  const [hoverInfo, setHoverInfo] = useState(null);
+  const [colorScale, setColorScale] = useState("thermal"); // thermal | viridis
+
+  // ── Region scopes ── the spectrogram is built directly from the EDF's scalp electrodes
+  // (regions ARE electrode groups), so it can aggregate the whole head, one hemisphere, or a
+  // lobe — power averaged in the LINEAR domain across the region, then shown in dB.
+  const chHemisphere = (e) => { const m = e.match(/(\d+)$/); if (!m) return "M"; return (+m[1]) % 2 === 1 ? "L" : "R"; }; // 10-20 parity: odd=L, even=R, z/none=midline
+  const chLobe = (e) => {
+    const u = e.toUpperCase();
+    if (/^AF/.test(u) || /^FP/.test(u)) return "frontal";
+    if (/^FC/.test(u) || /^CP/.test(u)) return "central";
+    if (/^FT/.test(u) || /^TP/.test(u)) return "temporal";
+    if (/^PO/.test(u)) return "occipital";
+    if (/^F/.test(u)) return "frontal";
+    if (/^C/.test(u)) return "central";
+    if (/^T/.test(u)) return "temporal";
+    if (/^P/.test(u)) return "parietal";
+    if (/^O/.test(u) || /^I/.test(u)) return "occipital";
+    return "other";
+  };
+
+  // Distinct scalp electrodes present in the EDF (first signal per electrode name). Uses the
+  // full 10-10 recognizer so high-density files contribute every channel, not just a 10-20 subset.
+  const electrodes = useMemo(() => {
+    if (!edfData?.channelLabels) return [];
+    const seen = new Set(), out = [];
+    edfData.channelLabels.forEach((l, idx) => {
+      const e = canonicalElectrode(l);
+      if (!e || seen.has(e)) return;
+      seen.add(e); out.push({ elec: e, idx });
+    });
+    return out;
+  }, [edfData]);
+
+  const scopeIndices = (sc) => {
+    if (sc.startsWith("ele:")) { const i = parseInt(sc.slice(4), 10); return Number.isFinite(i) ? [i] : []; }
+    if (sc === "global") return electrodes.map(e => e.idx);
+    if (sc === "left" || sc === "right") { const H = sc === "left" ? "L" : "R"; return electrodes.filter(e => chHemisphere(e.elec) === H).map(e => e.idx); }
+    return electrodes.filter(e => chLobe(e.elec) === sc).map(e => e.idx); // a lobe
+  };
+
+  // Color maps (greyscale removed — thermal/viridis read far better for power)
   const colorMaps = {
     thermal: (t) => {
       if (t < 0.25) return [0, Math.floor(t*4*128), Math.floor(t*4*255)];
@@ -5019,61 +5081,86 @@ function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochS
       const b = Math.floor(84 + (t < 0.5 ? t * 2 * (170 - 84) : (170 - (t - 0.5) * 2 * 170)));
       return [r, g, b];
     },
-    grayscale: (t) => { const v = Math.floor(t * 255); return [v, v, v]; },
   };
 
-  // STFT computation
+  // STFT over a SPECTRO_SEC window, averaged across the region's electrodes (linear power → dB).
+  // Each electrode is windowed (with guard padding) and filtered with the current LFF/HFF/notch,
+  // then cropped — so the spectrogram matches what you're filtering in Review.
   const stftData = useMemo(() => {
-    if (!waveformData || !waveformData[selectedChannel]) return null;
-    const data = waveformData[selectedChannel];
-    const N = data.length;
+    if (!edfData?.channelData) return null;
+    const idxs = scopeIndices(scope);
+    if (!idxs.length) return null;
+    // Build the filtered window for each electrode in the region.
+    const sigs = [];
+    for (const idx of idxs) {
+      const w = getEDFEpochWindow(edfData, idx, epochStart, SPECTRO_SEC, sampleRate, FILTER_GUARD_SEC);
+      if (!w) continue;
+      let ext = w.data;
+      if (hpf > 0) ext = applyHighPass(ext, hpf, sampleRate);
+      if (lpf > 0) ext = applyLowPass(ext, lpf, sampleRate);
+      if (notch > 0) ext = applyNotch(ext, notch, sampleRate);
+      sigs.push((w.lead > 0 || w.len < ext.length) ? ext.slice(w.lead, w.lead + w.len) : ext);
+    }
+    if (!sigs.length) return null;
+    const N = sigs[0].length;
     const winSize = Math.min(256, N);
     const hop = Math.floor(winSize / 2);
     const nFrames = Math.max(1, Math.floor((N - winSize) / hop) + 1);
 
-    // Hanning window
     const hann = new Float32Array(winSize);
     for (let i = 0; i < winSize; i++) hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (winSize - 1)));
 
-    // Frequency resolution
     const freqRes = sampleRate / winSize;
     const maxFreqBin = Math.min(Math.ceil(50 / freqRes), Math.floor(winSize / 2));
     const minFreqBin = Math.max(1, Math.floor(0.5 / freqRes));
     const nFreqs = maxFreqBin - minFreqBin + 1;
 
-    // Compute STFT frames
+    const sum = new Array(nFrames);
+    for (let f = 0; f < nFrames; f++) sum[f] = new Float32Array(nFreqs);
+    for (const data of sigs) {
+      for (let f = 0; f < nFrames; f++) {
+        const offset = f * hop;
+        const frame = new Float32Array(winSize);
+        for (let i = 0; i < winSize; i++) frame[i] = (data[offset + i] || 0) * hann[i];
+        const row = sum[f];
+        for (let k = minFreqBin; k <= maxFreqBin; k++) {
+          let re = 0, im = 0;
+          for (let n = 0; n < winSize; n++) {
+            const angle = -2 * Math.PI * k * n / winSize;
+            re += frame[n] * Math.cos(angle);
+            im += frame[n] * Math.sin(angle);
+          }
+          row[k - minFreqBin] += (re * re + im * im) / winSize; // linear power
+        }
+      }
+    }
+
+    const inv = 1 / sigs.length;
     const powerMatrix = new Array(nFrames);
     let globalMax = -Infinity, globalMin = Infinity;
-
     for (let f = 0; f < nFrames; f++) {
-      const offset = f * hop;
-      // Apply window and compute FFT (using DFT for the relevant freq bins)
-      const frame = new Float32Array(winSize);
-      for (let i = 0; i < winSize; i++) frame[i] = (data[offset + i] || 0) * hann[i];
-
       const power = new Float32Array(nFreqs);
-      for (let k = minFreqBin; k <= maxFreqBin; k++) {
-        let re = 0, im = 0;
-        for (let n = 0; n < winSize; n++) {
-          const angle = -2 * Math.PI * k * n / winSize;
-          re += frame[n] * Math.cos(angle);
-          im += frame[n] * Math.sin(angle);
-        }
-        const p = Math.log10((re * re + im * im) / winSize + 1e-10);
-        power[k - minFreqBin] = p;
+      for (let b = 0; b < nFreqs; b++) {
+        const p = Math.log10(sum[f][b] * inv + 1e-10);
+        power[b] = p;
         if (p > globalMax) globalMax = p;
         if (p < globalMin) globalMin = p;
       }
       powerMatrix[f] = power;
     }
 
-    return { powerMatrix, nFrames, nFreqs, minFreqBin, maxFreqBin, freqRes, globalMin, globalMax, hop };
-  }, [waveformData, selectedChannel, sampleRate]);
+    return { powerMatrix, nFrames, nFreqs, minFreqBin, maxFreqBin, freqRes, globalMin, globalMax, hop, nChannels: sigs.length, winSec: N / sampleRate };
+  }, [edfData, scope, epochStart, hpf, lpf, notch, sampleRate]);
 
   // Canvas rendering
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !stftData) return;
+    if (!canvas) return;
+    if (!stftData) { // empty scope (e.g. a lobe with no electrodes present) — clear + label
+      const c = canvas.getContext("2d"); c.fillStyle = "#050505"; c.fillRect(0, 0, canvas.width, canvas.height);
+      c.fillStyle = "#555"; c.font = "11px 'IBM Plex Mono', monospace"; c.textAlign = "center"; c.textBaseline = "middle";
+      c.fillText("No EEG channels in this region", canvas.width / 2, canvas.height / 2); return;
+    }
     const { powerMatrix, nFrames, nFreqs, minFreqBin, freqRes, globalMin, globalMax, hop } = stftData;
     const ctx = canvas.getContext("2d");
     const W = canvas.width, H = canvas.height;
@@ -5117,12 +5204,12 @@ function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochS
       }
     }
 
-    // X-axis labels (time)
+    // X-axis labels (time) — spans the spectrogram's own window (SPECTRO_SEC), not the epoch.
     ctx.textAlign = "center";
-    const totalSec = epochSec;
-    for (let s = 0; s <= totalSec; s += Math.max(1, Math.floor(totalSec / 6))) {
+    const totalSec = stftData.winSec || SPECTRO_SEC;
+    for (let s = 0; s <= totalSec; s += Math.max(1, Math.round(totalSec / 6))) {
       const x = margin.left + (s / totalSec) * plotW;
-      ctx.fillText(`${(epochStart + s).toFixed(1)}s`, x, margin.top + plotH + 14);
+      ctx.fillText(`${(epochStart + s).toFixed(0)}s`, x, margin.top + plotH + 14);
       ctx.beginPath(); ctx.moveTo(x, margin.top + plotH); ctx.lineTo(x, margin.top + plotH + 3); ctx.stroke();
     }
 
@@ -5137,7 +5224,7 @@ function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochS
       }
     }
     ctx.setLineDash([]);
-  }, [stftData, colorScale, epochSec, epochStart]);
+  }, [stftData, colorScale, epochStart]);
 
   // Mouse hover for frequency/power readout
   const handleCanvasMove = useCallback((e) => {
@@ -5155,12 +5242,9 @@ function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochS
     setHoverInfo({ freq: freq.toFixed(1), time: time.toFixed(2), power: power.toFixed(2), x: e.clientX, y: e.clientY });
   }, [stftData, epochStart, sampleRate]);
 
-  // Filter EEG-only channels
-  const eegChannels = channels.filter(ch => !/ECG|EKG|EOG|EMG|EDF Annot/i.test(ch));
-
   return (
     <FloatingPanel
-      title="SPECTROGRAM — STFT" titleColor="#7ec8d9" titleSize={11} titleSpacing="0.05em"
+      title={`SPECTROGRAM — STFT · ${SPECTRO_SEC}s`} titleColor="#7ec8d9" titleSize={11} titleSpacing="0.05em"
       onClose={onClose} panelPos={panelPos} setPanelPos={setPanelPos}
       defaultPos={() => ({ x: window.innerWidth - 620, y: 80 })}
       width={600} zIndex={1200}
@@ -5170,15 +5254,32 @@ function SpectrogramPanel({ waveformData, channels, sampleRate, epochSec, epochS
     >
       {/* Controls */}
       <div style={{display:"flex",gap:8,padding:"6px 12px",borderBottom:"1px solid #111",alignItems:"center"}}>
-        <label style={{fontSize:10,color:"#666"}}>Channel:</label>
-        <select value={selectedChannel} onChange={e=>setSelectedChannel(parseInt(e.target.value))}
+        <label style={{fontSize:10,color:"#666"}}>Scope:</label>
+        <select value={scope} onChange={e=>setScope(e.target.value)}
           style={{background:"#111",border:"1px solid #222",color:"#7ec8d9",fontSize:10,padding:"2px 6px"}}>
-          {eegChannels.map((ch,i) => <option key={ch} value={channels.indexOf(ch)}>{ch}</option>)}
+          <optgroup label="Aggregate">
+            <option value="global">Global (all EEG)</option>
+            <option value="left">Left hemisphere</option>
+            <option value="right">Right hemisphere</option>
+            <option value="frontal">Frontal</option>
+            <option value="central">Central</option>
+            <option value="temporal">Temporal</option>
+            <option value="parietal">Parietal</option>
+            <option value="occipital">Occipital</option>
+          </optgroup>
+          <optgroup label="Single electrode">
+            {electrodes.map(({elec, idx}) => <option key={idx} value={`ele:${idx}`}>{elec}</option>)}
+          </optgroup>
         </select>
+        {stftData?.nChannels != null && (
+          <span style={{fontSize:9,color:"#556",fontFamily:"'IBM Plex Mono',monospace"}}>
+            {stftData.nChannels} {stftData.nChannels > 1 ? "electrodes avg" : "electrode"}
+          </span>
+        )}
         <label style={{fontSize:10,color:"#666",marginLeft:8}}>Color:</label>
         <select value={colorScale} onChange={e=>setColorScale(e.target.value)}
           style={{background:"#111",border:"1px solid #222",color:"#7ec8d9",fontSize:10,padding:"2px 6px"}}>
-          <option value="thermal">Thermal</option><option value="viridis">Viridis</option><option value="grayscale">Grayscale</option>
+          <option value="thermal">Thermal</option><option value="viridis">Viridis</option>
         </select>
         {hoverInfo && (
           <span style={{marginLeft:"auto",fontSize:9,color:"#888",fontFamily:"'IBM Plex Mono',monospace"}}>
@@ -5303,6 +5404,7 @@ function analyzeFullFile(edfData) {
     bands: avgBands,
     peakAlphaFreq: peakAlphaSum / nSegments,
     thetaBetaRatio: tbrSum / nSegments,
+    alphaDeltaRatio: avgBands.delta > 0 ? avgBands.alpha / avgBands.delta : 0,
     nChannels: eegIdxs.length,
     nSegments,
   };
@@ -5575,6 +5677,7 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos })
                   <div style={{ borderTop: "1px solid #111", marginTop: 4, paddingTop: 4 }}>
                     {mkRow("Peak Alpha", a.peakAlphaFreq, b.peakAlphaFreq, "Hz", false)}
                     {mkRow("θ/β Ratio", a.thetaBetaRatio, b.thetaBetaRatio, "", true)}
+                    {mkRow("α/δ Ratio", a.alphaDeltaRatio, b.alphaDeltaRatio, "", false)}
                     {mkRow("Slow/Fast", slowA / fastA, slowB / fastB, "", true)}
                   </div>
                 </div>
@@ -6776,7 +6879,7 @@ function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenRe
   // Compute metrics per recording (memoized so flipping between subjects is cheap)
   const points = useMemo(() => subjectRecords.map(r => {
     const edf = edfFileStore?.[r.filename];
-    const metrics = edf ? computeRecordMetrics(edf) : { peakAlphaFreq: null, thetaBetaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
+    const metrics = edf ? computeRecordMetrics(edf) : { peakAlphaFreq: null, thetaBetaRatio: null, alphaDeltaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
     return { record: r, metrics };
   }), [subjectRecords, edfFileStore]);
 
@@ -9255,8 +9358,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
 
       {/* Floating spectrogram panel */}
       {showSpectrogram && (
-        <SpectrogramPanel waveformData={eeg.waveformData} channels={eeg.channels}
-          sampleRate={eeg.sampleRate} epochSec={eeg.epochSec} epochStart={eeg.epochStart}
+        <SpectrogramPanel edfData={edfData} sampleRate={eeg.sampleRate} epochStart={eeg.epochStart}
+          hpf={eeg.hpf} lpf={eeg.lpf} notch={eeg.notch}
           onClose={()=>setShowSpectrogram(false)}
           panelPos={spectrogramPanelPos} setPanelPos={setSpectrogramPanelPos}/>
       )}
