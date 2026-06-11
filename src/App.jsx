@@ -2,6 +2,9 @@ import { useState, useEffect, useRef, useCallback, useMemo, useReducer, createCo
 import JSZip from "jszip";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";
 import { buildAnnotationSidecar } from "./sidecar.js";
+// Export-envelope builders (patient-package zip manifest, ExportModal JSON manifest,
+// .reegb bundle) — pure + version-stamped in one place, enforced by test/manifests.test.js.
+import { buildPatientPackageManifest, buildExportManifest, buildReegbBundle } from "./manifests.js";
 // ACNS/ILAE annotation taxonomy + migration (ANNOTATION_TYPES aliased to the long-standing
 // ANNOTATION_COLORS name so existing call sites are unchanged).
 import { ANNOTATION_TYPES as ANNOTATION_COLORS, migrateAnnotations } from "./annotations.js";
@@ -61,8 +64,10 @@ const groupRecordsByCollection = (records, collections) => {
 // Block ends at "── END CONFIGURATION ──" marker further down.
 // ══════════════════════════════════════════════════════════════
 
-// ── App identity / versioning ── (APP_VERSION / PIPELINE_VERSION / SCHEMA_VERSION now
-// imported from ./version.js so App.jsx and dsp.js share one source of truth.)
+// ── App identity / versioning ── APP_VERSION / PIPELINE_VERSION / SCHEMA_VERSION are
+// imported from ./version.js — THE documented scheme (meanings, bump rules, release
+// checklist). Export envelopes are built in ./manifests.js + ./sidecar.js so stamping
+// is enforced by tests; don't construct export JSON inline here.
 const DEBUG = false;
 const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 
@@ -696,17 +701,7 @@ async function buildPatientPackageZip({ subjectHash, records, annotationsMap, cl
 
   if (fileEntries.length === 0) return { error: "No EDF binaries available for this subject's promoted recordings." };
 
-  const manifest = {
-    kind: "react-eeg-patient-package",
-    formatVersion: 1,
-    schemaVersion: SCHEMA_VERSION,
-    pipelineVersion: PIPELINE_VERSION,
-    appVersion: APP_VERSION,
-    subjectHash,
-    bundledAt: new Date().toISOString(),
-    fileCount: fileEntries.length,
-    files: fileEntries,
-  };
+  const manifest = buildPatientPackageManifest(subjectHash, fileEntries);
   zip.file("manifest.json", JSON.stringify(manifest, null, 2));
 
   const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
@@ -8180,30 +8175,7 @@ function ExportModal({ records, onClose }) {
   const doExport = () => {
     const toExport = records.filter(r => selected.has(r.id));
     if (toExport.length === 0) return;
-    const bySubject = {};
-    toExport.forEach(r => {
-      if (!bySubject[r.subjectHash]) bySubject[r.subjectHash] = [];
-      bySubject[r.subjectHash].push(r);
-    });
-    const manifest = {
-      schemaVersion: SCHEMA_VERSION,
-      pipelineVersion: PIPELINE_VERSION,
-      appVersion: APP_VERSION,
-      exportDate: new Date().toISOString(),
-      totalRecords: toExport.length,
-      subjects: Object.entries(bySubject).map(([hash, recs]) => ({
-        subjectHash: hash,
-        recordCount: recs.length,
-        records: recs.map(r => ({
-          filename: r.filename, studyType: r.studyType, date: r.date,
-          channels: r.channels, sampleRate: r.sampleRate, duration: r.duration, status: r.status,
-          pipelineVersion: r.pipelineVersion || null,
-          schemaVersion: r.schemaVersion || null,
-          edfPath: `data/${r.studyType}/${r.filename}`,
-          annotationPath: `annotations/${r.filename.replace('.edf','_annotations.json')}`,
-        })),
-      })),
-    };
+    const manifest = buildExportManifest(toExport);
     const blob = new Blob([JSON.stringify(manifest, null, 2)], {type:"application/json"});
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -8939,19 +8911,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
     )) { return; }
     try {
       const rawEdf = await getEdfRawFromDB(filename);
-      const bundle = {
-        version: 1,
-        kind: "react-eeg-bundle",
-        schemaVersion: SCHEMA_VERSION,
-        pipelineVersion: PIPELINE_VERSION,
-        appVersion: APP_VERSION,
-        savedAt: new Date().toISOString(),
+      const bundle = buildReegbBundle({
         record,
         edfBase64: rawEdf ? arrayBufferToBase64(rawEdf) : null,
         annotations: annotationsMap[filename] || [],
         clinicalNotes: clinicalNotesMap[filename] || "",
-        baselineFilename: null,
-      };
+      });
       const blob = new Blob([JSON.stringify(bundle)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
