@@ -10,6 +10,7 @@ import { describe, it, expect } from "vitest";
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
+  interpolateArtifacts,
 } from "../src/dsp.js";
 
 // ── helpers ──
@@ -139,5 +140,47 @@ describe("computeBands", () => {
   });
   it("returns zeros for sub-threshold input length (< 64 samples)", () => {
     expect(computeBands(f32([1, 2, 3]), sr)).toEqual({ delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 });
+  });
+});
+
+describe("interpolateArtifacts (P3 — replaces zeroing; no broadband injection)", () => {
+  it("leaves the signal byte-for-byte unchanged when nothing is flagged", () => {
+    const x = sine(10, 256, 512, 20);
+    const out = interpolateArtifacts(x, new Array(512).fill(false));
+    for (let i = 0; i < x.length; i++) close(out[i], x[i], 1e-6);
+    // band power is therefore identical
+    const a = computeBands(x, 256), b = computeBands(out, 256);
+    close(b.alpha, a.alpha, 1e-6); close(b.total, a.total, 1e-6);
+  });
+
+  it("a short artifact burst no longer inflates broadband power (interp ≈ clean ≪ zeroed)", () => {
+    const sr = 256, N = 512;
+    const clean = sine(10, sr, N, 20);                 // pure 10 Hz alpha — no broadband content
+    const dirty = f32(clean), mask = new Array(N).fill(false);
+    for (let i = 240; i < 262; i++) { dirty[i] = 500; mask[i] = true; }   // big spike, flagged
+    const zeroed = f32(dirty); for (let i = 0; i < N; i++) if (mask[i]) zeroed[i] = 0;
+    const interp = interpolateArtifacts(dirty, mask);
+
+    const bClean = computeBands(clean, sr);
+    const bZero  = computeBands(zeroed, sr);
+    const bInterp = computeBands(interp, sr);
+
+    // The clean alpha tone has essentially no broadband (beta+gamma) content.
+    const broadband = (b) => b.beta + b.gamma;
+    // Zeroing's hard 0-edges spread energy across the spectrum → real broadband injection;
+    // interpolation keeps the trace continuous, so it injects far less.
+    expect(broadband(bZero)).toBeGreaterThan(broadband(bClean) + 1e-3); // zeroing demonstrably adds broadband
+    expect(broadband(bInterp)).toBeLessThan(broadband(bZero) * 0.5);    // interp injects < half of zeroing's
+    expect(bInterp.gamma).toBeLessThan(bZero.gamma);
+    // And the flagged spike itself is gone from the interpolated trace.
+    for (let i = 240; i < 262; i++) expect(Math.abs(interp[i])).toBeLessThan(100);
+  });
+
+  it("holds the clean side for an artifact run at the signal edge", () => {
+    const x = f32([5, 5, 5, 9, 9, 9]);
+    const mask = [true, true, false, false, true, true];
+    const out = interpolateArtifacts(x, mask);
+    expect(out[0]).toBeCloseTo(5, 6); expect(out[1]).toBeCloseTo(5, 6); // start run holds right-clean (x[2]=5)
+    expect(out[4]).toBeCloseTo(9, 6); expect(out[5]).toBeCloseTo(9, 6); // end run holds left-clean (x[3]=9)
   });
 });
