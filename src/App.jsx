@@ -16,7 +16,12 @@ import {
 } from "./dsp.js";
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
-import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI } from "./deid.js";
+import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, setHashSalt } from "./deid.js";
+
+// Per-deployment subject-hash salt (HIPAA Safe Harbor / G7): set at BUILD time via the
+// VITE_HASH_SALT env var so different sites don't produce linkable subject hashes. Applied once
+// here at module load, before any subject is hashed. Leave unset to keep the default salt.
+setHashSalt(import.meta.env.VITE_HASH_SALT);
 // Live acquisition WebSocket-bridge frame parser (see bridge/PROTOCOL.md). Unit-tested in
 // test/live-stream.test.js. The mock + Python bridges emit exactly these frames.
 import { decodeMessage, gapBatches } from "./live-stream.js";
@@ -254,13 +259,8 @@ const DEFAULT_COLLECTION_DEFS = [];
 const COMPLIANCE_MIN_DURATION_SEC = 5 * 60;       // 5 minutes
 const COMPLIANCE_MIN_CHANNELS = 19;
 const COMPLIANCE_MAX_IMPEDANCE_KOHM = 5;
-// PHI red-flag patterns scanned in EDF patient/recording header fields
-const COMPLIANCE_PHI_PATTERNS = [
-  { name: "SSN-like", re: /\b\d{3}-\d{2}-\d{4}\b/ },
-  { name: "MRN-like", re: /\b(MRN|mrn)[:\s#]*\d{4,}\b/ },
-  { name: "Email", re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/ },
-  { name: "Phone", re: /\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b/ },
-];
+// (PHI red-flag scanning is consolidated into scanTextForPHI in deid.js — used both here, in the
+// de-identification compliance check, and in the export gates.)
 
 // Single source of truth for the repository-compliance criteria. checkProtocolCompliance()
 // emits one check per id below (labels mirror these), and the Repository sidebar renders this
@@ -272,7 +272,7 @@ const COMPLIANCE_CRITERIA = [
   { id: "activations",     label: "Activation procedures documented", threshold: "documented",           desc: "Hyperventilation / photic / sleep noted (or explicitly “none”)." },
   { id: "conditions",      label: "Recording conditions documented",  threshold: "posture + environment", desc: "Patient posture and environment recorded." },
   { id: "hardware",        label: "Hardware tag present",             threshold: "make + model",         desc: "Acquisition device manufacturer and model identified." },
-  { id: "deidentification",label: "De-identification verified",       threshold: "no PHI in header",     desc: "No SSN / MRN / email / phone patterns in the EDF header." },
+  { id: "deidentification",label: "De-identification verified",       threshold: "no PHI in header/note", desc: "No SSN / MRN / email / phone / date patterns in the EDF header or the record note." },
 ];
 
 // ── Persistence: legacy localStorage keys (migrated to IDB on first load) ──
@@ -1093,14 +1093,17 @@ function checkProtocolCompliance(record, edfData = null) {
   if (!hw || !hw.manufacturer || !hw.model) push("hardware", "Hardware tag present", "fail", null, "manufacturer+model", "Hardware manufacturer or model missing.");
   else push("hardware", "Hardware tag present", "pass", `${hw.manufacturer} ${hw.model}`, "manufacturer+model", `Recorded with ${hw.manufacturer} ${hw.model}.`);
 
-  // 8. De-identification: scan EDF patient/recording ID fields for PHI patterns
-  const phiTargets = [edfData?.patientId, edfData?.recordingId, record?.subjectId].filter(Boolean).join(" | ");
+  // 8. De-identification: scan the de-identified header fields + the free-text record note for PHI,
+  // using the same scanner as the export gates (scanTextForPHI). Header PHI is normally impossible
+  // post import-scrub (see saveEdfToDB) — this catches a PHI-bearing record note or a legacy import
+  // that predates the scrub. Clinical-notes + annotation free-text are scanned at export time (G4).
+  const phiTargets = [edfData?.patientId, edfData?.recordingId, record?.subjectId, record?.notes].filter(Boolean).join(" | ");
   if (!phiTargets) {
-    push("deidentification", "De-identification verified", "unknown", null, "no PHI patterns", "No EDF header data available to scan.");
+    push("deidentification", "De-identification verified", "unknown", null, "no PHI patterns", "No header or note text available to scan.");
   } else {
-    const hits = COMPLIANCE_PHI_PATTERNS.filter(p => p.re.test(phiTargets));
-    if (hits.length === 0) push("deidentification", "De-identification verified", "pass", null, "no PHI patterns", "No SSN / MRN / email / phone patterns detected in EDF header.");
-    else push("deidentification", "De-identification verified", "fail", hits.map(h => h.name).join(", "), "no PHI patterns", `Possible PHI detected: ${hits.map(h => h.name).join(", ")}.`);
+    const hits = scanTextForPHI(phiTargets);
+    if (hits.length === 0) push("deidentification", "De-identification verified", "pass", null, "no PHI patterns", "No PHI patterns (SSN / MRN / email / phone / date) in the header or record note.");
+    else push("deidentification", "De-identification verified", "fail", hits.join(", "), "no PHI patterns", `Possible PHI detected: ${hits.join(", ")}.`);
   }
 
   let passCount = 0, warnCount = 0, failCount = 0, unknownCount = 0;
@@ -2027,18 +2030,6 @@ function applyTrainedICA(channelData, trained) {
     }
   }
   return cleaned;
-}
-
-/**
- * One-shot ICA convenience wrapper — trains and applies in one call. Kept for any
- * future caller that doesn't want to manage the trained-cache lifecycle itself.
- * Live use in useEEGState goes through trainICA + applyTrainedICA directly so the
- * mixing matrix can be cached across epoch navigation.
- */
-function applyICA(channelData, auxChannels, sr) {
-  const trained = trainICA(channelData, auxChannels, sr);
-  if (!trained) return { data: channelData, log: null };
-  return { data: applyTrainedICA(channelData, trained), log: trained.log };
 }
 
 // ── Icons ──

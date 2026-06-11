@@ -10,11 +10,20 @@
 // dates are generalized to the year; ages over 89 are aggregated to "90+". The
 // 6-char hash (derived from the full subject id) is the ONLY retained subject key.
 
+// Per-deployment hash salt. Default keeps the original value (so existing hashes are stable);
+// a deployment overrides it ONCE at startup via setHashSalt() (driven from a build-time env var in
+// App.jsx) so two sites don't produce linkable hashes for the same subject id. MUST be set before
+// any subject is hashed and never changed afterward — changing it re-hashes every subject and
+// breaks the grouping of a subject's existing recordings.
+const DEFAULT_HASH_SALT = "REACT-EEG-2026";
+let _hashSalt = DEFAULT_HASH_SALT;
+export function setHashSalt(salt) { if (salt && typeof salt === "string") _hashSalt = salt; }
+
 // Deterministic 6-hex-char subject hash (xxHash-style mix). Salted; same id +
 // salt always yields the same hash, so a subject's recordings group by hash with
 // no reversible identifier. (Replaced an earlier djb2 variant that collided badly
 // on short similar inputs like "PHY-S001" / "PHY-S004".)
-export function hashSubjectId(id, salt = "REACT-EEG-2026") {
+export function hashSubjectId(id, salt = _hashSalt) {
   const str = salt + id;
   let h1 = 0xdeadbeef ^ 0, h2 = 0x41c6ce57 ^ 0;
   for (let i = 0; i < str.length; i++) {

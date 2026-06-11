@@ -7,7 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   hashSubjectId, generateFilename, parseEdfPatientField,
   generalizeDateToYear, capAge, parseHashYearFromFilename,
-  scrubEdfHeader, scrubEdfHeaderForFilename, scanTextForPHI,
+  scrubEdfHeader, scrubEdfHeaderForFilename, scanTextForPHI, setHashSalt,
 } from "../src/deid.js";
 
 const ascii = (buf, off, len) => new TextDecoder("ascii").decode(new Uint8Array(buf, off, len));
@@ -177,5 +177,24 @@ describe("scanTextForPHI (free-text export warning)", () => {
     expect(hits).toContain("MRN");
     expect(hits).toContain("email");
     expect(hits).toContain("date");
+  });
+});
+
+describe("hash salt (G7 — per-deployment, default stable)", () => {
+  it("the salt changes the hash (same id, different salt → different hash)", () => {
+    expect(hashSubjectId("PHY-S001", "SITE-A")).not.toBe(hashSubjectId("PHY-S001", "SITE-B"));
+  });
+  it("setHashSalt overrides the default and is restorable", () => {
+    expect(hashSubjectId("PHY-S001")).toBe("A9024A");   // default salt
+    setHashSalt("OTHER-DEPLOYMENT");
+    expect(hashSubjectId("PHY-S001")).not.toBe("A9024A");
+    setHashSalt("REACT-EEG-2026");                        // restore default for other tests
+    expect(hashSubjectId("PHY-S001")).toBe("A9024A");
+  });
+  it("setHashSalt ignores empty / non-string values", () => {
+    setHashSalt("");
+    setHashSalt(null);
+    setHashSalt(123);
+    expect(hashSubjectId("PHY-S001")).toBe("A9024A");     // unchanged
   });
 });
