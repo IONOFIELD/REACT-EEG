@@ -14,9 +14,33 @@ import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
 } from "./dsp.js";
+// De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
+// on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
+import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI } from "./deid.js";
 // Live acquisition WebSocket-bridge frame parser (see bridge/PROTOCOL.md). Unit-tested in
 // test/live-stream.test.js. The mock + Python bridges emit exactly these frames.
 import { decodeMessage, gapBatches } from "./live-stream.js";
+
+// Display formatter for age under HIPAA Safe Harbor: ages ≥ 90 render as "90+" (capAge
+// stores 90 as the aggregate sentinel). Applied at display time too, so any record stored
+// before the age cap still shows compliantly. Returns the raw value for null/empty.
+const fmtAge = (a) => { const c = capAge(a); return (c == null || c === "") ? c : (c === 90 ? "90+" : c); };
+
+// Group a record list by collection for the Review file pickers. Returns an ordered array of
+// { id, name, records } groups — one per non-empty collection (in the collections' own order),
+// followed by an "Uncategorized" group for records in no (existing) collection. A record in
+// multiple collections appears under each (use a composite React key at the call site).
+const groupRecordsByCollection = (records, collections) => {
+  const cols = collections || [];
+  const groups = [];
+  for (const c of cols) {
+    const recs = records.filter(r => (r.collectionIds || []).includes(c.id));
+    if (recs.length) groups.push({ id: c.id, name: c.name, records: recs });
+  }
+  const uncategorized = records.filter(r => !(r.collectionIds || []).some(id => cols.some(c => c.id === id)));
+  if (uncategorized.length) groups.push({ id: "__uncat", name: "Uncategorized", records: uncategorized });
+  return groups;
+};
 
 // ══════════════════════════════════════════════════════════════
 // REACT EEG — Unified Platform
@@ -436,9 +460,15 @@ async function migrateLocalStorageToIdb() {
 
 async function saveEdfToDB(filename, arrayBuffer) {
   try {
+    // De-identification chokepoint (HIPAA Safe Harbor): scrub the EDF header
+    // (patient/recording/date/time) before anything is persisted, so IndexedDB never holds
+    // PHI regardless of which import path called us — and every export that reads these raw
+    // bytes (patient-package .zip, .reegb bundle) is PHI-free by construction. Returns a
+    // copy; the caller's in-memory buffer is untouched. See src/deid.js + test/deid.test.js.
+    const scrubbed = scrubEdfHeaderForFilename(arrayBuffer, filename);
     const db = await openEdfDB();
     const tx = db.transaction(EDF_DB_STORE, "readwrite");
-    tx.objectStore(EDF_DB_STORE).put(arrayBuffer, filename);
+    tx.objectStore(EDF_DB_STORE).put(scrubbed, filename);
     await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
   } catch (e) { console.warn("Failed to save EDF to IndexedDB:", e); }
 }
@@ -880,7 +910,7 @@ function generateDataSheetHTML(record, edfData) {
     <div class="header-meta">
       <div><b>Filename:</b> ${safe(record.filename)}</div>
       <div><b>Subject hash:</b> ${safe(record.subjectHash)} &nbsp; <b>Study type:</b> ${safe(STUDY_TYPES[record.studyType]?.label || record.studyType)}</div>
-      <div><b>Date:</b> ${safe(record.date)} &nbsp; <b>Sex:</b> ${safe(record.sex)} &nbsp; <b>Age:</b> ${safe(record.age)}</div>
+      <div><b>Date:</b> ${safe(generalizeDateToYear(record.date))} &nbsp; <b>Sex:</b> ${safe(record.sex)} &nbsp; <b>Age:</b> ${safe(fmtAge(record.age))}</div>
       <div><b>Channels:</b> ${safe(record.channels)} &nbsp; <b>Sample rate:</b> ${safe(record.sampleRate)} Hz &nbsp; <b>Duration:</b> ${safe(record.durationSec ? `${(record.durationSec/60).toFixed(1)} min` : `${record.duration} min`)}</div>
     </div>
   </div>
@@ -1085,25 +1115,9 @@ function checkProtocolCompliance(record, edfData = null) {
   return { compliant, passCount, warnCount, failCount, unknownCount, checks, computedAt: new Date().toISOString(), pipelineVersion: PIPELINE_VERSION };
 }
 
-// ── Utility: deterministic hash for de-identification ──
-// Uses cyrb53 (well-distributed 53-bit hash, public domain — bryc/code) instead of
-// the original djb2 variant, which collided badly on short similar inputs like
-// "PHY-S001" / "PHY-S004" / ... (the high-order hex digits stayed nearly identical).
-function hashSubjectId(id, salt = "REACT-EEG-2026") {
-  const str = salt + id;
-  let h1 = 0xdeadbeef ^ 0, h2 = 0x41c6ce57 ^ 0;
-  for (let i = 0; i < str.length; i++) {
-    const ch = str.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
-  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
-  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  const combined = 4294967296 * (2097151 & h2) + (h1 >>> 0);
-  return combined.toString(16).toUpperCase().padStart(6, "0").slice(-6);
-}
+// De-identification utilities (hashSubjectId, generateFilename, parseEdfPatientField, the
+// Safe-Harbor field helpers, and the EDF-header scrub) live in ./deid.js — imported above
+// and unit-tested in test/deid.test.js.
 
 // ── Study type codes ──
 const STUDY_TYPES = {
@@ -1113,19 +1127,6 @@ const STUDY_TYPES = {
   RT: { label: "Routine EEG", color: "#8B5CF6" },
   LT: { label: "Long-Term", color: "#6366F1" },
 };
-
-function generateFilename(subjectId, studyType, date, sex = "", age = "", seq = 1) {
-  // The 6-char hash is derived from the FULL subject ID and is what uniquely + deterministically
-  // identifies the subject (same subject → same hash). So the visible leading segment only needs
-  // the SOURCE acronym (e.g. "PHY-S001" → "PHY") for provenance — the per-subject number is
-  // redundant and is dropped, keeping filenames shorter.
-  const hash = hashSubjectId(subjectId);
-  const cleanId = subjectId.replace(/[^a-zA-Z0-9-]/g, "").toUpperCase();
-  const source = cleanId.split("-")[0] || cleanId;
-  const d = date.replace(/-/g, "");
-  const demo = (sex || age) ? `-${(sex || "").toUpperCase()}${age}` : "";
-  return `${source}${demo}-${studyType}-${hash}-${d}-${String(seq).padStart(3, "0")}.edf`;
-}
 
 // Decode a REACT-convention filename (SUBJECT[-SEX/AGE]-TYPE-HASH-DATE-SEQ.edf) into the segments
 // that aren't stored as standalone record fields — the subject ID (first token) and sequence
@@ -1155,26 +1156,6 @@ function decodeReactFilename(r) {
     out.source = (subjectPart.split("-")[0] || subjectPart) || "—";
   }
   return out;
-}
-
-// Parse EDF+ patient field: "subjectcode sex birthdate name"
-function parseEdfPatientField(field) {
-  if (!field || !field.trim()) return { sex: null, age: null };
-  const parts = field.trim().split(/\s+/);
-  let sex = null, age = null;
-  if (parts.length >= 2 && /^[MFX]$/i.test(parts[1])) sex = parts[1].toUpperCase();
-  if (parts.length >= 3 && /^\d{2}-[A-Z]{3}-\d{4}$/i.test(parts[2])) {
-    const months = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
-    const [dd, mmm, yyyy] = parts[2].split("-");
-    const mo = months[mmm.toUpperCase()];
-    if (mo !== undefined) {
-      const bd = new Date(parseInt(yyyy), mo, parseInt(dd));
-      const now = new Date();
-      age = Math.floor((now - bd) / (365.25 * 24 * 60 * 60 * 1000));
-      if (age < 0 || age > 120) age = null;
-    }
-  }
-  return { sex, age };
 }
 
 // Extract the subject ID and patient hash from filename
@@ -1711,6 +1692,27 @@ function getEDFEpochWindow(edfData, channelIndex, epochStart, epochSec, targetSr
   return { data: win, lead: leadSrc, len };
 }
 
+// Whole-channel signal resampled to targetSr (same anti-alias + linear resample as
+// getEDFEpochWindow, applied once over the entire recording). Backs the waveform derivation's
+// once-per-file cache so per-epoch scrolling is a cheap slice instead of a re-filter.
+function getEDFFullResampled(edfData, channelIndex, targetSr) {
+  if (!edfData?.channelData || channelIndex >= edfData.channelData.length) return null;
+  const sigSr = edfData.signals[channelIndex]?.sampleRate || edfData.sampleRate;
+  const raw = edfData.channelData[channelIndex];
+  if (!raw || raw.length === 0) return null;
+  if (sigSr === targetSr || targetSr <= 0) return raw;
+  let win = raw;
+  if (sigSr > targetSr && win.length >= 8) win = applyLowPass(win, targetSr / 2.5, sigSr, 4);
+  const ratio = sigSr / targetSr;
+  const totalTgt = Math.max(1, Math.round(win.length / ratio));
+  const out = new Float32Array(totalTgt);
+  for (let i = 0; i < totalTgt; i++) {
+    const si = i * ratio, lo = Math.floor(si), hi = Math.min(lo + 1, win.length - 1);
+    out[i] = win[lo] * (1 - (si - lo)) + win[hi] * (si - lo);
+  }
+  return out;
+}
+
 // ── EDF Writer ──
 function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSec = 1, patientId = "", recordingId = "" }) {
   const ns = channelLabels.length;
@@ -2156,13 +2158,13 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap, existingPath
         subjectHash: hashSubjectId(def.subjectId),
         subjectId: def.subjectId,
         sport: "", position: "",
-        studyType: def.studyType, date: def.date,
+        studyType: def.studyType, date: generalizeDateToYear(def.date), // Safe Harbor: year only
         filename: reactFilename,
         channels: parsed.numSignals,
         duration: Math.round((def.durationSec || parsed.totalDuration) / 60 * 10) / 10,
         durationSec: def.durationSec || parsed.totalDuration,
         sampleRate: parsed.sampleRate,
-        fileSize: fileSizeMB, sex: def.sex || "", age: def.age,
+        fileSize: fileSizeMB, sex: def.sex || "", age: capAge(def.age), // Safe Harbor: 90+ aggregate
         montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: true, fileType: "real-public",
         hasEdfData: true,
@@ -2830,7 +2832,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
   // them for the playback cursor; Acquire omits them). isLiveSimulation/simClipRef are a
   // dormant live-sim feature — undefined here, kept declared so the draw code can read them.
   const {
-    channels, waveformData, epochSec, epochStart, epochEnd, sampleRate,
+    channels, waveformData, fullChannels, epochSec, epochStart, epochEnd, sampleRate,
     sensitivity, channelSensitivity = {}, annotations = [], annotationDraft,
     selectedAnnotationType, hoveredTime, isAddingAnnotation, isMeasuring,
     measureSel, measureDragRef, containerRef, canvasRef, montage,
@@ -2847,19 +2849,55 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
   // The overlay sits over the trace with pointer-events:none so the container still owns mouse events.
   const overlayCanvasRef = useRef(null);
 
+  // Cache the container's pixel size so the hot draw path never calls getBoundingClientRect.
+  // Reading layout right after React commits the DOM forces a synchronous reflow every frame —
+  // the dominant cause of dropped frames during continuous (held-arrow) scrolling. A
+  // ResizeObserver refreshes the cache only when the element actually resizes.
+  const sizeRef = useRef({ w: 0, h: 0 });
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const update = () => { const r = el.getBoundingClientRect(); sizeRef.current = { w: r.width, h: r.height }; };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [containerRef]);
+  // Read the cached size; fall back to a (one-off) measurement only before the observer first fires.
+  const readSize = () => {
+    let { w, h } = sizeRef.current;
+    if (!w || !h) { const el = containerRef.current; if (el) { const r = el.getBoundingClientRect(); w = r.width; h = r.height; sizeRef.current = { w, h }; } }
+    return { w, h };
+  };
+
+  // ── Offscreen waveform tile cache (MP3-player-style instant scrubbing) ──
+  // The whole-file trace polylines are pre-rendered into fixed-width offscreen tiles at the
+  // viewport's pixels-per-second; scrubbing then blits the visible slice (1:1 drawImage) instead of
+  // re-path-drawing every channel each frame, so scroll cost is independent of channel count.
+  // Tiles render lazily on first visit and are LRU-capped (bounded memory, any file length). Only
+  // engaged when fullChannels is available (wavelet/ICA off); otherwise the canvas path-draws from
+  // waveformData as before. Tiles hold ONLY traces — grid/labels/annotations/axis stay per-frame.
+  const TILE_W = 2048, MAX_TILES = 16;
+  const tileCacheRef = useRef({ key: "", fc: null, tiles: new Map(), order: [] });
+
   const drawTrace = useCallback(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
-    const rect = container.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    canvas.style.width = rect.width + "px";
-    canvas.style.height = rect.height + "px";
+    const { w: W, h: H } = readSize();
+    if (!W || !H) return;
+    const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+    // Only reallocate the backing store when the size actually changes. Assigning canvas.width
+    // every frame (even to the same value) clears + reallocates the buffer and is the main cause
+    // of low frame-rate while scrolling. Re-set the transform absolutely each draw (setTransform,
+    // not scale, which would compound when the buffer isn't reset).
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw; canvas.height = bh;
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    }
     const ctx = canvas.getContext("2d");
-    ctx.scale(dpr, dpr);
-    const W = rect.width, H = rect.height;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = "#0a0a0a"; ctx.fillRect(0, 0, W, H);
 
     const labelWidth = 72, plotW = W - labelWidth - 16, plotX = labelWidth;
@@ -2886,7 +2924,59 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
       ctx.fillText(ann.type, x1 + 3, 12);
     });
 
-    // Channels
+    // Channels. Chain-break indices computed ONCE here (was recomputed per channel inside the
+    // loop → O(channels²) of hemisphere string-parsing every frame, the main cause of poor scroll
+    // smoothness at high channel counts).
+    const breaks = getChainBreaks(channels);
+
+    // Instant-scrub path: when whole-file signals are available (wavelet/ICA off, not live sim),
+    // blit pre-rendered trace tiles instead of path-drawing each channel's samples every frame.
+    const useTiles = !!fullChannels && fullChannels.length === channels.length && !isLiveSimulation && epochSec > 0;
+    const pxPerSec = plotW / epochSec;
+    const tileScale = (ch) => {
+      const aux = ch === "EKG" || ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
+      return (73.5 / Math.max(1, (aux ? 7 : sensitivity) + (channelSensitivity[ch] || 0))) * (ch === "EKG" ? 3 : 1);
+    };
+    const renderTile = (idx) => {
+      const tile = document.createElement("canvas");
+      tile.width = TILE_W; tile.height = Math.max(1, Math.round(H));
+      const tctx = tile.getContext("2d");
+      const tileStartSec = (idx * TILE_W) / pxPerSec, tileEndSec = ((idx + 1) * TILE_W) / pxPerSec;
+      for (let i = 0; i < channels.length; i++) {
+        const ch = channels[i];
+        const data = fullChannels[i] && fullChannels[i].data;
+        if (!data || !chPositions[i]) continue;
+        const yCenter = chPositions[i].yCenter, chScale = tileScale(ch);
+        const s0 = Math.max(0, Math.floor(tileStartSec * sampleRate));
+        const s1 = Math.min(data.length, Math.ceil(tileEndSec * sampleRate));
+        if (s1 <= s0) continue;
+        const step = Math.max(1, Math.floor((s1 - s0) / TILE_W / 2));
+        tctx.strokeStyle = ch === "EKG" ? "#FF3333" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B80" : "#1a8fff";
+        tctx.lineWidth = ch === "EKG" ? 1.2 : 0.9;
+        tctx.beginPath();
+        let first = true;
+        for (let j = s0; j < s1; j += step) {
+          const x = (j / sampleRate - tileStartSec) * pxPerSec;
+          const y = yCenter - (data[j] / chScale);
+          if (first) { tctx.moveTo(x, y); first = false; } else tctx.lineTo(x, y);
+        }
+        tctx.stroke();
+      }
+      return tile;
+    };
+    const getTile = (idx) => {
+      const c = tileCacheRef.current;
+      const key = `${channels.length}|${montage}|${sensitivity}|${JSON.stringify(channelSensitivity)}|${sampleRate}|${Math.round(pxPerSec*100)}|${Math.round(H)}`;
+      if (c.key !== key || c.fc !== fullChannels) { c.key = key; c.fc = fullChannels; c.tiles.clear(); c.order = []; }
+      let tile = c.tiles.get(idx);
+      if (!tile) {
+        tile = renderTile(idx);
+        c.tiles.set(idx, tile); c.order.push(idx);
+        while (c.order.length > MAX_TILES) { const ev = c.order.shift(); if (ev !== idx) c.tiles.delete(ev); }
+      } else { const oi = c.order.indexOf(idx); if (oi >= 0) { c.order.splice(oi, 1); c.order.push(idx); } }
+      return tile;
+    };
+
     channels.forEach((ch, i) => {
       const yCenter = chPositions[i].yCenter;
       const data = waveformData[i];
@@ -2901,7 +2991,6 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
       // breaks[] holds channel indices that START a new chain; the bright separator
       // belongs at the BOTTOM of the previous channel (i.e. between i and i+1) so it
       // aligns with the 8px gap added before channel i+1 in getChannelYPositions.
-      const breaks = getChainBreaks(channels);
       const isChainBreak = breaks.includes(i + 1);
       ctx.strokeStyle = isChainBreak ? "#2a2a2a" : "#151515"; ctx.lineWidth = isChainBreak ? 1 : 0.5;
       ctx.beginPath(); ctx.moveTo(plotX, chPositions[i].yTop + chPositions[i].height); ctx.lineTo(W, chPositions[i].yTop + chPositions[i].height); ctx.stroke();
@@ -2916,20 +3005,40 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
       ctx.font = "600 10px 'IBM Plex Mono', monospace"; ctx.textAlign = "right"; ctx.textBaseline = "middle";
       const labelText = isAvgRefCh ? (ch.split("-")[0] + "·avg") : ((isPartial ? "⚠ " : "") + ch);
       ctx.fillText(labelText, labelWidth - 8, yCenter);
-      ctx.strokeStyle = ch === "EKG" ? "#FF3333" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B80" : "#1a8fff";
-      ctx.lineWidth = ch === "EKG" ? 1.2 : 0.9;
-      ctx.beginPath();
-      const clipSamples = (isLiveSimulation && simClipRef?.current !== undefined)
-        ? Math.min(data.length, Math.floor(simClipRef.current * samplesPerEpoch))
-        : data.length;
-      const step = Math.max(1, Math.floor(clipSamples / plotW / 2));
-      for (let j = 0; j < clipSamples; j += step) {
-        const x = plotX + (j / samplesPerEpoch) * plotW;
-        const y = yCenter - (data[j] / chScale);
-        if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      // Trace polyline — only when NOT using the tile cache (tiles blit all traces after the loop).
+      if (!useTiles) {
+        ctx.strokeStyle = ch === "EKG" ? "#FF3333" : (ch==="LOC1"||ch==="LOC2"||ch==="ROC1"||ch==="ROC2") ? "#F59E0B80" : "#1a8fff";
+        ctx.lineWidth = ch === "EKG" ? 1.2 : 0.9;
+        ctx.beginPath();
+        const clipSamples = (isLiveSimulation && simClipRef?.current !== undefined)
+          ? Math.min(data.length, Math.floor(simClipRef.current * samplesPerEpoch))
+          : data.length;
+        const step = Math.max(1, Math.floor(clipSamples / plotW / 2));
+        for (let j = 0; j < clipSamples; j += step) {
+          const x = plotX + (j / samplesPerEpoch) * plotW;
+          const y = yCenter - (data[j] / chScale);
+          if (j === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
       }
-      ctx.stroke();
     });
+
+    // Tile blit — the visible window of pre-rendered whole-file traces, 1:1 (instant scrub).
+    if (useTiles) {
+      const x0 = epochStart * pxPerSec;                 // cache-px at the viewport's left edge
+      const firstTile = Math.max(0, Math.floor(x0 / TILE_W));
+      const lastTile = Math.floor((x0 + plotW - 1) / TILE_W);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(plotX, 0, plotW, H); ctx.clip(); // keep traces out of the label gutter
+      for (let t = firstTile; t <= lastTile; t++) {
+        const tilePx0 = t * TILE_W;
+        const srcLeft = Math.max(x0, tilePx0), srcRight = Math.min(x0 + plotW, tilePx0 + TILE_W);
+        if (srcRight <= srcLeft) continue;
+        const tile = getTile(t);
+        ctx.drawImage(tile, srcLeft - tilePx0, 0, srcRight - srcLeft, H, plotX + (srcLeft - x0), 0, srcRight - srcLeft, H);
+      }
+      ctx.restore();
+    }
 
     // Sweep line for live simulation
     if (isLiveSimulation && simClipRef?.current !== undefined && simClipRef.current < 1.0) {
@@ -2980,22 +3089,31 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
     ctx.fillStyle = "#7ec8d9"; ctx.font = "bold 9px 'IBM Plex Mono', monospace";
     ctx.fillText(`${epochSec}s/pg`, 6, H - 3);
     ctx.textBaseline = "alphabetic";
-  }, [waveformData, channels, epochSec, epochStart, epochEnd, sampleRate, sensitivity, channelSensitivity, annotations, canvasRef, containerRef, isLiveSimulation, simClipRef, montage]);
+  }, [waveformData, fullChannels, channels, epochSec, epochStart, epochEnd, sampleRate, sensitivity, channelSensitivity, annotations, canvasRef, containerRef, isLiveSimulation, simClipRef, montage]);
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayCanvasRef.current;
     const container = containerRef.current;
     if (!canvas || !container) return;
-    const rect = container.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    canvas.style.width = rect.width + "px";
-    canvas.style.height = rect.height + "px";
+    const { w: W, h: H } = readSize();
+    if (!W || !H) return;
+    const bw = Math.round(W * dpr), bh = Math.round(H * dpr);
+    // Resize the backing store only when needed (see drawTrace) — avoids per-frame realloc jank.
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw; canvas.height = bh;
+      canvas.style.width = W + "px"; canvas.style.height = H + "px";
+    }
     const ctx = canvas.getContext("2d");
-    ctx.scale(dpr, dpr);
-    const W = rect.width, H = rect.height;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
+
+    // Nothing to overlay (no hover crosshair, annotation draft, playback cursor or measurement)
+    // — clear and bail. During a glide none of these are active (the glide pauses playback), so
+    // scrolling no longer pays for getChannelYPositions + the overlay draws every frame.
+    if (!annotationDraft && hoveredTime == null && playbackAbsSec == null && !isMeasuring && !measureSel && !(measureDragRef && measureDragRef.current)) {
+      return;
+    }
 
     const labelWidth = 72, plotW = W - labelWidth - 16, plotX = labelWidth;
     const { positions: chPositions, chHeight } = getChannelYPositions(channels, montage, H);
@@ -5914,6 +6032,16 @@ function AnnotationPanel({ annotations, setAnnotations, isAddingAnnotation, setI
       </div>
       <div style={{padding:"8px 12px",borderTop:"1px solid #1a1a1a"}}>
         <button onClick={()=>{
+          // G4: scan annotation free-text for likely PHI before this sidecar leaves the system.
+          const annPhi = [];
+          (annotations || []).forEach((a, i) => {
+            const hits = scanTextForPHI(a.label || a.text || "");
+            if (hits.length) annPhi.push(`• annotation #${i + 1}: ${hits.join(", ")}`);
+          });
+          if (annPhi.length && !window.confirm(
+            `Possible PHI detected in annotation text that will be exported:\n\n${annPhi.slice(0, 12).join("\n")}` +
+            `${annPhi.length > 12 ? `\n…and ${annPhi.length - 12} more` : ""}\n\nRemove the flagged content first, or export anyway?`
+          )) { return; }
           // Annotation sidecar with provenance header — built via the shared sidecar helper
           // so schema/pipeline/app stamps are identical to the patient-package writer.
           const sidecar = buildAnnotationSidecar(annotations, filename);
@@ -6451,7 +6579,10 @@ function useEEGState(totalDuration = 600, edfData = null) {
     visibilityDispatch({ type: 'AUTO_HIDE_BY_DATA', channelsWithData, allChannels });
   }, [channelsWithData, allChannels]);
 
-  const channels = allChannels.filter(ch => !hiddenChannels.has(ch));
+  // Memoized so its array identity is stable across renders (it only changes when the montage's
+  // electrode set or the hidden-channel set actually changes). This keeps the heavy, currentEpoch-
+  // independent fullChannels memo from busting on every scroll — the key to smooth scrolling.
+  const channels = useMemo(() => allChannels.filter(ch => !hiddenChannels.has(ch)), [allChannels, hiddenChannels]);
   const totalEpochs = Math.ceil(totalDuration / epochSec);
   const epochStart = currentEpoch * epochSec;
   const epochEnd = Math.min(epochStart + epochSec, totalDuration);
@@ -6492,150 +6623,133 @@ function useEEGState(totalDuration = 600, edfData = null) {
   // electrodes are available, since an average over too few channels isn't meaningful.
   // Common average reference, computed over the SAME guard-extended window the electrodes use
   // (so electrode − CAR stays aligned before cropping). Returns { data, lead, len } or null.
-  const avgRefSignal = useMemo(() => {
+  // Common Average Reference over the WHOLE recording (raw scalp electrodes, resampled to the
+  // display rate), computed once per file. Channels that re-reference to the average subtract this
+  // and are then filtered — identical by linearity to the old per-epoch CAR-then-filter.
+  const avgRefFull = useMemo(() => {
     if (!edfData || !edfData.channelData || !edfData.channelLabels) return null;
-    let sum = null, lead = 0, len = 0, count = 0;
+    let sum = null, count = 0;
     edfData.channelLabels.forEach((label, idx) => {
       if (!extractElectrodeName(label)) return; // scalp EEG electrodes only
-      const w = getEDFEpochWindow(edfData, idx, epochStart, epochSec, sampleRate, FILTER_GUARD_SEC);
-      if (!w) return;
-      if (!sum) { sum = new Float32Array(w.data.length); lead = w.lead; len = w.len; }
-      const m = Math.min(sum.length, w.data.length);
-      for (let i = 0; i < m; i++) sum[i] += w.data[i];
+      const full = getEDFFullResampled(edfData, idx, sampleRate);
+      if (!full) return;
+      if (!sum) sum = new Float32Array(full.length);
+      const m = Math.min(sum.length, full.length);
+      for (let i = 0; i < m; i++) sum[i] += full[i];
       count++;
     });
     if (!sum || count < 4) return null;
     for (let i = 0; i < sum.length; i++) sum[i] /= count;
-    return { data: sum, lead, len };
-  }, [edfData, epochStart, epochSec, sampleRate]);
+    return sum;
+  }, [edfData, sampleRate]);
 
-  // Subtract the common average reference from a guard-extended electrode window (electrode − CAR).
-  // Returns a new Float32Array of the same length, or null if no average is available.
-  const reReferenceToAverage = (extData) => {
-    if (!extData || !avgRefSignal) return null;
-    const a = avgRefSignal.data;
-    const out = new Float32Array(extData.length);
-    const m = Math.min(extData.length, a.length);
-    for (let i = 0; i < extData.length; i++) out[i] = extData[i] - (i < m ? a[i] : 0);
-    return out;
-  };
-
-  const waveformData = useMemo(() => {
-    const Nep = Math.round(sampleRate * epochSec);
-    // Fetch a guard-extended window for an electrode (real signal padding each side of the epoch).
-    const win = (idx) => getEDFEpochWindow(edfData, idx, epochStart, epochSec, sampleRate, FILTER_GUARD_SEC);
-    return channels.map((ch) => {
-      const fullIdx = allChannels.indexOf(ch);
-      let ext;                    // guard-extended signal (filtered as a whole, then cropped)
-      let lead = 0, len = Nep;    // visible epoch lives at ext[lead .. lead+len)
-      let isPartial = false;      // bipolar ref missing AND no average available → truly unreferenced
-      let isAvgFallback = false;  // bipolar ref missing → re-referenced to the common average instead
-
-      // Use real EDF data if available
-      if (edfData && edfData.channelData) {
-        const isEyeLead = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
-        const isEKG = ch === "EKG";
-        // "As recorded" traces are raw file signals — match the full label and display as-is
-        // (never re-derive), even when the label itself contains a "-" derivation.
-        const isSingleLabel = montage === MONTAGE_AS_RECORDED || isEyeLead || isEKG || !ch.includes("-");
-
-        if (isSingleLabel) {
-          // EKG: match ECG label in EDF
-          const searchLabel = isEKG ? "ECG" : ch;
-          const edfIdx = edfData.channelLabels.findIndex(l => {
-            const n = normEdf(l);
-            if (n === normCh(searchLabel) || n === normCh(ch)) return true;
-            if (isEKG && (n === "ECG" || n === "EKG")) return true;
-            if (isEyeLead && EYE_LEAD_ALIASES[n] === ch) return true;
-            return false;
-          });
-          if (edfIdx >= 0) {
-            const w = win(edfIdx);
-            if (w) {
-              ext = w.data; lead = w.lead; len = w.len;
-              // ECG channels in many EDF files are stored in mV — convert to µV for display
-              if (isEKG) {
-                let maxAbs = 0;
-                for (let i = 0; i < ext.length; i++) { const a = Math.abs(ext[i]); if (a > maxAbs) maxAbs = a; }
-                if (maxAbs > 0 && maxAbs < 10) { // values < 10 likely in mV, scale to µV
-                  const scaled = new Float32Array(ext.length);
-                  for (let i = 0; i < ext.length; i++) scaled[i] = ext[i] * 1000;
-                  ext = scaled;
-                }
-              }
-            }
+  // ── Whole-signal channel derivation + linear filtering (currentEpoch-INDEPENDENT) ──
+  // PERF: the heavy montage derivation + zero-phase HPF/LPF/notch run ONCE per file+settings over
+  // the entire recording and are cached here. Scrolling then only slices the visible epoch (see
+  // waveformData below) instead of re-filtering every channel each step. HPF/LPF/notch and CAR are
+  // linear, so filtering whole electrodes then deriving equals the old derive-then-filter-per-epoch
+  // (whole-signal filtfilt settles on the entire record — equal or better than the old 3 s guard).
+  const fullChannels = useMemo(() => {
+    if (!edfData || !edfData.channelData) return channels.map(() => ({ data: null, __partial: false, __avgRef: false }));
+    const elCache = new Map();
+    const fullEl = (idx) => { if (!elCache.has(idx)) elCache.set(idx, getEDFFullResampled(edfData, idx, sampleRate)); return elCache.get(idx); };
+    const reRefAvg = (sig) => {
+      if (!sig || !avgRefFull) return null;
+      const out = new Float32Array(sig.length);
+      const m = Math.min(sig.length, avgRefFull.length);
+      for (let i = 0; i < sig.length; i++) out[i] = sig[i] - (i < m ? avgRefFull[i] : 0);
+      return out;
+    };
+    const __r = channels.map((ch) => {
+      let sig = null, isPartial = false, isAvgFallback = false;
+      const isEyeLead = ch === "LOC1" || ch === "LOC2" || ch === "ROC1" || ch === "ROC2";
+      const isEKG = ch === "EKG";
+      const isSingleLabel = montage === MONTAGE_AS_RECORDED || isEyeLead || isEKG || !ch.includes("-");
+      if (isSingleLabel) {
+        const searchLabel = isEKG ? "ECG" : ch;
+        const edfIdx = edfData.channelLabels.findIndex(l => {
+          const n = normEdf(l);
+          if (n === normCh(searchLabel) || n === normCh(ch)) return true;
+          if (isEKG && (n === "ECG" || n === "EKG")) return true;
+          if (isEyeLead && EYE_LEAD_ALIASES[n] === ch) return true;
+          return false;
+        });
+        if (edfIdx >= 0) {
+          sig = fullEl(edfIdx);
+          // ECG often stored in mV → scale to µV for display (same heuristic as before)
+          if (sig && isEKG) {
+            let maxAbs = 0; for (let i = 0; i < sig.length; i++) { const a = Math.abs(sig[i]); if (a > maxAbs) maxAbs = a; }
+            if (maxAbs > 0 && maxAbs < 10) { const s = new Float32Array(sig.length); for (let i = 0; i < sig.length; i++) s[i] = sig[i] * 1000; sig = s; }
           }
-        } else {
-          const parts = ch.split("-");
-          const ref = parts[parts.length - 1];
-          const isAvgRef = ref === "Avg";
-          const isCzRef = ref === "Cz";
-
-          const idx1 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[0]));
-
-          if (isAvgRef) {
-            // Average-reference montage — electrode minus the common average. Falls back to the
-            // raw electrode only when too few channels exist for a meaningful average.
-            if (idx1 >= 0) {
-              const w = win(idx1);
-              if (w) { ext = reReferenceToAverage(w.data) || w.data; lead = w.lead; len = w.len; }
-            }
-          } else if (isCzRef) {
-            if (idx1 >= 0) { const w = win(idx1); if (w) { ext = w.data; lead = w.lead; len = w.len; } }
-          } else if (parts.length === 2) {
-            const idx2 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[1]));
-            if (idx1 >= 0 && idx2 >= 0) {
-              const w1 = win(idx1), w2 = win(idx2);
-              if (w1 && w2) {
-                // Both fetched with identical params → same lead/length, so they subtract aligned.
-                ext = new Float32Array(w1.data.length); lead = w1.lead; len = w1.len;
-                for (let i = 0; i < ext.length; i++) ext[i] = w1.data[i] - (i < w2.data.length ? w2.data[i] : 0);
-              }
-            } else if (idx1 >= 0) {
-              // Reference electrode missing in the EDF. Rather than show this electrode
-              // unreferenced (which carries whatever drift/artifact the original recording
-              // reference had), re-reference it to the common average — this cancels shared
-              // common-mode artifact while preserving the electrode's local activity. If there
-              // aren't enough scalp electrodes for a meaningful average, fall back to the raw
-              // single electrode and flag it as truly partial/unreferenced.
-              const w = win(idx1);
-              if (w) {
-                lead = w.lead; len = w.len;
-                const avg = reReferenceToAverage(w.data);
-                if (avg) { ext = avg; isAvgFallback = true; }
-                else { ext = w.data; isPartial = true; }
-              }
-            }
+        }
+      } else {
+        const parts = ch.split("-");
+        const ref = parts[parts.length - 1];
+        const isAvgRef = ref === "Avg";
+        const isCzRef = ref === "Cz";
+        const idx1 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[0]));
+        if (isAvgRef) {
+          if (idx1 >= 0) { const e = fullEl(idx1); sig = reRefAvg(e) || e; }
+        } else if (isCzRef) {
+          if (idx1 >= 0) sig = fullEl(idx1);
+        } else if (parts.length === 2) {
+          const idx2 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[1]));
+          if (idx1 >= 0 && idx2 >= 0) {
+            const a = fullEl(idx1), b = fullEl(idx2);
+            if (a && b) { sig = new Float32Array(a.length); for (let i = 0; i < a.length; i++) sig[i] = a[i] - (i < b.length ? b[i] : 0); }
+          } else if (idx1 >= 0) {
+            // Reference electrode missing → re-reference to the common average (or flag partial).
+            const e = fullEl(idx1);
+            const avg = reRefAvg(e);
+            if (avg) { sig = avg; isAvgFallback = true; }
+            else { sig = e; isPartial = true; }
           }
         }
       }
-
-      // Fall back: no matching EDF channel → flat line.
-      // (Synthetic signal generation was removed — all displayed signals must come
-      // from a real EDF in edfData.channelData.)
-      if (!ext) { ext = new Float32Array(Nep); lead = 0; len = Nep; }
-
+      if (!sig) return { data: null, __partial: false, __avgRef: false };
+      // Per-channel filter settings (override or global), applied once over the whole signal.
       const chHpf = channelHpf[ch] !== undefined ? channelHpf[ch] : hpf;
       const chLpf = channelLpf[ch] !== undefined ? channelLpf[ch] : lpf;
-      // Filter the guard-extended window so the IIR/zero-phase filters settle on real
-      // neighbouring data, THEN crop to the visible epoch — no edge transient pinned to the
-      // window boundary. (At the true file start lead=0, so only that one edge can still reflect.)
-      if (chHpf > 0) ext = applyHighPass(ext, chHpf, sampleRate);
-      if (chLpf > 0) ext = applyLowPass(ext, chLpf, sampleRate);
-      if (notch > 0) ext = applyNotch(ext, notch, sampleRate);
-      // Wavelet denoising (EEG channels only)
-      if (waveletDenoise && !AUX_CHANNELS.has(ch)) {
+      let out = sig;
+      if (chHpf > 0) out = applyHighPass(out, chHpf, sampleRate);
+      if (chLpf > 0) out = applyLowPass(out, chLpf, sampleRate);
+      if (notch > 0) out = applyNotch(out, notch, sampleRate);
+      return { data: out, __partial: isPartial, __avgRef: isAvgFallback };
+    });
+    return __r;
+  }, [montage, hpf, lpf, notch, sampleRate, channels, allChannels, channelHpf, channelLpf, edfData, avgRefFull]);
+
+  // ── Per-epoch slice — the ONLY thing that re-runs while scrolling (cheap). ──
+  // Slices each pre-derived/pre-filtered full channel to the visible epoch. Wavelet denoise
+  // (opt-in, nonlinear) still runs per-epoch on a guard-extended slice so its behaviour is
+  // unchanged; with it off (default) this is a pure array slice → smooth scrolling.
+  const waveformData = useMemo(() => {
+    const Nep = Math.round(sampleRate * epochSec);
+    const start = Math.round(epochStart * sampleRate);
+    const guard = Math.round(FILTER_GUARD_SEC * sampleRate);
+    const padTo = (a) => { if (a.length >= Nep) return a; const p = new Float32Array(Nep); p.set(a); return p; };
+    const __wf = fullChannels.map((fc, ci) => {
+      const ch = channels[ci];
+      const fd = fc && fc.data;
+      let raw;
+      if (!fd) {
+        raw = new Float32Array(Nep);
+      } else if (waveletDenoise && !AUX_CHANNELS.has(ch)) {
+        // Guard-extended slice so the wavelet edges settle, then crop to the visible epoch.
+        const ws = Math.max(0, start - guard), we = Math.min(fd.length, start + Nep + guard);
+        const lead = start - ws;
         const levels = sampleRate >= 256 ? 5 : 4;
-        ext = applyWaveletDenoise(ext, levels).data;
+        const seg = applyWaveletDenoise(fd.slice(ws, we), levels).data;
+        raw = padTo(seg.slice(lead, lead + Nep));
+      } else {
+        raw = padTo(fd.slice(start, start + Nep));
       }
-      // Crop the guard padding off, leaving exactly the visible epoch.
-      const raw = (lead > 0 || len < ext.length) ? ext.slice(lead, lead + len) : ext;
-      // Stamp derivation flags for the canvas label to surface
-      if (isPartial) raw.__partial = true;
-      if (isAvgFallback) raw.__avgRef = true;
+      if (fc && fc.__partial) raw.__partial = true;
+      if (fc && fc.__avgRef) raw.__avgRef = true;
       return raw;
     });
-  }, [montage, hpf, lpf, notch, epochSec, currentEpoch, sampleRate, channels, allChannels, hiddenChannels, channelHpf, channelLpf, edfData, epochStart, waveletDenoise, avgRefSignal]);
+    return __wf;
+  }, [fullChannels, epochSec, epochStart, currentEpoch, sampleRate, waveletDenoise, channels]);
 
   // ICA artifact cleaning — train the mixing matrix once per file+filter combo,
   // apply per-epoch via the cheap projection path.
@@ -6842,6 +6956,11 @@ function useEEGState(totalDuration = 600, edfData = null) {
     epochSec, setEpochSec: (v) => { setEpochSec(v); setCurrentEpoch(0); },
     currentEpoch, setCurrentEpoch, sensitivity, setSensitivity, sampleRate,
     channels, allChannels, totalEpochs, epochStart, epochEnd, totalDuration, waveformData: cleanedWaveformData,
+    // Whole-file, montage-derived + linearly-filtered channel signals for the offscreen waveform
+    // tile cache (instant scrubbing). Exposed ONLY when the per-epoch NONLINEAR steps are off
+    // (wavelet denoise / ICA), since those aren't baked into fullChannels — the canvas falls back
+    // to the per-epoch path-draw when this is null. Each entry: { data: Float32Array(wholeSignal) }.
+    fullChannels: (waveletDenoise || icaClean) ? null : fullChannels,
     annotations, setAnnotations, selectedAnnotationType, setSelectedAnnotationType,
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
@@ -7086,7 +7205,9 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
 
   // Collapsed → minimize the sidebar to a vertical rail of one-letter collection icons.
   const [collapsed, setCollapsed] = useState(() => {
-    try { return localStorage.getItem(STORAGE_KEYS.COLLECTIONS_COLLAPSED) === "1"; } catch { return false; }
+    // Default to collapsed (closed) when the user hasn't set a preference yet; once they
+    // toggle it, that choice persists and is respected here.
+    try { const v = localStorage.getItem(STORAGE_KEYS.COLLECTIONS_COLLAPSED); return v === null ? true : v === "1"; } catch { return true; }
   });
   const setCollapsedPersist = (v) => {
     setCollapsed(v);
@@ -7133,7 +7254,7 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
   }
 
   return (
-    <div style={{width:200,height:"100%",background:"#0a0a0a",borderRight:"1px solid #1a1a1a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:0}}>
+    <div style={{width:236,height:"100%",background:"#0a0a0a",borderRight:"1px solid #1a1a1a",display:"flex",flexDirection:"column",flexShrink:0,minHeight:0}}>
       <div data-tut="Collections: User-defined groups for organizing recordings (e.g. by study, cohort or protocol). Click one to filter the list to just its members." style={{padding:"8px 10px",borderBottom:"1px solid #1a1a1a",display:"flex",alignItems:"center",gap:8}}>
         {folderToggle}
         <span style={{flex:1,fontSize:9,fontWeight:700,color:"#666",letterSpacing:"0.1em"}}>COLLECTIONS</span>
@@ -7193,7 +7314,7 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
         <div data-tut="Compliance criteria: The fixed checklist a recording must meet to be promotion-eligible in the repository. A recording is compliant when none of these fail (Unknown is allowed)."
           style={{borderTop:"1px solid #1a1a1a",background:"#080808",flexShrink:0,maxHeight:"42%",overflowY:"auto"}}>
           <div style={{padding:"8px 12px 4px",position:"sticky",top:0,background:"#080808"}}>
-            <span style={{fontSize:9,fontWeight:700,color:"#4a9bab",letterSpacing:"0.1em"}}>COMPLIANCE CRITERIA</span>
+            <span style={{fontSize:10,fontWeight:700,color:"#4a9bab",letterSpacing:"0.1em"}}>COMPLIANCE CRITERIA</span>
           </div>
           <div style={{padding:"0 10px 10px"}}>
             {COMPLIANCE_CRITERIA.map(c => {
@@ -7201,16 +7322,16 @@ function CollectionsSidebar({ collections, selectedCollectionId, onSelect, recor
               // so the criterion name and its threshold stack cleanly without colliding.
               const name = c.label.replace(/\s*[≥≤].*$/, "").trim() || c.label;
               return (
-                <div key={c.id} title={c.desc} style={{display:"flex",gap:6,padding:"4px 2px",borderBottom:"1px solid #0f0f0f"}}>
-                  <span style={{color:"#3a6b75",fontSize:9,lineHeight:1.5,flexShrink:0}}>▸</span>
+                <div key={c.id} title={c.desc} style={{display:"flex",gap:6,padding:"5px 2px",borderBottom:"1px solid #0f0f0f"}}>
+                  <span style={{color:"#3a6b75",fontSize:11,lineHeight:1.4,flexShrink:0}}>▸</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:10,color:"#bbb",lineHeight:1.3,wordBreak:"break-word"}}>{name}</div>
-                    <div style={{fontSize:9,color:"#5a8b95",fontFamily:"'IBM Plex Mono', monospace",lineHeight:1.3,wordBreak:"break-word"}}>{c.threshold}</div>
+                    <div style={{fontSize:12,color:"#bbb",lineHeight:1.35,wordBreak:"break-word"}}>{name}</div>
+                    <div style={{fontSize:11,color:"#5a8b95",fontFamily:"'IBM Plex Mono', monospace",lineHeight:1.35,wordBreak:"break-word"}}>{c.threshold}</div>
                   </div>
                 </div>
               );
             })}
-            <div style={{fontSize:8,color:"#444",lineHeight:1.4,marginTop:6}}>
+            <div style={{fontSize:9,color:"#444",lineHeight:1.4,marginTop:6}}>
               Promotion-eligible when no criterion fails. “Unknown” (e.g. impedance not stored) does not block.
             </div>
           </div>
@@ -7304,12 +7425,12 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
         subjectId: result.manifest.subjectHash, // hash-only — original subjectId not in package
         sport: "", position: "",
         studyType: meta.studyType || "BL",
-        date: meta.date || new Date().toISOString().split("T")[0],
+        date: generalizeDateToYear(meta.date || new Date().toISOString().split("T")[0]), // Safe Harbor: year only
         filename: imp.filename,
         channels: meta.channels || parsed.numSignals, duration: meta.duration || Math.round(parsed.totalDuration / 60),
         durationSec: meta.durationSec || parsed.totalDuration, sampleRate: meta.sampleRate || parsed.sampleRate,
         fileSize: meta.fileSize || Math.round(imp.edfArrayBuffer.byteLength / 1024 / 1024 * 10) / 10,
-        sex: meta.sex || "", age: meta.age ?? null,
+        sex: meta.sex || "", age: capAge(meta.age ?? null), // Safe Harbor: 90+ aggregate
         montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: false, isImportedPackage: true, fileType: "imported-package",
         hasEdfData: true,
@@ -7560,7 +7681,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
               <tr style={{borderBottom:"1px solid #1a1a1a"}}>
               {[
                 {key:null,label:"",w:"4%"},
-                {key:"filename",label:"FILE",sort:true,w:"17%"},
+                {key:"filename",label:"FILE",sort:true,w:"24%"},
                 {key:null,label:"SUBJECT",w:"8%"},
                 {key:null,label:"SEQ",w:"5%"},
                 {key:null,label:"SEX/AGE",w:"6%"},
@@ -7606,7 +7727,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
                   <td data-tut="File: The de-identified filename. The colored dot shows data status — green recorded, yellow imported, blue test, red no EDF data. Hover the name for channels, duration and size." style={{padding:"10px 16px 10px 4px",verticalAlign:"middle",textAlign:"left"}}>
                     <div style={{display:"flex",alignItems:"center",gap:8,justifyContent:"flex-start"}}>
                       <span title={dotTitle} style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:dotColor,flexShrink:0}}/>
-                      <span title={`${r.filename}  —  ${r.channels}ch · ${durStr} · ${r.fileSize}MB`} style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:13,color:"#ddd",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:200}}>{r.filename}</span>
+                      <span title={`${r.filename}  —  ${r.channels}ch · ${durStr} · ${r.fileSize}MB`} style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:13,color:"#ddd",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:340}}>{r.filename}</span>
                     </div>
                   </td>
                   {/* SUBJECT — source acronym only (provenance). The per-subject number is dropped
@@ -7620,12 +7741,12 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
                   </td>
                   {/* SEX/AGE — research covariates (not PHI). "—" = not recorded; M=Male, F=Female, X=Other. */}
                   <td data-tut="Sex / Age: Patient sex (M=Male, F=Female, X=Other) and age in years. Shows — when not recorded. De-identified research covariates, not identifying info." style={{padding:"10px 16px",verticalAlign:"middle"}}>
-                    <span title={`Sex: ${r.sex==="M"?"Male":r.sex==="F"?"Female":r.sex==="X"?"Other":"not recorded"} · Age: ${r.age!=null?r.age:"not recorded"}`}
-                      style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:(r.sex||r.age!=null)?"#999":"#555",whiteSpace:"nowrap"}}>{r.sex || "—"}{r.age != null ? ` / ${r.age}` : ""}</span>
+                    <span title={`Sex: ${r.sex==="M"?"Male":r.sex==="F"?"Female":r.sex==="X"?"Other":"not recorded"} · Age: ${r.age!=null?fmtAge(r.age):"not recorded"}`}
+                      style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:(r.sex||r.age!=null)?"#999":"#555",whiteSpace:"nowrap"}}>{r.sex || "—"}{r.age != null ? ` / ${fmtAge(r.age)}` : ""}</span>
                   </td>
                   {/* DATE — recording date (filename segment, YYYY-MM-DD) */}
                   <td data-tut="Date: The recording date, decoded from the filename (YYYY-MM-DD)." style={{padding:"10px 16px",verticalAlign:"middle"}}>
-                    <span style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:dec.date!=="—"?"#999":"#555",whiteSpace:"nowrap"}}>{dec.date}</span>
+                    <span style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:dec.date!=="—"?"#999":"#555",whiteSpace:"nowrap"}}>{dec.date==="—"?"—":generalizeDateToYear(dec.date)}</span>
                   </td>
                   {/* TYPE — study-type code (filename segment) */}
                   <td data-tut="Type: The study type of this recording — Baseline, Post-Injury, Follow-Up, Routine or Long-Term." style={{padding:"10px 16px",verticalAlign:"middle"}}><TypeBadge record={r}/></td>
@@ -7809,6 +7930,26 @@ function RepositoryTab() {
   useFocusTrap(licenseDialogRef, !!licenseTarget, () => setLicenseTarget(null));
 
   const handleBundleSubject = async (subjectHash) => {
+    // G4: scan the free-text that this package will carry (clinical notes, record notes +
+    // annotation labels) for likely PHI and require explicit confirmation before it leaves the
+    // system. Field names and categories are shown, never the raw matched value.
+    const subjRecs = records.filter(r => r.subjectHash === subjectHash && r.repositoryStatus === "promoted");
+    const phiFindings = [];
+    for (const r of subjRecs) {
+      const noteHits = scanTextForPHI(clinicalNotesMap?.[r.filename] || "");
+      if (noteHits.length) phiFindings.push(`• notes (${r.filename}): ${noteHits.join(", ")}`);
+      const recNoteHits = scanTextForPHI(r.notes || "");
+      if (recNoteHits.length) phiFindings.push(`• record notes (${r.filename}): ${recNoteHits.join(", ")}`);
+      (annotationsMap?.[r.filename] || []).forEach((a, i) => {
+        const hits = scanTextForPHI(a.label || a.text || "");
+        if (hits.length) phiFindings.push(`• annotation #${i + 1} (${r.filename}): ${hits.join(", ")}`);
+      });
+    }
+    if (phiFindings.length && !window.confirm(
+      `Possible PHI detected in free-text that will be included in this patient package:\n\n${phiFindings.slice(0, 12).join("\n")}` +
+      `${phiFindings.length > 12 ? `\n…and ${phiFindings.length - 12} more` : ""}\n\n` +
+      `These notes/annotations are exported as-is. Remove the flagged content first, or export anyway?`
+    )) { return; }
     setBundling(subjectHash);
     try {
       const result = await buildPatientPackageZip({ subjectHash, records, annotationsMap, clinicalNotesMap });
@@ -8441,9 +8582,9 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
     const deIdFilename = generateFilename(form.subjectId,form.studyType,form.date,form.sex,form.age);
     const record = {
       id:`REC-${Date.now()}`,subjectHash:hashSubjectId(form.subjectId),subjectId:form.subjectId,sport:"",position:"",
-      studyType:form.studyType,date:form.date,filename:deIdFilename,
+      studyType:form.studyType,date:generalizeDateToYear(form.date),filename:deIdFilename, // Safe Harbor: year only
       channels:form.channels,duration:form.duration,sampleRate:form.sampleRate,
-      fileSize:fileSizeMB,sex:form.sex||"",age:form.age?parseInt(form.age):null,
+      fileSize:fileSizeMB,sex:form.sex||"",age:form.age?capAge(parseInt(form.age)):null, // Safe Harbor: 90+ aggregate
       montage:form.montage,status:"pending",isTest:false,notes:form.notes,uploadedAt:new Date().toISOString(),
       sourceFile: selectedFile ? selectedFile.name : null,
       hasEdfData: !!selectedFile,
@@ -8546,8 +8687,11 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
         <div style={{marginTop:6,fontSize:10,color:"#F59E0B"}}>Warning: file does not have .edf or .bdf extension</div>
       )}
       {fileInfo?.patientField && (
-        <div style={{marginTop:6,fontSize:10,color:"#F59E0B"}}>
-          EDF header contains patient ID field: "{fileInfo.patientField}" - this will NOT be stored. De-identified filename will be used.
+        <div style={{marginTop:6,fontSize:10,color:"#10B981",lineHeight:1.5}}>
+          Identifying info detected in the EDF header. On import it is removed (HIPAA Safe Harbor):
+          the stored file's patient, recording, date and time fields are scrubbed, only sex and age
+          are kept as de-identified research covariates, and the recording is saved under a
+          de-identified filename. The raw identifier is not displayed or stored.
         </div>
       )}
     </div>
@@ -8687,7 +8831,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // body uses (openReview→onSelectRecord), so the rest of the ~810-line component is unchanged.
   const { records, setRecords, edfFileStore, setEdfFileStore, annotationsMap, setAnnotationsMap,
     clinicalNotesMap, setClinicalNotesMap, baselineMap, setBaselineMap, updateRecordStatus,
-    openReview: onSelectRecord } = useAppStore();
+    collections, openReview: onSelectRecord } = useAppStore();
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   // Per-signal EDF analysis (electrode/type/RMS) — drives the montage-builder green dots
@@ -8787,6 +8931,21 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // Save bundle: gather everything for this record into a .reegb JSON file
   const handleSaveBundle = async () => {
     if (!record) return;
+    // G4: warn on likely PHI in this file's free-text (clinical notes, record notes + annotation
+    // labels) before it is written into the .reegb bundle. Categories shown, raw values never echoed.
+    const bundlePhi = [];
+    const noteHits = scanTextForPHI(clinicalNotesMap[filename] || "");
+    if (noteHits.length) bundlePhi.push(`• clinical notes: ${noteHits.join(", ")}`);
+    const recNoteHits = scanTextForPHI(record.notes || "");
+    if (recNoteHits.length) bundlePhi.push(`• record notes: ${recNoteHits.join(", ")}`);
+    (annotationsMap[filename] || []).forEach((a, i) => {
+      const hits = scanTextForPHI(a.label || a.text || "");
+      if (hits.length) bundlePhi.push(`• annotation #${i + 1}: ${hits.join(", ")}`);
+    });
+    if (bundlePhi.length && !window.confirm(
+      `Possible PHI detected in free-text that will be saved into this bundle:\n\n${bundlePhi.slice(0, 12).join("\n")}` +
+      `${bundlePhi.length > 12 ? `\n…and ${bundlePhi.length - 12} more` : ""}\n\nRemove the flagged content first, or save anyway?`
+    )) { return; }
     try {
       const rawEdf = await getEdfRawFromDB(filename);
       const bundle = {
@@ -8884,12 +9043,10 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // rather than stuttering at a fixed cadence). currentEpoch is a float, so the
   // viewer renders a smoothly sliding window.
   useEffect(() => {
-    let intervalId = null;
+    let rafId = null;
     let dir = 0;            // -1 = left, +1 = right, 0 = idle
     let lastTs = 0;
     let holdStart = 0;
-    const TICK_MS = 22;               // ~45 fps glide driver (setInterval keeps ticking
-                                      //   even when the tab loses compositing focus, unlike rAF)
     const HOLD_DELAY_MS = 190;        // tap-vs-hold threshold before gliding kicks in
     const GLIDE_EEG_SEC_PER_SEC = 10; // scroll speed while holding (EEG-seconds / wall-second)
 
@@ -8900,23 +9057,27 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
       });
     };
 
-    const stopGlide = () => { if (intervalId) { clearInterval(intervalId); intervalId = null; } dir = 0; };
+    const stopGlide = () => { if (rafId) { cancelAnimationFrame(rafId); rafId = null; } dir = 0; };
 
+    // requestAnimationFrame-driven so each advance lands on the display's refresh (smooth 60 fps)
+    // instead of the old fixed 22 ms setInterval (~45 fps, off-vsync → visible stutter). The step is
+    // delta-time-normalized, so scroll speed stays constant regardless of the actual frame rate. The
+    // onBlur handler stops the glide, so rAF pausing on a backgrounded tab is harmless.
     const startGlide = () => {
-      if (intervalId) clearInterval(intervalId);
+      if (rafId) cancelAnimationFrame(rafId);
       lastTs = performance.now();
-      intervalId = setInterval(() => {
-        if (!dir) return;
+      const tick = () => {
+        if (!dir) { rafId = null; return; }
         const now = performance.now();
         const dt = (now - lastTs) / 1000;
         lastTs = now;
-        // Delta-time advance: velocity stays constant (EEG-sec/wall-sec) even if the
-        // timer is throttled, so the scroll feels stable rather than stuttering.
         if (now - holdStart >= HOLD_DELAY_MS) {
           const epPerSec = GLIDE_EEG_SEC_PER_SEC / (epochSecRef.current || 10);
           clampStep(dir * epPerSec * dt);
         }
-      }, TICK_MS);
+        rafId = requestAnimationFrame(tick);
+      };
+      rafId = requestAnimationFrame(tick);
     };
 
     const onKeyDown = (e) => {
@@ -8958,7 +9119,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
-      if (intervalId) clearInterval(intervalId);
+      if (rafId) cancelAnimationFrame(rafId);
     };
   }, []); // stable — all values via refs
 
@@ -9086,24 +9247,33 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             <div style={{padding:"8px 12px",borderBottom:"1px solid #1a1a1a",fontSize:10,color:"#666",fontWeight:700,letterSpacing:"0.08em"}}>
               SELECT FILE TO REVIEW
             </div>
-            {records.map(r => (
-              <button key={r.id} onClick={()=>{onSelectRecord(r);setShowFilePicker(false);}} style={{
-                display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",
-                padding:"8px 12px",background:r.id===record?.id?"#1a2a30":"transparent",
-                border:"none",cursor:"pointer",borderBottom:"1px solid #111",transition:"background 0.1s",
-                color:"#ccc",fontFamily:"'IBM Plex Mono', monospace",fontSize:11,
-              }} onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
-                 onMouseLeave={e=>e.currentTarget.style.background=r.id===record?.id?"#1a2a30":"transparent"}>
-                <span style={{display:"flex",alignItems:"center",gap:6}}>
-                  <span title={!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"No EDF data":r.isTest?"Test":r.isAcquired?"Recorded":"Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
-                    background:!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"#ef4444":r.isTest?"#3b82f6":r.isAcquired?"#22c55e":"#eab308"}}/>
-                  <span style={{color:"#7ec8d9"}}>{r.filename}</span>
-                </span>
-                <div style={{display:"flex",gap:8,alignItems:"center"}}>
-                  <StatusBadge status={r.status}/>
-                  <span style={{color:"#555"}}>{r.date}</span>
+            {groupRecordsByCollection(records, collections).map(group => (
+              <div key={group.id}>
+                {/* Blue collection header */}
+                <div style={{padding:"6px 12px",background:"#0c1f24",borderBottom:"1px solid #1a3a40",borderTop:"1px solid #1a3a40",
+                  color:"#7ec8d9",fontSize:9,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>{group.name}</span><span style={{color:"#3a6b75",fontSize:9}}>{group.records.length}</span>
                 </div>
-              </button>
+                {group.records.map(r => (
+                  <button key={`${group.id}-${r.id}`} onClick={()=>{onSelectRecord(r);setShowFilePicker(false);}} style={{
+                    display:"flex",alignItems:"center",justifyContent:"space-between",width:"100%",
+                    padding:"8px 12px",background:r.id===record?.id?"#1a2a30":"transparent",
+                    border:"none",cursor:"pointer",borderBottom:"1px solid #111",transition:"background 0.1s",
+                    color:"#ccc",fontFamily:"'IBM Plex Mono', monospace",fontSize:11,
+                  }} onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
+                     onMouseLeave={e=>e.currentTarget.style.background=r.id===record?.id?"#1a2a30":"transparent"}>
+                    <span style={{display:"flex",alignItems:"center",gap:6}}>
+                      <span title={!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"No EDF data":r.isTest?"Test":r.isAcquired?"Recorded":"Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
+                        background:!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"#ef4444":r.isTest?"#3b82f6":r.isAcquired?"#22c55e":"#eab308"}}/>
+                      <span style={{color:"#7ec8d9"}}>{r.filename}</span>
+                    </span>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      <StatusBadge status={r.status}/>
+                      <span style={{color:"#555"}}>{r.date}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
             ))}
           </div>
         </div>
@@ -9426,12 +9596,21 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
         <div style={{position:"fixed",inset:0,background:"#000c",zIndex:2000,display:"flex",alignItems:"center",justifyContent:"center"}} onClick={()=>setShowFilePicker(false)}>
           <div onClick={e=>e.stopPropagation()} style={{background:"#111",border:"1px solid #2a2a2a",padding:20,maxHeight:"70vh",overflowY:"auto",width:500}}>
             <div style={{fontSize:12,color:"#7ec8d9",fontWeight:700,marginBottom:12,letterSpacing:"0.05em"}}>SELECT FILE TO REVIEW</div>
-            {records.filter(r=>r.hasEdfData||r.fileType==="simulated"||r.isSimulated).map(r => (
-              <div key={r.id} onClick={()=>{onSelectRecord(r);setShowFilePicker(false);}}
-                style={{padding:"8px 12px",cursor:"pointer",borderBottom:"1px solid #1a1a1a",fontSize:11,color:"#ccc",display:"flex",justifyContent:"space-between",alignItems:"center"}}
-                onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                <span>{r.filename}</span>
-                <span style={{fontSize:9,color:"#555"}}>{r.studyType} · {r.sex}{r.age}</span>
+            {groupRecordsByCollection(records.filter(r=>r.hasEdfData||r.fileType==="simulated"||r.isSimulated), collections).map(group => (
+              <div key={group.id}>
+                {/* Blue collection header */}
+                <div style={{padding:"5px 12px",margin:"4px -8px 0",background:"#0c1f24",borderTop:"1px solid #1a3a40",borderBottom:"1px solid #1a3a40",
+                  color:"#7ec8d9",fontSize:9,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span>{group.name}</span><span style={{color:"#3a6b75",fontSize:9}}>{group.records.length}</span>
+                </div>
+                {group.records.map(r => (
+                  <div key={`${group.id}-${r.id}`} onClick={()=>{onSelectRecord(r);setShowFilePicker(false);}}
+                    style={{padding:"8px 12px",cursor:"pointer",borderBottom:"1px solid #1a1a1a",fontSize:11,color:"#ccc",display:"flex",justifyContent:"space-between",alignItems:"center"}}
+                    onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                    <span>{r.filename}</span>
+                    <span style={{fontSize:9,color:"#555"}}>{r.studyType} · {r.sex}{fmtAge(r.age) ?? ""}</span>
+                  </div>
+                ))}
               </div>
             ))}
             {records.filter(r=>r.hasEdfData||r.fileType==="simulated"||r.isSimulated).length === 0 && (
@@ -10373,7 +10552,7 @@ function AcquireTab() {
       sport: "",
       position: "",
       studyType,
-      date: today,
+      date: generalizeDateToYear(today), // Safe Harbor: year only
       filename: acqFile,
       channels: chCount,
       duration: durationMin,
