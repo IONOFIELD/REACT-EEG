@@ -13,6 +13,7 @@ import { signalStats, channelHasSignal } from "./edf-signals.js";
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
+  interpolateArtifacts,
 } from "./dsp.js";
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
@@ -4615,11 +4616,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
         channelArtifacts[ch] = artifactPct;
         totalArtifactPct += artifactPct;
         nArtChannels++;
-        // Zero out artifact samples before spectral analysis
-        if (artifactPct > 0) {
-          sub = new Float32Array(sub);
-          for (let j = 0; j < sub.length; j++) { if (mask[j]) sub[j] = 0; }
-        }
+        // Replace artifact samples with boundary-respecting interpolation before spectral analysis.
+        // (Zeroing them — the previous behavior — injected broadband energy into the band-power
+        // estimate of the very signal being measured. See interpolateArtifacts + dsp.golden tests.)
+        if (artifactPct > 0) sub = interpolateArtifacts(sub, mask);
       }
 
       // Spectral interpolation for 60 Hz line noise (cleaner than IIR notch)

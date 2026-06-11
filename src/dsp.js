@@ -254,3 +254,33 @@ export function computeBands(data, sr) {
   powers.total = total;
   return powers;
 }
+
+// Replace artifact-flagged samples with boundary-respecting LINEAR INTERPOLATION between the
+// nearest clean samples on each side — instead of zeroing them. Zeroing injects sharp 0-edges,
+// which spread BROADBAND spectral energy into the very signal whose band power is being measured
+// (a known defect). Interpolation preserves continuity and keeps the length (so DFT resolution is
+// unchanged), so a short artifact (blink/movement) no longer contaminates the estimate. Runs at the
+// signal edges hold the single available clean side. Returns a NEW Float32Array; input untouched.
+// mask[i] === true marks an artifact sample.
+export function interpolateArtifacts(data, mask) {
+  const N = data.length;
+  const out = new Float32Array(data);
+  if (!mask || mask.length < N) return out;
+  let i = 0;
+  while (i < N) {
+    if (!mask[i]) { i++; continue; }
+    let j = i; while (j < N && mask[j]) j++;          // contiguous artifact run [i, j)
+    const hasL = i - 1 >= 0, hasR = j < N;
+    const L = hasL ? out[i - 1] : (hasR ? out[j] : 0);
+    const R = hasR ? out[j] : L;
+    if (hasL && hasR) {
+      const denom = j - (i - 1);                       // run length + 1
+      for (let k = i; k < j; k++) out[k] = L + (R - L) * ((k - (i - 1)) / denom);
+    } else {
+      const fill = hasL ? L : R;                       // edge run → hold the one clean side
+      for (let k = i; k < j; k++) out[k] = fill;
+    }
+    i = j;
+  }
+  return out;
+}
