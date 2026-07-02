@@ -10158,19 +10158,39 @@ function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false, devic
 // the moment the bridge is connected — before and during recording. Auto-scales each lane
 // to its own recent peak so any channel/gain fills cleanly. Read-only overlay; it does not
 // touch the Review epoch viewer underneath.
-function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, droppedRef, filterText = "" }) {
+function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, droppedRef, rxRef, filterText = "" }) {
   const canvasRef = useRef(null);
+  const rxRateRef = useRef(0);          // samples/s received, refreshed ~2 Hz
+  const rxWinRef = useRef({ n: 0, t: 0 });
   useEffect(() => {
     if (!active) { const cv = canvasRef.current; if (cv) { const c = cv.getContext("2d"); c && c.clearRect(0, 0, cv.width, cv.height); } return; }
+    rxWinRef.current = { n: rxRef?.current || 0, t: performance.now() };
     let raf;
     const draw = () => {
       const cv = canvasRef.current, view = (filtered ? filtRef : rawRef).current;
       if (cv) {
         const W = cv.clientWidth || 1, H = cv.clientHeight || 1;
+        // Refresh the received-samples rate ~twice a second (a live "is data flowing?" readout).
+        const nowMs = performance.now();
+        if (nowMs - rxWinRef.current.t >= 500) {
+          const dn = (rxRef?.current || 0) - rxWinRef.current.n;
+          rxRateRef.current = Math.max(0, Math.round(dn * 1000 / (nowMs - rxWinRef.current.t)));
+          rxWinRef.current = { n: rxRef?.current || 0, t: nowMs };
+        }
         if (cv.width !== W) cv.width = W;
         if (cv.height !== H) cv.height = H;
         const ctx = cv.getContext("2d");
-        if (!view || view.count === 0) { ctx.clearRect(0, 0, W, H); raf = requestAnimationFrame(draw); return; }
+        if (!view || view.count === 0) {
+          // Connected but no samples yet — say so explicitly instead of a blank canvas, so
+          // "connected, server not streaming" is distinguishable from a stalled UI.
+          ctx.clearRect(0, 0, W, H);
+          ctx.fillStyle = "#F59E0B"; ctx.font = "12px 'IBM Plex Mono', monospace";
+          ctx.textAlign = "center"; ctx.textBaseline = "middle";
+          ctx.fillText("Connected — waiting for samples from pieeg-server…", W / 2, H / 2 - 10);
+          ctx.fillStyle = "#555"; ctx.font = "10px 'IBM Plex Mono', monospace";
+          ctx.fillText("(no data received yet — check the server is streaming)", W / 2, H / 2 + 10);
+          raf = requestAnimationFrame(draw); return;
+        }
         ctx.fillStyle = "#050505"; ctx.fillRect(0, 0, W, H);
         const labels = view.labels, n = labels.length || 1;
         const labelW = 46, plotW = Math.max(1, W - labelW);
@@ -10189,6 +10209,11 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
         ctx.fillStyle = recording ? "#EF4444" : "#10B981";
         const modeTag = filtered ? (filterText ? `FILT ${filterText}` : "FILT") : "RAW";
         ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s · ${modeTag}`, labelW + 6, 4);
+        // rx-rate readout — green when flowing, amber when stalled (data stopped arriving).
+        const rx = rxRateRef.current;
+        ctx.fillStyle = rx > 0 ? "#10B981" : "#F59E0B"; ctx.textAlign = "right";
+        ctx.fillText(rx > 0 ? `rx ${rx}/s` : "rx 0 — stalled", W - (droppedRef?.current > 0 ? 90 : 6), 4);
+        ctx.textAlign = "left";
         const dropped = droppedRef?.current || 0;
         if (dropped > 0) { ctx.fillStyle = "#F59E0B"; ctx.textAlign = "right"; ctx.fillText(`${dropped} dropped`, W - 6, 4); ctx.textAlign = "left"; }
         for (let c = 0; c < n; c++) {
@@ -10264,7 +10289,7 @@ function LiveChannelPanel({ rawRef, active, mains = 60 }) {
         <span>CHANNEL CHECK</span><span style={{ color: "#444" }}>RMS µV</span>
       </div>
       <div style={{ overflowY: "auto", flex: 1 }}>
-        {rows.length === 0 && <div style={{ padding: "8px", fontSize: 10, color: "#444" }}>warming up…</div>}
+        {rows.length === 0 && <div style={{ padding: "8px", fontSize: 10, color: "#666" }}>waiting for samples…</div>}
         {rows.map((r, i) => {
           const s = STATUS[r.status] || STATUS.flatline;
           return (
@@ -10363,6 +10388,7 @@ function AcquireTab() {
   const liveFiltersRef = useRef(null);  // per-channel createStreamingFilter instances (display filtering)
   const liveSeqRef = useRef(null);   // last bridge samples `seq` seen (drop detection, legacy path)
   const liveNRef = useRef(null);     // last pieeg-server per-sample `n` seen (drop detection)
+  const liveRxRef = useRef(0);       // total real sample-frames received this session (rx-rate readout)
   const liveDroppedRef = useRef(0);  // total dropped samples this session
   const recordingRef = useRef(false);
   const userClosingRef = useRef(false);   // true while the user is intentionally disconnecting
@@ -10389,6 +10415,7 @@ function AcquireTab() {
     const e = eegRef.current;
     liveFiltersRef.current = labels.map(() => createStreamingFilter({ sampleRate: sr, hpf: e.hpf, lpf: e.lpf, notch: e.notch }));
     liveSeqRef.current = null;
+    liveRxRef.current = 0;
   };
 
   const appendSamples = (rows) => {
@@ -10451,6 +10478,7 @@ function AcquireTab() {
       if (imp.length) { setConnectionState(s => (s >= CONN.ready ? s : CONN.impedance)); setShowImpedance(true); }
       else setConnectionState(s => (s >= CONN.ready ? s : CONN.ready));
     } else if (res.kind === "samples") {
+      liveRxRef.current += res.rows.length;
       if (res.seq != null) {
         const dropped = gapBatches(liveSeqRef.current, res.seq);
         if (dropped > 0) { liveDroppedRef.current += dropped; debugLog(`[live] dropped ${dropped} batch(es) (seq ${liveSeqRef.current}→${res.seq})`); }
@@ -10491,6 +10519,7 @@ function AcquireTab() {
       if (c.filter || c.notchFilter) notify("Disabled the server-side filter so REACT receives (and captures) raw µV; live filtering is applied in-app.", "info");
       setConnectionState(s => (s >= CONN.ready ? s : CONN.ready));   // no impedance step for pieeg-server
     } else if (res.kind === "samples") {
+      liveRxRef.current += res.rows.length;
       if (res.n != null) {
         const dropped = gapBatches(liveNRef.current, res.n);   // per-sample continuity on n
         if (dropped > 0) {
@@ -10862,7 +10891,7 @@ function AcquireTab() {
           <LiveWaveform rawRef={liveViewRef} filtRef={liveFiltViewRef} filtered={liveFilterOn}
             filterText={`${eeg.hpf||0}–${eeg.lpf||0}·N${eeg.notch||0}`}
             active={connectionState >= CONN.connected}
-            recording={isRecording && !isPaused} droppedRef={liveDroppedRef}/>
+            recording={isRecording && !isPaused} droppedRef={liveDroppedRef} rxRef={liveRxRef}/>
         )}
         {/* Live view toggles: raw/filtered trace + show/hide the channel-check panel */}
         {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && connectionState >= CONN.connected && (
