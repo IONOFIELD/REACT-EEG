@@ -79,6 +79,12 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v19.0", items: [
+    "Live PiEEG acquisition — the Record tab connects directly to the vendor pieeg-server (ws://<host>:1616), adopts its declared sample rate and channel count, and forces a raw µV stream (disabling the server-side filter) so captures stay unfiltered. Refuses a synthetic (--mock) stream outright — REACT never displays or records fabricated data",
+    "Live trace + per-channel verification panel for hardware bring-up — a rolling now-pinned strip (raw or in-app-filtered via a new streaming filter) plus a live RMS / mains-dominance / live·flatline·noisy readout per channel, so a floating or badly-seated electrode is obvious at a glance. Dropped samples are flagged and reconciled into the recorded timeline",
+    "Captured sessions write a valid EDF stamped with the pipeline + schema versions and load through the normal de-identify + review path; records now carry a structured sourceType provenance tag (pieeg / acquire / import / package / public-dataset), with PiEEG marked non-diagnostic (research/education)",
+    "Library flags no-data recordings — a file whose every channel is flat/empty now shows a red status dot and a warning banner",
+  ]},
   { version: "v18.5", items: [
     "Default library gains two mental-arithmetic recordings (resting baseline + serial-subtraction task, same subject) from the PhysioNet eegmat / Zyma et al. dataset — 23-ch 10-20 @ 500 Hz, de-identified and header-scrubbed. Complements the 64-ch EEGMMIDB seeds with a different paradigm and a lower-density montage",
     "Seed attribution is now per-dataset: the manifest carries a sources map (EEGMMIDB ODC-By + eegmat CC-BY, with the PhysioNet/Goldberger resource citation), and each record stamps its own dataset, license and hardware. New datasets added to the manifest now reconcile into existing libraries on load instead of only on first launch",
@@ -572,6 +578,19 @@ function migrateRecord(record) {
   if (r.schemaVersion === "v14.1") {
     r.schemaVersion = "v15.0";
   }
+  // v15.0 → v16.0: records gain a structured `sourceType` provenance tag (and PiEEG live
+  // captures a `nonClinical` flag). Backfill legacy records by inferring from existing fields
+  // so downstream can distinguish live-acquired data from imported/public files.
+  if (r.schemaVersion === "v15.0") {
+    if (r.sourceType === undefined) {
+      r.sourceType = r.isAcquired ? "acquire"
+        : r.isImportedPackage ? "package"
+        : (r.fileType === "real-public" || r.isTest) ? "public-dataset"
+        : "import";
+    }
+    if (r.nonClinical === undefined) r.nonClinical = false; // legacy records predate PiEEG capture
+    r.schemaVersion = "v16.0";
+  }
   return r;
 }
 
@@ -697,6 +716,7 @@ async function buildPatientPackageZip({ subjectHash, records, annotationsMap, cl
       filename: r.filename, studyType: r.studyType, date: r.date,
       channels: r.channels, sampleRate: r.sampleRate, duration: r.duration,
       durationSec: r.durationSec || null, fileSize: r.fileSize, sex: r.sex || null, age: r.age ?? null,
+      sourceType: r.sourceType || null, nonClinical: !!r.nonClinical,
       pipelineVersion: r.pipelineVersion, schemaVersion: r.schemaVersion,
       complianceCompliant: r.complianceResult?.compliant ?? null,
       collectionIds: r.collectionIds || [],
@@ -2089,6 +2109,7 @@ async function loadRealSeedEdfs(setEdfFileStore, setAnnotationsMap, existingPath
         fileSize: fileSizeMB, sex: def.sex || "", age: capAge(def.age), // Safe Harbor: 90+ aggregate
         montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: true, fileType: "real-public",
+        sourceType: "public-dataset", nonClinical: false, // provenance: a seeded public research dataset
         hasEdfData: true,
         notes: `${def.task || ""} (Source: ${src.name})`,
         uploadedAt: new Date().toISOString(),
@@ -7354,6 +7375,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
         sex: meta.sex || "", age: capAge(meta.age ?? null), // Safe Harbor: 90+ aggregate
         montage: detectEdfSystem(parsed) || "10-20", status: "pending",
         isTest: false, isImportedPackage: true, fileType: "imported-package",
+        sourceType: "package", nonClinical: false, // provenance: imported from a REACT patient package
         hasEdfData: true,
         notes: `Imported from patient package on ${new Date().toISOString().split("T")[0]}`,
         uploadedAt: new Date().toISOString(),
@@ -8516,6 +8538,7 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
       fileSize:fileSizeMB,sex:form.sex||"",age:form.age?capAge(parseInt(form.age)):null, // Safe Harbor: 90+ aggregate
       montage:form.montage,status:"pending",isTest:false,notes:form.notes,uploadedAt:new Date().toISOString(),
       sourceFile: selectedFile ? selectedFile.name : null,
+      sourceType: "import", nonClinical: false, // provenance: user-imported single EDF
       hasEdfData: !!selectedFile,
       pipelineVersion: PIPELINE_VERSION,
       schemaVersion: SCHEMA_VERSION,
@@ -10690,7 +10713,11 @@ function AcquireTab() {
       status: "pending",
       isTest: false,
       isAcquired: true,
-      notes: `Recorded via ${selectedDevice?.name || "unknown device"}`,
+      // provenance: live-acquired. PiEEG is a research/education device (vendor states
+      // non-medical), so mark it distinctly and note it's non-diagnostic.
+      sourceType: selectedDevice?.protocol === "pieeg-server" ? "pieeg" : "acquire",
+      nonClinical: selectedDevice?.protocol === "pieeg-server",
+      notes: `Recorded via ${selectedDevice?.name || "unknown device"}${selectedDevice?.protocol === "pieeg-server" ? " — research/education, non-diagnostic" : ""}`,
       uploadedAt: new Date().toISOString(),
       sourceFile: null,
       hasEdfData: true,

@@ -49,6 +49,7 @@ export function buildExportManifest(records) {
       records: recs.map(r => ({
         filename: r.filename, studyType: r.studyType, date: r.date,
         channels: r.channels, sampleRate: r.sampleRate, duration: r.duration, status: r.status,
+        sourceType: r.sourceType || null, nonClinical: !!r.nonClinical,
         pipelineVersion: r.pipelineVersion || null,
         schemaVersion: r.schemaVersion || null,
         edfPath: `data/${r.studyType}/${r.filename}`,
