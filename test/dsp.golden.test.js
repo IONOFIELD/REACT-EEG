@@ -11,6 +11,7 @@ import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
   interpolateArtifacts,
+  notchCoeffs, makeCascadeState, applyBiquadCascadeStateful, createStreamingFilter,
 } from "../src/dsp.js";
 
 // ── helpers ──
@@ -182,5 +183,98 @@ describe("interpolateArtifacts (P3 — replaces zeroing; no broadband injection)
     const out = interpolateArtifacts(x, mask);
     expect(out[0]).toBeCloseTo(5, 6); expect(out[1]).toBeCloseTo(5, 6); // start run holds right-clean (x[2]=5)
     expect(out[4]).toBeCloseTo(9, 6); expect(out[5]).toBeCloseTo(9, 6); // end run holds left-clean (x[3]=9)
+  });
+});
+
+// ── Phase 2: streaming (stateful, causal) biquad cascade ──
+// The gate for the live-acquire filter: the stateful cascade must (a) reproduce the static
+// applyBiquadCascade EXACTLY with fresh zero state, and (b) give the same result whether a
+// signal is filtered in one pass or split into arbitrary chunks with the state threaded.
+// The existing static-window blocks above remain the proof that review filtering is unchanged.
+describe("streaming biquad cascade (Phase 2)", () => {
+  const sr = 256, N = 500;
+  const sig = f32(Array.from({ length: N }, (_, n) =>
+    Math.sin(2 * Math.PI * 6 * n / sr) + 0.4 * Math.sin(2 * Math.PI * 40 * n / sr) + 0.2));
+  const sections = [
+    ...butterworthCoeffs(1, sr, 3, "high"),   // odd order → includes a 1st-order section (b2=a2=0)
+    ...butterworthCoeffs(40, sr, 4, "low"),
+    notchCoeffs(60, sr, 30),
+  ];
+
+  const runStatefulChunked = (data, secs, splits) => {
+    const st = makeCascadeState(secs);
+    const out = new Float32Array(data.length);
+    let off = 0;
+    for (const len of splits) {
+      const part = applyBiquadCascadeStateful(data.slice(off, off + len), secs, st);
+      out.set(part, off);
+      off += len;
+    }
+    return out;
+  };
+
+  it("fresh zero-state stateful pass reproduces applyBiquadCascade EXACTLY (single section)", () => {
+    const sec = butterworthCoeffs(30, 128, 4, "low");
+    const a = applyBiquadCascade(sig, sec);
+    const b = applyBiquadCascadeStateful(sig, sec, makeCascadeState(sec));
+    for (let i = 0; i < N; i++) expect(b[i]).toBe(a[i]); // bit-for-bit
+  });
+
+  it("fresh zero-state stateful pass reproduces applyBiquadCascade EXACTLY (full HPF+LPF+notch cascade)", () => {
+    const a = applyBiquadCascade(sig, sections);
+    const b = applyBiquadCascadeStateful(sig, sections, makeCascadeState(sections));
+    for (let i = 0; i < N; i++) expect(b[i]).toBe(a[i]);
+  });
+
+  it("chunked processing equals the one-pass result for several chunk splittings", () => {
+    const onePass = applyBiquadCascadeStateful(sig, sections, makeCascadeState(sections));
+    const splittings = [
+      [N],
+      [1, N - 1],                       // tiny first chunk exercises the N===1 carry path
+      [250, 250],
+      [7, 13, 31, 199, N - 250],
+      Array.from({ length: N }, () => 1), // one sample per chunk (worst case)
+    ];
+    for (const splits of splittings) {
+      const chunked = runStatefulChunked(sig, sections, splits);
+      for (let i = 0; i < N; i++) expect(chunked[i]).toBe(onePass[i]); // exact
+    }
+  });
+
+  it("notchCoeffs section attenuates the notch tone and passes an off-notch tone", () => {
+    const at = (f) => f32(Array.from({ length: 1024 }, (_, n) => Math.sin(2 * Math.PI * f * n / sr)));
+    const sec = [notchCoeffs(60, sr, 30)];
+    const settle = (y) => y.slice(512); // ignore the causal start-up transient
+    const rms60 = rms(settle(applyBiquadCascade(at(60), sec)));
+    const rms10 = rms(settle(applyBiquadCascade(at(10), sec)));
+    expect(rms60).toBeLessThan(0.1);   // 60 Hz strongly attenuated
+    expect(rms10).toBeGreaterThan(0.6); // 10 Hz largely passes
+  });
+
+  it("notchCoeffs rejects out-of-range frequencies", () => {
+    expect(notchCoeffs(0, sr)).toBeNull();
+    expect(notchCoeffs(sr / 2, sr)).toBeNull();
+  });
+
+  it("createStreamingFilter: chunked == one-pass, and reset() re-zeros the delay line", () => {
+    const mk = () => createStreamingFilter({ sampleRate: sr, hpf: 1, lpf: 40, notch: 60, order: 3 });
+    const whole = mk().process(sig);
+    // stream it in ragged chunks through one filter instance
+    const f = mk();
+    const streamed = new Float32Array(N);
+    let off = 0;
+    for (const len of [10, 1, 33, 200, N - 244]) { const p = f.process(sig.slice(off, off + len)); streamed.set(p, off); off += len; }
+    for (let i = 0; i < N; i++) expect(streamed[i]).toBe(whole[i]);
+    // after reset, the same first chunk yields the same first-chunk output as a fresh filter
+    f.reset();
+    const again = f.process(sig.slice(0, 50));
+    const fresh = mk().process(sig.slice(0, 50));
+    for (let i = 0; i < 50; i++) expect(again[i]).toBe(fresh[i]);
+  });
+
+  it("createStreamingFilter with no active filters is a pass-through (copy)", () => {
+    const f = createStreamingFilter({ sampleRate: sr });
+    const out = f.process(sig);
+    expect(Array.from(out)).toEqual(Array.from(sig));
   });
 });

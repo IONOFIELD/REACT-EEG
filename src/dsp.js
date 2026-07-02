@@ -119,6 +119,88 @@ export function applyNotch(data, freq, sr, q = 30) {
   return out;
 }
 
+// ══════════════════════════════════════════════════════════════
+// Streaming (stateful, causal) biquad cascade — for LIVE acquisition
+// ══════════════════════════════════════════════════════════════
+// The functions above are for STATIC windows: applyButterworthFilter is zero-phase
+// (forward-backward filtfilt) and needs the whole signal, so it cannot run on an unbounded
+// live stream. The live path instead runs a single forward (CAUSAL) pass whose per-section
+// delay line is RETAINED across chunks, so consecutive WebSocket chunks filter seamlessly
+// (no per-chunk edge transient). This is a DIFFERENT filter from the review path — it has
+// phase lag the zero-phase path does not — and is used ONLY for the live display; captured
+// EDF samples stay raw. The review functions and their golden vectors are untouched.
+//
+// Equivalence guarantee (locked by test/dsp.golden.test.js): a fresh cascade whose delay
+// registers start at zero reproduces applyBiquadCascade's output EXACTLY, because
+// applyBiquadCascade's special-cased first two samples are just the general Direct-Form-I
+// recurrence evaluated with zero history. It follows that feeding a signal in one pass and
+// feeding it split into arbitrary chunks (threading the state) give identical output.
+
+// A single normalized notch biquad section (matches applyNotch's coefficients), so the notch
+// can join the streaming cascade. Returns null for an out-of-range frequency.
+export function notchCoeffs(freq, sr, q = 30) {
+  if (freq <= 0 || freq >= sr / 2) return null;
+  const w0 = (2 * Math.PI * freq) / sr, alpha = Math.sin(w0) / (2 * q), c = Math.cos(w0);
+  const a0 = 1 + alpha;
+  return { b0: 1 / a0, b1: -2 * c / a0, b2: 1 / a0, a1: -2 * c / a0, a2: (1 - alpha) / a0 };
+}
+
+// Zero-initialized per-section delay state for a stateful cascade. One {x1,x2,y1,y2} per
+// section (x = input history, y = output history), matching Direct-Form-I.
+export function makeCascadeState(sections) {
+  return sections.map(() => ({ x1: 0, x2: 0, y1: 0, y2: 0 }));
+}
+
+// Apply the cascade to one chunk, threading each section's delay state across calls. Mutates
+// `state` (from makeCascadeState) in place and returns a NEW Float32Array; the input is not
+// modified. Arithmetic mirrors applyBiquadCascade sample-for-sample (reads float32 history
+// out of the working buffers), so: (a) over a whole signal with fresh zero state it equals
+// applyBiquadCascade exactly, and (b) chunked processing equals the one-pass result.
+export function applyBiquadCascadeStateful(chunk, sections, state) {
+  let buf = chunk;
+  for (let si = 0; si < sections.length; si++) {
+    const s = sections[si];
+    const st = state[si];
+    const N = buf.length;
+    const out = new Float32Array(N);
+    for (let i = 0; i < N; i++) {
+      const x0 = buf[i];
+      const x1 = i >= 1 ? buf[i - 1] : st.x1;
+      const x2 = i >= 2 ? buf[i - 2] : (i === 1 ? st.x1 : st.x2);
+      const y1 = i >= 1 ? out[i - 1] : st.y1;
+      const y2 = i >= 2 ? out[i - 2] : (i === 1 ? st.y1 : st.y2);
+      out[i] = s.b0 * x0 + s.b1 * x1 + s.b2 * x2 - s.a1 * y1 - s.a2 * y2;
+    }
+    // Carry the last two inputs/outputs (float32 values) as the next chunk's history.
+    if (N >= 2) { st.x1 = buf[N - 1]; st.x2 = buf[N - 2]; st.y1 = out[N - 1]; st.y2 = out[N - 2]; }
+    else if (N === 1) { st.x2 = st.x1; st.x1 = buf[0]; st.y2 = st.y1; st.y1 = out[0]; }
+    buf = out;
+  }
+  return buf;
+}
+
+// Convenience factory for the live filter chain: HPF → LPF → notch, composed as one cascade
+// with retained state. Section order matches the review path (applyHighPass→applyLowPass→
+// applyNotch) so the causal live trace resembles the zero-phase review trace (modulo the
+// expected phase lag). `process(chunk)` filters a chunk of channel-major samples for ONE
+// channel; keep one filter instance per channel. `reset()` re-zeros the delay line (call on
+// (re)connect or when filter settings change). Pure/deterministic — unit-tested.
+export function createStreamingFilter({ sampleRate, hpf = 0, lpf = 0, notch = 0, order = 3, q = 30 }) {
+  const sections = [];
+  if (hpf > 0) sections.push(...butterworthCoeffs(hpf, sampleRate, order, "high"));
+  if (lpf > 0) sections.push(...butterworthCoeffs(lpf, sampleRate, order, "low"));
+  if (notch > 0) { const n = notchCoeffs(notch, sampleRate, q); if (n) sections.push(n); }
+  let state = makeCascadeState(sections);
+  return {
+    sections,
+    reset() { state = makeCascadeState(sections); },
+    process(chunk) {
+      if (!sections.length) return chunk instanceof Float32Array ? chunk : Float32Array.from(chunk);
+      return applyBiquadCascadeStateful(chunk instanceof Float32Array ? chunk : Float32Array.from(chunk), sections, state);
+    },
+  };
+}
+
 // ── Discrete Wavelet Transform (Daubechies-4) denoising ──
 export function applyWaveletDenoise(data, levels = 4) {
   const N = data.length;
