@@ -35,3 +35,14 @@ export function channelHasSignal(arr, physDim, cap = 8192) {
   const { std, range } = signalStats(arr, cap);
   return std > signalStdFloor(physDim) && range > 0;
 }
+
+// True if a parsed EDF carries real signal on ANY channel (same per-channel rule as above).
+// A file whose channels are all flat/zero — e.g. a session saved with no live samples (the
+// acquire zero-fill fallback) or an empty import — returns false. Cheap: channelHasSignal
+// caps its scan, so this is a handful of short scans regardless of recording length.
+export function edfHasAnySignal(edfData) {
+  const cd = edfData?.channelData;
+  if (!Array.isArray(cd) || cd.length === 0) return false;
+  const sigs = edfData?.signals || [];
+  return cd.some((arr, i) => channelHasSignal(arr, sigs[i]?.physDim));
+}
