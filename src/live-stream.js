@@ -128,3 +128,65 @@ export function decodeMessage(data, ctx = {}) {
   }
   return { kind: "ignore" };
 }
+
+// ══════════════════════════════════════════════════════════════
+// pieeg-server protocol (the vendor Raspberry-Pi server, github.com/pieeg-club/PiEEG-server)
+// ══════════════════════════════════════════════════════════════
+// A DISTINCT protocol from the bridge `hello`/Float32 one above — kept separate so the
+// existing decodeMessage (and its tests) are untouched. pieeg-server is JSON TEXT only:
+//   welcome (on connect):  {"status":"connected","sample_rate":250,"channels":8|16,
+//                           "filter":bool,"notch_filter":bool,"notch_freq":60.0,"mock":bool, …}
+//   data frame (per sample): {"t":<unix_s>,"n":<monotonic_int>,"channels":[<uV>…]}
+// It also broadcasts many other status objects (record_status/lsl_status/spike_config/…) that
+// we must ignore. Values are already µV (no scaling). Drop detection uses the per-sample `n`
+// (reuse gapBatches: n − prevN − 1). See AUDIT-live-acquire.md and the server source under
+// ../PiEEG-server-main-extract/ (pieeg_server/server.py:245).
+
+// Normalize a pieeg-server welcome into the config the client adopts. pieeg-server sends NO
+// channel labels, so synthesize Ch1..ChN (the Acquire tab overrides these with the electrode
+// map for the known channel counts). `mock` and `filter`/`notch_filter` are surfaced so the
+// client can refuse synthetic data and force a raw stream.
+export function normalizePieegWelcome(msg) {
+  const m = msg || {};
+  let channels = Number.isFinite(m.channels) ? Math.max(0, Math.floor(m.channels)) : 0;
+  let labels = Array.isArray(m.labels) ? m.labels.map(String) : null;
+  if (labels && !channels) channels = labels.length;
+  if (!labels && channels > 0) labels = Array.from({ length: channels }, (_, i) => `Ch${i + 1}`);
+  const sampleRate = Number.isFinite(m.sample_rate) && m.sample_rate > 0 ? m.sample_rate : 250;
+  return {
+    protocol: "pieeg-server",
+    device: typeof m.device === "string" ? m.device : "PiEEG",
+    sampleRate, channels, labels: labels || [],
+    units: "uV", uvScale: 1,                 // pieeg-server streams µV already
+    filter: m.filter === true,               // server-side bandpass state (on by default!)
+    notchFilter: m.notch_filter === true,
+    notchFreq: Number.isFinite(m.notch_freq) ? m.notch_freq : 60,
+    mock: m.mock === true,                    // synthetic-data mode — client must refuse
+    impedanceSupported: false,               // pieeg-server has no impedance frame
+  };
+}
+
+// Decode one pieeg-server WebSocket message (JSON text; tolerant of a UTF-8 binary payload).
+// → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"ignore" }
+// Sample iff `n` is a number AND `channels` is an array; welcome iff status==="connected";
+// everything else (record_status, lsl_status, spike_config, …) is ignored. `rows` is a
+// single-sample batch so it feeds the same appendSamples path as the bridge decoder.
+export function decodePieegMessage(data) {
+  let text = null;
+  if (typeof data === "string") text = data;
+  else if (data && typeof data !== "string") {
+    try {
+      if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) text = new TextDecoder().decode(new Uint8Array(data));
+      else if (data.buffer instanceof ArrayBuffer) text = new TextDecoder().decode(data);
+      else return { kind: "ignore" };
+    } catch { return { kind: "ignore" }; }
+  }
+  if (text == null) return { kind: "ignore" };
+  let msg; try { msg = JSON.parse(text); } catch { return { kind: "ignore" }; }
+  if (!msg || typeof msg !== "object") return { kind: "ignore" };
+  if (msg.status === "connected") return { kind: "welcome", config: normalizePieegWelcome(msg) };
+  if (typeof msg.n === "number" && Array.isArray(msg.channels)) {
+    return { kind: "samples", rows: [msg.channels.map(Number)], n: msg.n, t: typeof msg.t === "number" ? msg.t : null };
+  }
+  return { kind: "ignore" };
+}

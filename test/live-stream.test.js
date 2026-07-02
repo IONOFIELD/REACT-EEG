@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   LIVE_PROTOCOL, impedanceStatus, unitToMicrovolts, normalizeHello,
   decodeImpedance, deinterleave, scaleRows, gapBatches, decodeMessage,
+  normalizePieegWelcome, decodePieegMessage,
 } from "../src/live-stream.js";
 
 describe("impedanceStatus", () => {
@@ -155,5 +156,83 @@ describe("decodeMessage", () => {
 
   it("exports the protocol version", () => {
     expect(LIVE_PROTOCOL).toBe(1);
+  });
+});
+
+// ── pieeg-server protocol (vendor Raspberry-Pi server) ──
+describe("normalizePieegWelcome", () => {
+  const welcome = {
+    status: "connected", sample_rate: 250, channels: 8,
+    filter: true, notch_filter: false, notch_freq: 60.0, mock: false,
+  };
+  it("adopts sample_rate + channels and synthesizes labels (server sends none)", () => {
+    const c = normalizePieegWelcome(welcome);
+    expect(c.protocol).toBe("pieeg-server");
+    expect(c.sampleRate).toBe(250);
+    expect(c.channels).toBe(8);
+    expect(c.labels).toEqual(["Ch1", "Ch2", "Ch3", "Ch4", "Ch5", "Ch6", "Ch7", "Ch8"]);
+    expect(c.uvScale).toBe(1);            // already µV
+    expect(c.impedanceSupported).toBe(false);
+  });
+  it("surfaces server filter / notch / mock state", () => {
+    expect(normalizePieegWelcome(welcome).filter).toBe(true);        // server filters by default
+    expect(normalizePieegWelcome(welcome).notchFilter).toBe(false);
+    expect(normalizePieegWelcome({ ...welcome, mock: true }).mock).toBe(true);
+    expect(normalizePieegWelcome(welcome).mock).toBe(false);
+    expect(normalizePieegWelcome(welcome).notchFreq).toBe(60);
+  });
+  it("defaults sample_rate to 250 and channels to 0 when absent", () => {
+    const c = normalizePieegWelcome({ status: "connected" });
+    expect(c.sampleRate).toBe(250);
+    expect(c.channels).toBe(0);
+  });
+});
+
+describe("decodePieegMessage", () => {
+  it("decodes the welcome frame", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "connected", sample_rate: 250, channels: 16, mock: false }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.channels).toBe(16);
+    expect(r.config.mock).toBe(false);
+  });
+  it("flags mock mode via the welcome so the client can refuse it", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, mock: true }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.mock).toBe(true);
+  });
+  it("decodes a per-sample {t,n,channels} frame into a single-row batch, carrying n", () => {
+    const r = decodePieegMessage(JSON.stringify({ t: 1711234567.123, n: 42, channels: [1.5, -2.5, 3] }));
+    expect(r.kind).toBe("samples");
+    expect(r.rows).toEqual([[1.5, -2.5, 3]]);
+    expect(r.n).toBe(42);
+    expect(r.t).toBe(1711234567.123);
+  });
+  it("also decodes a frame delivered as a UTF-8 binary payload", () => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ t: 1, n: 7, channels: [4, 5] }));
+    const r = decodePieegMessage(bytes.buffer);
+    expect(r.kind).toBe("samples");
+    expect(r.rows).toEqual([[4, 5]]);
+    expect(r.n).toBe(7);
+  });
+  it("ignores the server's other status messages and malformed frames", () => {
+    for (const m of [
+      { record_status: { recording: false } },
+      { lsl_status: { running: false } },
+      { spike_config: { threshold: 1 } },
+      { hampel_config: {} },
+      { t: 1, channels: [1, 2] },          // missing n
+      { n: 5 },                             // missing channels
+      { n: "5", channels: [1] },           // n not a number
+    ]) {
+      expect(decodePieegMessage(JSON.stringify(m)).kind).toBe("ignore");
+    }
+    expect(decodePieegMessage("{bad json").kind).toBe("ignore");
+    expect(decodePieegMessage(null).kind).toBe("ignore");
+    expect(decodePieegMessage(42).kind).toBe("ignore");
+  });
+  it("per-sample drop detection uses gapBatches on the monotonic n", () => {
+    expect(gapBatches(41, 42)).toBe(0);   // in order
+    expect(gapBatches(41, 45)).toBe(3);   // 42,43,44 dropped
+    expect(gapBatches(41, 41)).toBe(0);   // duplicate / restart
   });
 });
