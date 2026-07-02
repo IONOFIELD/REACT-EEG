@@ -19,7 +19,8 @@ function expectStamped(obj) {
 const rec = (over = {}) => ({
   filename: "PHY-BL-A7F3C2-20260101-001.edf", studyType: "BL", date: "2026-01-01",
   channels: 64, sampleRate: 160, duration: 1, status: "pending",
-  subjectHash: "A7F3C2", pipelineVersion: "react-pipeline-1.0.0", schemaVersion: "v15.0",
+  subjectHash: "A7F3C2", pipelineVersion: "react-pipeline-1.0.0", schemaVersion: "v16.0",
+  sourceType: "import", nonClinical: false,
   ...over,
 });
 
@@ -63,9 +64,20 @@ describe("buildExportManifest", () => {
     expect(a.recordCount).toBe(2);
     // per-record stamps pass through (these are the *record's own* provenance, may differ from current)
     expect(a.records[0].pipelineVersion).toBe("react-pipeline-1.0.0");
-    expect(a.records[0].schemaVersion).toBe("v15.0");
+    expect(a.records[0].schemaVersion).toBe("v16.0");
     expect(a.records[0].edfPath).toBe("data/BL/PHY-BL-A7F3C2-20260101-001.edf");
     expect(a.records[0].annotationPath).toBe("annotations/PHY-BL-A7F3C2-20260101-001_annotations.json");
+  });
+
+  it("carries the sourceType provenance + nonClinical flag through the export", () => {
+    const m = buildExportManifest([rec({ sourceType: "pieeg", nonClinical: true })]);
+    const r = m.subjects[0].records[0];
+    expect(r.sourceType).toBe("pieeg");
+    expect(r.nonClinical).toBe(true);
+    // absent provenance → null/false, never undefined
+    const m2 = buildExportManifest([rec({ sourceType: undefined, nonClinical: undefined })]);
+    expect(m2.subjects[0].records[0].sourceType).toBeNull();
+    expect(m2.subjects[0].records[0].nonClinical).toBe(false);
   });
 
   it("per-record provenance is null (not omitted) for legacy records", () => {

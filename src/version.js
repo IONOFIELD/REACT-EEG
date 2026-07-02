@@ -18,9 +18,11 @@
 //                     Bumped ONLY when the stored record/annotation shape changes in a
 //                     way readers must handle. Every bump REQUIRES a matching step in
 //                     migrateRecord() (App.jsx) so older libraries load cleanly.
-//                     History: v13 → v14.0 → v14.1 → v15.0.
+//                     History: v13 → v14.0 → v14.1 → v15.0 → v16.0.
 //                     v15.0: annotations gain a stable ACNS/ILAE `code`; ACNS
 //                     periodic/rhythmic terms added.
+//                     v16.0: records gain a structured `sourceType` provenance tag
+//                     (pieeg/acquire/import/package/public-dataset) + `nonClinical` flag.
 //
 // STAMPING RULE (enforced by test/versioning.test.js + test/manifests.test.js):
 // every artifact that leaves the app — annotation sidecar (sidecar.js), patient-package
@@ -35,6 +37,6 @@
 //   3. package-lock.json — BOTH the top-level "version" AND packages[""].version
 //   4. Prepend { version, items } to CHANGELOG in App.jsx (top entry renders as "· current")
 // test/versioning.test.js fails if 1/2/3/4 drift apart.
-export const APP_VERSION = "v18.5";
+export const APP_VERSION = "v19.0";
 export const PIPELINE_VERSION = "react-pipeline-1.0.0";
-export const SCHEMA_VERSION = "v15.0";
+export const SCHEMA_VERSION = "v16.0";
