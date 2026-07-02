@@ -11,7 +11,7 @@ import { ANNOTATION_TYPES as ANNOTATION_COLORS, migrateAnnotations } from "./ann
 // Inter-rater / provenance: pseudonymous (hashed) annotator id + concordant/discordant indicator.
 import { hashAnnotator, agreementByAnnotation } from "./interrater.js";
 // EDF channel signal-presence (σ-based; ignores DC offset). Unit-tested in test/edf-signals.test.js.
-import { signalStats, channelHasSignal } from "./edf-signals.js";
+import { signalStats, channelHasSignal, edfHasAnySignal } from "./edf-signals.js";
 // Pure DSP kernel (extracted, behaviour-identical, unit-tested in test/dsp.golden.test.js)
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
@@ -7503,6 +7503,30 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
     return 0;
   });
 
+  // Files whose loaded EDF carries NO signal on any channel (all flat/empty) — e.g. a session
+  // saved with no live data. Memoized over records + edfFileStore so the capped signal scans
+  // only re-run when the library or its loaded EDFs change.
+  const noSignalFiles = useMemo(() => {
+    const s = new Set();
+    for (const r of records) {
+      const edf = edfFileStore?.[r.filename];
+      if (edf && !edfHasAnySignal(edf)) s.add(r.filename);
+    }
+    return s;
+  }, [records, edfFileStore]);
+
+  // Single source of truth for the library status dot. Red = no data (EDF missing OR present
+  // but every channel flat/empty); otherwise blue=test, green=recorded, yellow=imported.
+  const dataDot = (r) => {
+    const missing = !edfFileStore?.[r.filename] && r.fileType !== "simulated" && !r.isSimulated;
+    if (missing) return { color: "#ef4444", title: "No EDF data", noData: true };
+    if (noSignalFiles.has(r.filename)) return { color: "#ef4444", title: "No signal — every channel is flat/empty", noData: true };
+    if (r.isTest) return { color: "#3b82f6", title: "Test", noData: false };
+    if (r.isAcquired) return { color: "#22c55e", title: "Recorded", noData: false };
+    return { color: "#eab308", title: "Imported", noData: false };
+  };
+  const noDataCount = noSignalFiles.size;
+
   const stats = {
     total: records.length, verified: records.filter(r=>r.status==="verified").length,
     subjects: new Set(records.map(r=>r.subjectHash)).size,
@@ -7640,6 +7664,15 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
           .lib-table th, .lib-table td { text-align: center; }
           .lib-table td > div { justify-content: center; }
         `}</style>
+        {noDataCount > 0 && (
+          <div role="status" style={{display:"flex",alignItems:"center",gap:8,margin:"0 28px 12px",padding:"8px 12px",
+            background:"#2a0a0a",border:"1px solid #7f1d1d",borderRadius:0,fontSize:11,color:"#f87171",
+            fontFamily:"'IBM Plex Mono', monospace"}}>
+            <span style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:"#ef4444",flexShrink:0}}/>
+            <span><strong>{noDataCount}</strong> recording{noDataCount!==1?"s":""} in the library {noDataCount!==1?"have":"has"} no signal — every channel is flat/empty
+              (e.g. a session saved with no live data). Look for the red status dot; these files contain no EEG to review.</span>
+          </div>
+        )}
         {viewMode==="table" ? (
           <table className="lib-table" style={{width:"100%",borderCollapse:"collapse",fontSize:13}}>
             <thead>
@@ -7693,8 +7726,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
             </tr></thead>
             <tbody>{filtered.map(r=>{
               const st=STUDY_TYPES[r.studyType]||{label:"?",color:"#666"};
-              const dotColor = !edfFileStore?.[r.filename] && r.fileType!=="simulated"&&!r.isSimulated ? "#ef4444" : r.isTest ? "#3b82f6" : r.isAcquired ? "#22c55e" : "#eab308";
-              const dotTitle = !edfFileStore?.[r.filename] && r.fileType!=="simulated"&&!r.isSimulated ? "No EDF data" : r.isTest ? "Test" : r.isAcquired ? "Recorded" : "Imported";
+              const dot = dataDot(r); const dotColor = dot.color, dotTitle = dot.title;
               const durStr = r.durationSec && r.durationSec < 60 ? `${r.durationSec}s` : `${r.duration}m`;
               const dec = decodeReactFilename(r);
               return (
@@ -7710,7 +7742,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
                   </td>
                   {/* FILE: single line — status dot + filename. Channel count / duration / size moved
                       to the hover tooltip so every row stays one line tall. */}
-                  <td data-tut="File: The de-identified filename. The colored dot shows data status — green recorded, yellow imported, blue test, red no EDF data. Hover the name for channels, duration and size." style={{padding:"10px 16px 10px 4px",verticalAlign:"middle",textAlign:"left"}}>
+                  <td data-tut="File: The de-identified filename. The colored dot shows data status — green recorded, yellow imported, blue test, red = no data (EDF missing, or every channel flat/empty). Hover the name for channels, duration and size." style={{padding:"10px 16px 10px 4px",verticalAlign:"middle",textAlign:"left"}}>
                     <div style={{display:"flex",alignItems:"center",gap:8,justifyContent:"flex-start"}}>
                       <span title={dotTitle} style={{display:"inline-block",width:8,height:8,borderRadius:"50%",background:dotColor,flexShrink:0}}/>
                       <span title={`${r.filename}  —  ${r.channels}ch · ${durStr} · ${r.fileSize}MB`} style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:13,color:"#ddd",fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:340}}>{r.filename}</span>
@@ -7805,8 +7837,7 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
           <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(280px,1fr))",gap:12,padding:"20px 28px"}}>
             {filtered.map(r=>{
               const st=STUDY_TYPES[r.studyType]||{label:"?",color:"#666"};
-              const dotColor = !edfFileStore?.[r.filename] && r.fileType!=="simulated"&&!r.isSimulated ? "#ef4444" : r.isTest ? "#3b82f6" : r.isAcquired ? "#22c55e" : "#eab308";
-              const dotTitle = !edfFileStore?.[r.filename] && r.fileType!=="simulated"&&!r.isSimulated ? "No EDF data" : r.isTest ? "Test" : r.isAcquired ? "Recorded" : "Imported";
+              const dot = dataDot(r); const dotColor = dot.color, dotTitle = dot.title;
               return (
                 <div key={r.id} style={{background:"#0d0d0d",border:"1px solid #1a1a1a",borderRadius:0,padding:16,cursor:"pointer",transition:"border-color 0.15s"}}
                   onMouseEnter={e=>e.currentTarget.style.borderColor="#333"} onMouseLeave={e=>e.currentTarget.style.borderColor="#1a1a1a"}

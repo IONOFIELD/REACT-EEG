@@ -4,7 +4,7 @@
 // made flat/constant channels read as "has data". The rule is now mean-removed σ + a
 // require-it-varies check.
 import { describe, it, expect } from "vitest";
-import { signalStats, channelHasSignal, signalStdFloor, EEG_SIGNAL_STD_MIN } from "../src/edf-signals.js";
+import { signalStats, channelHasSignal, edfHasAnySignal, signalStdFloor, EEG_SIGNAL_STD_MIN } from "../src/edf-signals.js";
 
 const f32 = (a) => Float32Array.from(a);
 const sine = (freq, sr, N, amp) => f32(Array.from({ length: N }, (_, n) => amp * Math.sin(2 * Math.PI * freq * n / sr)));
@@ -51,6 +51,28 @@ describe("channelHasSignal", () => {
   it("empty / missing channel → no signal", () => {
     expect(channelHasSignal(null)).toBe(false);
     expect(channelHasSignal(f32([]))).toBe(false);
+  });
+});
+
+describe("edfHasAnySignal", () => {
+  const edf = (channelData, signals) => ({ channelData, signals });
+  it("EDF with at least one live channel → true (even if others are flat)", () => {
+    expect(edfHasAnySignal(edf([f32(new Array(512).fill(0)), sine(10, 256, 512, 30)]))).toBe(true);
+  });
+  it("EDF whose every channel is flat/zero → false (the no-data / zero-fill session case)", () => {
+    expect(edfHasAnySignal(edf([f32(new Array(512).fill(0)), f32(new Array(512).fill(0))]))).toBe(false);
+  });
+  it("all channels flat with a DC offset → false (not fooled by baseline)", () => {
+    expect(edfHasAnySignal(edf([f32(new Array(512).fill(100)), f32(new Array(512).fill(-40))]))).toBe(false);
+  });
+  it("honours per-channel physical dimension when judging signal", () => {
+    // 30 µV expressed in mV — detected only because the signal's physDim says mV.
+    expect(edfHasAnySignal(edf([sine(10, 256, 512, 0.03)], [{ physDim: "mV" }]))).toBe(true);
+  });
+  it("no channelData / empty / missing EDF → false", () => {
+    expect(edfHasAnySignal(edf([], []))).toBe(false);
+    expect(edfHasAnySignal(null)).toBe(false);
+    expect(edfHasAnySignal({})).toBe(false);
   });
 });
 
