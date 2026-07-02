@@ -16,7 +16,7 @@ import { signalStats, channelHasSignal, edfHasAnySignal } from "./edf-signals.js
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
-  interpolateArtifacts,
+  interpolateArtifacts, createStreamingFilter,
 } from "./dsp.js";
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
@@ -29,6 +29,10 @@ setHashSalt(import.meta.env.VITE_HASH_SALT);
 // Live acquisition WebSocket-bridge frame parser (see bridge/PROTOCOL.md). Unit-tested in
 // test/live-stream.test.js. The mock + Python bridges emit exactly these frames.
 import { decodeMessage, gapBatches, decodePieegMessage } from "./live-stream.js";
+// Live per-channel verification metrics (RMS / mains dominance / status) — pure, unit-tested.
+import { channelQuality } from "./live-metrics.js";
+// EDF writer (extracted for round-trip testing; supports a reserved-field version stamp).
+import { buildEDFFile } from "./edf.js";
 
 // Display formatter for age under HIPAA Safe Harbor: ages ≥ 90 render as "90+" (capAge
 // stores 90 as the aggregate sentinel). Applied at display time too, so any record stored
@@ -1713,77 +1717,7 @@ function getEDFFullResampled(edfData, channelIndex, targetSr) {
   return out;
 }
 
-// ── EDF Writer ──
-function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSec = 1, patientId = "", recordingId = "" }) {
-  const ns = channelLabels.length;
-  const totalSamples = channelData[0].length;
-  const samplesPerRecord = sampleRate * recordDurationSec;
-  const numRecords = Math.ceil(totalSamples / samplesPerRecord);
-  const headerBytes = 256 + ns * 256;
-  const dataBytes = numRecords * ns * samplesPerRecord * 2;
-  const buffer = new ArrayBuffer(headerBytes + dataBytes);
-  const view = new DataView(buffer);
-  const bytes = new Uint8Array(buffer);
-
-  const writeStr = (offset, length, str) => {
-    const padded = (str || "").padEnd(length).slice(0, length);
-    for (let i = 0; i < length; i++) bytes[offset + i] = padded.charCodeAt(i);
-  };
-
-  // Main header (256 bytes)
-  writeStr(0, 8, "0       ");
-  writeStr(8, 80, patientId);
-  writeStr(88, 80, recordingId);
-  const now = new Date();
-  writeStr(168, 8, `${String(now.getDate()).padStart(2,"0")}.${String(now.getMonth()+1).padStart(2,"0")}.${String(now.getFullYear()%100).padStart(2,"0")}`);
-  writeStr(176, 8, `${String(now.getHours()).padStart(2,"0")}.${String(now.getMinutes()).padStart(2,"0")}.${String(now.getSeconds()).padStart(2,"0")}`);
-  writeStr(184, 8, String(headerBytes));
-  writeStr(192, 44, "");
-  writeStr(236, 8, String(numRecords));
-  writeStr(244, 8, String(recordDurationSec));
-  writeStr(252, 4, String(ns));
-
-  // Per-signal headers
-  const b = 256;
-  const physMins = [], physMaxs = [];
-  for (let i = 0; i < ns; i++) {
-    let min = Infinity, max = -Infinity;
-    const d = channelData[i];
-    for (let j = 0; j < d.length; j++) { if (d[j] < min) min = d[j]; if (d[j] > max) max = d[j]; }
-    if (min === max) { min -= 1; max += 1; }
-    physMins.push(min);
-    physMaxs.push(max);
-  }
-  const digMin = -32768, digMax = 32767;
-
-  for (let i = 0; i < ns; i++) writeStr(b + i * 16, 16, channelLabels[i]);          // label
-  for (let i = 0; i < ns; i++) writeStr(b + ns*16 + i*80, 80, "");                  // transducer
-  for (let i = 0; i < ns; i++) writeStr(b + ns*96 + i*8, 8, "uV");                  // physDim
-  for (let i = 0; i < ns; i++) writeStr(b + ns*104 + i*8, 8, physMins[i].toFixed(1));// physMin
-  for (let i = 0; i < ns; i++) writeStr(b + ns*112 + i*8, 8, physMaxs[i].toFixed(1));// physMax
-  for (let i = 0; i < ns; i++) writeStr(b + ns*120 + i*8, 8, String(digMin));       // digMin
-  for (let i = 0; i < ns; i++) writeStr(b + ns*128 + i*8, 8, String(digMax));       // digMax
-  for (let i = 0; i < ns; i++) writeStr(b + ns*136 + i*80, 80, "");                 // prefiltering
-  for (let i = 0; i < ns; i++) writeStr(b + ns*216 + i*8, 8, String(samplesPerRecord)); // numSamples
-  for (let i = 0; i < ns; i++) writeStr(b + ns*224 + i*32, 32, "");                 // reserved
-
-  // Data records — each record: ns channels × samplesPerRecord × Int16LE
-  let offset = headerBytes;
-  for (let rec = 0; rec < numRecords; rec++) {
-    for (let ch = 0; ch < ns; ch++) {
-      const scale = (physMaxs[ch] - physMins[ch]) / (digMax - digMin);
-      for (let s = 0; s < samplesPerRecord; s++) {
-        const si = rec * samplesPerRecord + s;
-        const physVal = si < channelData[ch].length ? channelData[ch][si] : 0;
-        const digVal = Math.round((physVal - physMins[ch]) / scale + digMin);
-        view.setInt16(offset, Math.max(digMin, Math.min(digMax, digVal)), true);
-        offset += 2;
-      }
-    }
-  }
-
-  return buffer;
-}
+// ── EDF Writer ── (moved to ./edf.js so the round-trip is unit-testable; imported at top.)
 
 // ── Filters ──
 // ── Butterworth filter design (cascaded biquad sections) ──
@@ -10198,13 +10132,13 @@ function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false, devic
 // the moment the bridge is connected — before and during recording. Auto-scales each lane
 // to its own recent peak so any channel/gain fills cleanly. Read-only overlay; it does not
 // touch the Review epoch viewer underneath.
-function LiveWaveform({ viewRef, active, recording, droppedRef }) {
+function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, droppedRef, filterText = "" }) {
   const canvasRef = useRef(null);
   useEffect(() => {
     if (!active) { const cv = canvasRef.current; if (cv) { const c = cv.getContext("2d"); c && c.clearRect(0, 0, cv.width, cv.height); } return; }
     let raf;
     const draw = () => {
-      const cv = canvasRef.current, view = viewRef.current;
+      const cv = canvasRef.current, view = (filtered ? filtRef : rawRef).current;
       if (cv) {
         const W = cv.clientWidth || 1, H = cv.clientHeight || 1;
         if (cv.width !== W) cv.width = W;
@@ -10227,7 +10161,8 @@ function LiveWaveform({ viewRef, active, recording, droppedRef }) {
         // header: fixed window length + status
         ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "top"; ctx.textAlign = "left";
         ctx.fillStyle = recording ? "#EF4444" : "#10B981";
-        ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s window`, labelW + 6, 4);
+        const modeTag = filtered ? (filterText ? `FILT ${filterText}` : "FILT") : "RAW";
+        ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s · ${modeTag}`, labelW + 6, 4);
         const dropped = droppedRef?.current || 0;
         if (dropped > 0) { ctx.fillStyle = "#F59E0B"; ctx.textAlign = "right"; ctx.fillText(`${dropped} dropped`, W - 6, 4); ctx.textAlign = "left"; }
         for (let c = 0; c < n; c++) {
@@ -10258,8 +10193,67 @@ function LiveWaveform({ viewRef, active, recording, droppedRef }) {
     };
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [active, recording]);
+  }, [active, recording, filtered, filterText]);
   return <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none", zIndex: 5 }} />;
+}
+
+// ══════════════════════════════════════════════════════════════
+// LIVE CHANNEL VERIFICATION PANEL — per-channel bring-up readout
+// ══════════════════════════════════════════════════════════════
+// For each channel, computed on a ~3 Hz timer (off the render path) from the RAW ring over the
+// last ~2 s: RMS (µV), whether mains (50/60 Hz) dominates, and a live/flatline/noisy status —
+// so a floating or badly-seated electrode is obvious at a glance. Compact + scrollable so it
+// fits the small appliance screen (≥ ~800×480). Pure metrics live in ./live-metrics.js.
+function LiveChannelPanel({ rawRef, active, mains = 60 }) {
+  const [rows, setRows] = useState([]);
+  useEffect(() => {
+    if (!active) { setRows([]); return; }
+    const tick = () => {
+      const view = rawRef.current;
+      if (!view || view.count === 0) { setRows([]); return; }
+      const { ring, labels, sr, cap, head, count } = view;
+      const win = Math.min(count, Math.round(sr * 2));
+      const out = labels.map((lab, c) => {
+        const w = new Float32Array(win);
+        for (let j = 0; j < win; j++) w[j] = ring[c][(head - win + j + cap * 2) % cap];
+        const q = channelQuality(w, sr, { mains });
+        return { label: lab, stdUv: q.stdUv, mains60: q.mains60, status: q.status };
+      });
+      setRows(out);
+    };
+    tick();
+    const id = setInterval(tick, 300);
+    return () => clearInterval(id);
+  }, [active, mains]);
+
+  if (!active) return null;
+  const STATUS = {
+    live:     { color: "#22c55e", label: "LIVE" },
+    flatline: { color: "#555",    label: "FLAT" },
+    noisy:    { color: "#F59E0B", label: "NOISY" },
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
+      <div style={{ padding: "6px 8px", borderBottom: "1px solid #1a1a1a", fontSize: 9, letterSpacing: "0.12em", color: "#6c8088", fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
+        <span>CHANNEL CHECK</span><span style={{ color: "#444" }}>RMS µV</span>
+      </div>
+      <div style={{ overflowY: "auto", flex: 1 }}>
+        {rows.length === 0 && <div style={{ padding: "8px", fontSize: 10, color: "#444" }}>warming up…</div>}
+        {rows.map((r, i) => {
+          const s = STATUS[r.status] || STATUS.flatline;
+          return (
+            <div key={i} title={`${r.label}: ${s.label}${r.mains60 ? " · 60 Hz dominant" : ""} · σ ${r.stdUv.toFixed(1)} µV`}
+              style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", borderBottom: "1px solid #111", fontSize: 10 }}>
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: s.color, flexShrink: 0 }} />
+              <span style={{ width: 40, color: "#aaa", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.label}</span>
+              <span style={{ flex: 1, textAlign: "right", color: r.status === "flatline" ? "#555" : "#cbd5d9" }}>{r.stdUv.toFixed(1)}</span>
+              {r.mains60 && <span style={{ color: "#F59E0B", fontSize: 8, fontWeight: 700 }} title="Mains (60 Hz) dominates this channel">⌁60</span>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -10338,7 +10332,9 @@ function AcquireTab() {
                                            // against the in-memory capture buffer growing unbounded
   const wsRef = useRef(null);
   const liveBufRef = useRef(null);   // recording buffer: { labels, data:[[]...], sr, uvScale }
-  const liveViewRef = useRef(null);  // rolling preview ring: { labels, sr, ring:[Float32Array], head, count, cap }
+  const liveViewRef = useRef(null);  // rolling RAW preview ring: { labels, sr, ring:[Float32Array], head, count, cap }
+  const liveFiltViewRef = useRef(null); // rolling FILTERED ring (same shape) for the live trace
+  const liveFiltersRef = useRef(null);  // per-channel createStreamingFilter instances (display filtering)
   const liveSeqRef = useRef(null);   // last bridge samples `seq` seen (drop detection, legacy path)
   const liveNRef = useRef(null);     // last pieeg-server per-sample `n` seen (drop detection)
   const liveDroppedRef = useRef(0);  // total dropped samples this session
@@ -10352,17 +10348,25 @@ function AcquireTab() {
   const stopRecordingRef = useRef(null);  // late-bound so the cap guard can flush a recording
   const liveImpedanceSupportedRef = useRef(false); // whether the connected device measures impedance
   const [liveConfig, setLiveConfig] = useState(null); // adopted server/bridge config shown in the UI
+  const [liveFilterOn, setLiveFilterOn] = useState(true); // live trace shows filtered (true) or raw (false)
+  const [liveVerifyOn, setLiveVerifyOn] = useState(true); // show the per-channel verification panel
 
-  // (Re)allocate buffers for a given channel set + rate (on connect and on hello adoption).
+  // (Re)allocate buffers for a given channel set + rate (on connect and on welcome adoption).
+  // Two rolling rings are kept: RAW (capture-independent preview + the per-channel verification
+  // metrics, which must see un-notched signal) and FILTERED (the live trace, via per-channel
+  // stateful streaming filters). The capture buffer (liveBufRef) is always RAW.
   const allocLiveBuffers = (labels, sr, uvScale = 1) => {
     const cap = Math.max(1, Math.round(sr * LIVE_VIEW_SEC));
     liveBufRef.current = { labels, data: labels.map(() => []), sr, uvScale };
     liveViewRef.current = { labels, sr, cap, head: 0, count: 0, ring: labels.map(() => new Float32Array(cap)) };
+    liveFiltViewRef.current = { labels, sr, cap, head: 0, count: 0, ring: labels.map(() => new Float32Array(cap)) };
+    const e = eegRef.current;
+    liveFiltersRef.current = labels.map(() => createStreamingFilter({ sampleRate: sr, hpf: e.hpf, lpf: e.lpf, notch: e.notch }));
     liveSeqRef.current = null;
   };
 
   const appendSamples = (rows) => {
-    const buf = liveBufRef.current, view = liveViewRef.current;
+    const buf = liveBufRef.current, view = liveViewRef.current, fview = liveFiltViewRef.current, filters = liveFiltersRef.current;
     if (!buf) return;
     const nc = buf.data.length;
     // Guard against an unbounded capture buffer on very long sessions: at the cap, flush what
@@ -10373,16 +10377,33 @@ function AcquireTab() {
       stopRecordingRef.current?.();
     }
     for (const row of rows) {
-      // Recording buffer — only while actively recording (this is what becomes the EDF).
+      // Recording buffer — only while actively recording (this is what becomes the EDF). RAW.
       if (recordingRef.current) for (let c = 0; c < nc; c++) buf.data[c].push(Number(row[c]) || 0);
-      // Rolling preview ring — always, so the live trace scrolls even before Record.
+      // Rolling RAW preview ring — always, so the trace + metrics work before Record.
       if (view) {
         for (let c = 0; c < nc; c++) view.ring[c][view.head] = Number(row[c]) || 0;
         view.head = (view.head + 1) % view.cap;
         if (view.count < view.cap) view.count++;
       }
+      // Rolling FILTERED ring — per-channel streaming filter (display only; capture stays raw).
+      if (fview) {
+        for (let c = 0; c < nc; c++) {
+          const v = Number(row[c]) || 0;
+          fview.ring[c][fview.head] = filters && filters[c] ? filters[c].process(Float32Array.of(v))[0] : v;
+        }
+        fview.head = (fview.head + 1) % fview.cap;
+        if (fview.count < fview.cap) fview.count++;
+      }
     }
   };
+
+  // Rebuild the per-channel live filters when the filter settings change mid-stream (new coeffs,
+  // fresh delay state). The filtered ring keeps its history; new samples use the new settings.
+  useEffect(() => {
+    const view = liveViewRef.current;
+    if (!view || !liveFiltersRef.current) return;
+    liveFiltersRef.current = view.labels.map(() => createStreamingFilter({ sampleRate: view.sr, hpf: eeg.hpf, lpf: eeg.lpf, notch: eeg.notch }));
+  }, [eeg.hpf, eeg.lpf, eeg.notch]);
 
   const handleWsMessage = (ev) => {
     const cfg = liveViewRef.current || liveBufRef.current;
@@ -10446,7 +10467,15 @@ function AcquireTab() {
     } else if (res.kind === "samples") {
       if (res.n != null) {
         const dropped = gapBatches(liveNRef.current, res.n);   // per-sample continuity on n
-        if (dropped > 0) { liveDroppedRef.current += dropped; debugLog(`[pieeg] dropped ${dropped} sample(s) (n ${liveNRef.current}→${res.n})`); }
+        if (dropped > 0) {
+          liveDroppedRef.current += dropped;
+          debugLog(`[pieeg] dropped ${dropped} sample(s) (n ${liveNRef.current}→${res.n})`);
+          // Reconcile the gap into the timeline so a dropout isn't silently compressed: insert
+          // explicit ZERO rows (never fabricated signal), capped at 2 s to bound a huge gap.
+          const nc = liveBufRef.current?.labels.length || res.rows[0].length;
+          const fill = Math.min(dropped, (liveBufRef.current?.sr || 250) * 2);
+          if (fill > 0) { const z = new Array(nc).fill(0); appendSamples(Array.from({ length: fill }, () => z)); }
+        }
         liveNRef.current = res.n;
       }
       appendSamples(res.rows);
@@ -10622,7 +10651,8 @@ function AcquireTab() {
       channelData = electrodes.map(() => new Float32Array(sr * actualDurationSec));
     }
 
-    // Build EDF binary and parse it back
+    // Build EDF binary and parse it back. Stamp the pipeline+schema versions into the reserved
+    // header field (survives the de-id scrub, unlike recordingId) for provenance on re-import.
     const edfBuffer = buildEDFFile({
       channelLabels: electrodes,
       channelData,
@@ -10630,6 +10660,7 @@ function AcquireTab() {
       recordDurationSec: 1,
       patientId: hashSubjectId(subjectId),
       recordingId: `REACT-${studyType}`,
+      versionStamp: `REACT ${PIPELINE_VERSION} ${SCHEMA_VERSION}`,
     });
     const parsed = parseEDFFile(edfBuffer);
 
@@ -10791,12 +10822,25 @@ function AcquireTab() {
           }}>{I.Square()} STOP</button>
         )}/>
 
-      <div style={{flex:1,display:"flex",overflow:"hidden",position:"relative"}}>
-        {/* Live rolling trace from the bridge ring buffer — overlays the (empty) epoch viewer
-            while connected so you see the incoming signal live, before and during recording. */}
-        {selectedDevice?.protocol === "websocket" && (
-          <LiveWaveform viewRef={liveViewRef} active={connectionState >= CONN.connected}
+      <div style={{flex:1,display:"flex",overflow:"hidden"}}>
+       <div style={{flex:1,position:"relative",overflow:"hidden"}}>
+        {/* Live rolling trace from the acquisition ring — overlays the (empty) epoch viewer while
+            connected so you see the incoming signal live, before and during recording. The trace
+            shows the FILTERED ring (toggleable); capture stays raw. */}
+        {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && (
+          <LiveWaveform rawRef={liveViewRef} filtRef={liveFiltViewRef} filtered={liveFilterOn}
+            filterText={`${eeg.hpf||0}–${eeg.lpf||0}·N${eeg.notch||0}`}
+            active={connectionState >= CONN.connected}
             recording={isRecording && !isPaused} droppedRef={liveDroppedRef}/>
+        )}
+        {/* Live view toggles: raw/filtered trace + show/hide the channel-check panel */}
+        {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && connectionState >= CONN.connected && (
+          <div style={{position:"absolute",top:6,right:8,zIndex:10,display:"flex",gap:6}}>
+            <button onClick={()=>setLiveFilterOn(v=>!v)} title="Toggle the live trace between raw and filtered (display only — the captured EDF is always raw)"
+              style={{padding:"3px 8px",background:"#0d0d0d",border:"1px solid #2a2a2a",color:liveFilterOn?"#7ec8d9":"#888",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>{liveFilterOn?"FILTERED":"RAW"}</button>
+            <button onClick={()=>setLiveVerifyOn(v=>!v)} title="Show/hide the per-channel verification panel"
+              style={{padding:"3px 8px",background:"#0d0d0d",border:`1px solid ${liveVerifyOn?"#2a4a54":"#2a2a2a"}`,color:liveVerifyOn?"#7ec8d9":"#888",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>CHK</button>
+          </div>
         )}
         <WaveformCanvas eeg={eeg}>
           <AnnotationPopup draft={eeg.annotationDraft} annotationType={eeg.selectedAnnotationType}
@@ -10854,6 +10898,11 @@ function AcquireTab() {
             </div>
           )}
         </WaveformCanvas>
+       </div>
+       {/* Per-channel verification panel (bring-up): RMS / mains / live·flat·noisy per channel */}
+       {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && liveVerifyOn && connectionState >= CONN.connected && (
+         <LiveChannelPanel rawRef={liveViewRef} active={true} mains={eeg.notch || 60}/>
+       )}
       </div>
 
       {/* Floating annotation panel */}
