@@ -9,6 +9,11 @@ dist-single
 
 # Local-only data + notes (not part of the app/deploy)
 seed-edfs-archive/
+# Vendored PiEEG-server source, kept locally as a protocol reference only — NOT part of
+# REACT and must never be committed into this repo (separate project, ~11 MB).
+PiEEG-server-main-extract/
+PiEEG-server-main.zip
 AUDIT-v13.md
 AUDIT-v15.7-improvements.md
 AUDIT-deid-export.md
+AUDIT-live-acquire.md
