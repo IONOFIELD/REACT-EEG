@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "../src/version.js";
-import { buildAnnotationSidecar } from "../src/sidecar.js";
+import { buildAnnotationSidecar, parseAnnotationSidecar } from "../src/sidecar.js";
 
 const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
 const appSrc = read("../src/App.jsx");
@@ -126,5 +126,51 @@ describe("buildAnnotationSidecar — provenance is always stamped", () => {
     expect(sc.annotations).toEqual([]);
     expect(sc.annotationCount).toBe(0);
     expect(sc.sourceFilename).toBeNull();
+  });
+});
+
+describe("parseAnnotationSidecar — sidecar import round-trip", () => {
+  const sample = [
+    { id: 1, time: 1.0, duration: 0.5, type: "Spike", channel: -1 },
+    { id: 2, time: 4.2, duration: 1.0, type: "Seizure", channel: 3, text: "left temporal" },
+  ];
+
+  it("round-trips what buildAnnotationSidecar exports (via JSON text)", () => {
+    const json = JSON.stringify(buildAnnotationSidecar(sample, "file.edf"), null, 2);
+    const res = parseAnnotationSidecar(json);
+    expect(res.error).toBeUndefined();
+    expect(res.annotations).toEqual(sample);
+    expect(res.sourceFilename).toBe("file.edf");
+    expect(res.skipped).toBe(0);
+  });
+
+  it("accepts a bare annotation array (hand-edited / third-party files)", () => {
+    const res = parseAnnotationSidecar(JSON.stringify(sample));
+    expect(res.annotations).toEqual(sample);
+    expect(res.sourceFilename).toBeNull();
+  });
+
+  it("drops entries without a finite non-negative time, counts them in skipped", () => {
+    const res = parseAnnotationSidecar({ annotations: [
+      sample[0], { type: "Spike" }, { time: -3, type: "Spike" }, { time: "NaN-ish", type: "x" }, null, "junk",
+    ]});
+    expect(res.annotations).toEqual([sample[0]]);
+    expect(res.skipped).toBe(5);
+  });
+
+  it("normalizes malformed fields (string time, missing duration/type/channel)", () => {
+    const res = parseAnnotationSidecar({ annotations: [{ time: "2.5", text: "blink" }] });
+    const a = res.annotations[0];
+    expect(a.time).toBe(2.5);
+    expect(a.duration).toBe(0);
+    expect(a.type).toBe("blink"); // falls back to text, then "Note"
+    expect(a.channel).toBe(-1);
+  });
+
+  it("rejects non-sidecar input with an error (never throws)", () => {
+    expect(parseAnnotationSidecar("{not json").error).toBeTruthy();
+    expect(parseAnnotationSidecar({ foo: 1 }).error).toBeTruthy();
+    expect(parseAnnotationSidecar(42).error).toBeTruthy();
+    expect(parseAnnotationSidecar(null).error).toBeTruthy();
   });
 });
