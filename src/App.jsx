@@ -9582,7 +9582,7 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
         {/* Device dropdown — flat select */}
         <div style={{flex:1,position:"relative"}}>
           <div style={microLabel}>Input Source</div>
-          <select value={selectedDevice?.id||""} onChange={e=>{
+          <select data-tut="Input Source: Pick the acquisition hardware. piEEG (Pi HAT, 8/16-ch) streams directly from the pieeg-server running on your Raspberry Pi over WebSocket; OpenBCI uses a BrainFlow bridge. The choice sets the default sample rate, channel count and connection." value={selectedDevice?.id||""} onChange={e=>{
             const dev = DEVICE_CATALOG.find(d=>d.id===e.target.value);
             setSelectedDevice(dev||null);
             setDeviceConfig(prev => ({ ...prev,
@@ -9602,7 +9602,7 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
 
         {/* Port config for brainflow devices */}
         {selectedDevice && selectedDevice.protocol === "brainflow" && !selectedDevice.wireless && (
-          <div><div style={microLabel}>Port</div>
+          <div data-tut="Port: The serial port the OpenBCI dongle enumerates on (COM3 on Windows, /dev/ttyUSB0 on Linux). Only shown for wired BrainFlow boards."><div style={microLabel}>Port</div>
             <input value={deviceConfig.port} onChange={e=>setDeviceConfig({...deviceConfig,port:e.target.value})}
               placeholder="COM3" style={{...selectStyle,width:80,padding:"5px 8px"}}/></div>
         )}
@@ -9610,7 +9610,7 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
         {/* Server / bridge URL for WebSocket-streamed devices (piEEG). pieeg-server defaults to
             ws://localhost:1616 on the Pi; editable for LAN review (ws://<pi-host>:1616). */}
         {selectedDevice && (selectedDevice.protocol === "pieeg-server" || selectedDevice.protocol === "websocket") && (
-          <div><div style={microLabel}>{selectedDevice.protocol === "pieeg-server" ? "PiEEG Server" : "Bridge URL"}</div>
+          <div data-tut="PiEEG Server: The WebSocket address of pieeg-server. Default ws://localhost:1616 when REACT runs on the Pi; for LAN review point it at ws://<pi-hostname>:1616. Run the server WITHOUT --filter (REACT filters in-app) and WITHOUT --mock (REACT refuses synthetic data)."><div style={microLabel}>{selectedDevice.protocol === "pieeg-server" ? "PiEEG Server" : "Bridge URL"}</div>
             <input value={deviceConfig.bridgeUrl||""} onChange={e=>setDeviceConfig({...deviceConfig,bridgeUrl:e.target.value})}
               placeholder={selectedDevice.protocol === "pieeg-server" ? "ws://localhost:1616" : "ws://localhost:8765"}
               title={selectedDevice.protocol === "pieeg-server" ? "pieeg-server WebSocket (ws://<host>:1616). Run it on the Pi WITHOUT --mock." : "Local Python/BrainFlow → WebSocket bridge that streams piEEG samples"}
@@ -9620,14 +9620,14 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
         {/* Action buttons */}
         <div style={{display:"flex",gap:6,alignItems:"flex-end"}}>
           {!isConnected ? (
-            <button onClick={onConnect} disabled={!selectedDevice||connectionState===CONN.connecting} style={{
+            <button data-tut="Connect: Opens the live stream. REACT adopts the server's sample rate + channel count, disables any server-side filtering so it receives raw µV, and (for piEEG) skips straight to Ready — there's no impedance step. A missing server shows an error and auto-reconnect." onClick={onConnect} disabled={!selectedDevice||connectionState===CONN.connecting} style={{
               padding:"6px 14px",background:selectedDevice?"#0a2a0a":"#1a1a1a",
               border:`1px solid ${selectedDevice?"#4a9bab40":"#333"}`,borderRadius:0,
               color:selectedDevice?"#7ec8d9":"#555",cursor:selectedDevice?"pointer":"default",
               fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
             }}>{I.Zap()} CONNECT</button>
           ) : (
-            <button onClick={onDisconnect} style={{
+            <button data-tut="Disconnect: Closes the live stream and cancels any pending reconnect. Stops the rolling preview; does not delete anything already recorded." onClick={onDisconnect} style={{
               padding:"6px 14px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
               color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
             }}>{I.X()} DISCONNECT</button>
@@ -10233,7 +10233,7 @@ function LiveChannelPanel({ rawRef, active, mains = 60 }) {
     noisy:    { color: "#F59E0B", label: "NOISY" },
   };
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
+    <div data-tut="Channel check: A live bring-up readout, one row per channel, from the last ~2 s of raw signal. The dot is the verdict — green LIVE (plausible EEG), grey FLAT (dead/floating input), amber NOISY (railed or mains-dominated). The number is RMS in µV; ⌁60 flags a channel swamped by mains hum. Use it to spot a loose or badly-seated electrode at a glance." style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
       <div style={{ padding: "6px 8px", borderBottom: "1px solid #1a1a1a", fontSize: 9, letterSpacing: "0.12em", color: "#6c8088", fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
         <span>CHANNEL CHECK</span><span style={{ color: "#444" }}>RMS µV</span>
       </div>
@@ -10732,13 +10732,14 @@ function AcquireTab() {
       {/* Recording controls bar */}
       <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexShrink:0}}>
         {!isRecording ? (<>
-          <SubjectIdInput value={subjectId} onChange={setSubjectId}/>
-          <div><div style={microLabel}>Study Type</div>
+          <div data-tut="Subject ID: An internal, de-identified subject code (e.g. FB-001). It is one-way hashed for the record and never stored in the clear — the raw ID never leaves this machine. Required before you can record.">
+            <SubjectIdInput value={subjectId} onChange={setSubjectId}/></div>
+          <div data-tut="Study Type: The recording paradigm — Baseline, Post-Injury, Follow-Up, Routine or Long-Term. It becomes part of the de-identified filename and drives compliance expectations."><div style={microLabel}>Study Type</div>
             <select value={studyType} onChange={e=>setStudyType(e.target.value)} style={selectStyle}>
               {Object.entries(STUDY_TYPES).map(([k,v])=><option key={k} value={k}>{v.label}</option>)}
             </select></div>
           {subjectId && (
-            <div style={{padding:"6px 12px",background:"#0a0a0a",border:"1px solid #1a3040",borderRadius:0,fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:"#7ec8d9"}}>
+            <div data-tut="File preview: The PHI-free filename this session will be saved as — SUBJECT-SEX/AGE-TYPE-HASH-DATE-SEQ.edf. The date is generalized to the year per HIPAA Safe Harbor." style={{padding:"6px 12px",background:"#0a0a0a",border:"1px solid #1a3040",borderRadius:0,fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:"#7ec8d9"}}>
               <span style={{color:"#555",fontSize:9}}>FILE → </span>
               {generateFilename(subjectId, studyType, new Date().toISOString().split("T")[0])}
             </div>
@@ -10802,28 +10803,28 @@ function AcquireTab() {
         totalDuration={acqDuration}
         isPlaying={isRecording && !isPaused} onPlayPause={isRecording ? togglePause : undefined}
         leftContent={connectionState >= CONN.ready && !isRecording ? (
-          <button onClick={()=>{ if(liveImpedanceSupportedRef.current){ try{wsRef.current?.send(JSON.stringify({cmd:"impedance"}));}catch{} } else setImpedances(null); setShowImpedance(true); }} style={{
+          <button data-tut="Impedance (Z): Requests a per-electrode impedance reading — only if the device measures it. pieeg-server does not, so REACT shows an honest 'not available' rather than a fabricated value; use the per-channel verification panel to judge electrode contact instead." onClick={()=>{ if(liveImpedanceSupportedRef.current){ try{wsRef.current?.send(JSON.stringify({cmd:"impedance"}));}catch{} } else setImpedances(null); setShowImpedance(true); }} style={{
             padding:"4px 10px",background:"#111",border:"1px solid #8B5CF640",borderRadius:0,
             color:"#8B5CF6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
           }}>{I.Ohm(14)} Z</button>
         ) : null}
         rightContent={!isRecording ? (
           connectionState >= CONN.ready ? (
-            <button onClick={startRecording} disabled={!canRecord} style={{
+            <button data-tut="REC: Starts capturing RAW µV samples to a new EDF (needs a Subject ID and a Ready device). The captured file is unfiltered — the live filter is display-only — so downstream analysis is reproducible. Dropped samples are zero-filled to keep the timeline honest." onClick={startRecording} disabled={!canRecord} style={{
               padding:"4px 14px",background:canRecord?"#7f1d1d":"#1a1a1a",border:`1px solid ${canRecord?"#EF444450":"#333"}`,
               borderRadius:0,color:canRecord?"#EF4444":"#555",cursor:canRecord?"pointer":"default",
               fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
             }}>{I.Record()} REC</button>
           ) : null
         ) : (
-          <button onClick={stopRecording} style={{
+          <button data-tut="STOP: Ends the recording and writes the EDF (stamped with the pipeline + schema versions), then adds it to the Library ready for Review — through the same de-identify + import path as any file." onClick={stopRecording} style={{
             padding:"4px 10px",background:"#111",border:"1px solid #EF444440",borderRadius:0,
             color:"#EF4444",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:4
           }}>{I.Square()} STOP</button>
         )}/>
 
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
-       <div style={{flex:1,position:"relative",overflow:"hidden"}}>
+       <div data-tut="Live trace: A rolling multi-channel strip pinned to now — the newest sample is at the right edge and each lane auto-scales to its own recent peak. The header shows channels · rate · window · RAW/FILTERED and any dropped-sample count. It streams the moment you connect, before and during recording." style={{flex:1,position:"relative",overflow:"hidden"}}>
         {/* Live rolling trace from the acquisition ring — overlays the (empty) epoch viewer while
             connected so you see the incoming signal live, before and during recording. The trace
             shows the FILTERED ring (toggleable); capture stays raw. */}
@@ -10836,9 +10837,9 @@ function AcquireTab() {
         {/* Live view toggles: raw/filtered trace + show/hide the channel-check panel */}
         {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && connectionState >= CONN.connected && (
           <div style={{position:"absolute",top:6,right:8,zIndex:10,display:"flex",gap:6}}>
-            <button onClick={()=>setLiveFilterOn(v=>!v)} title="Toggle the live trace between raw and filtered (display only — the captured EDF is always raw)"
+            <button data-tut="Filtered / Raw: Switches the LIVE TRACE between the in-app filtered view (HPF/LPF/notch from the toolbar, applied by a streaming filter) and the raw amplifier signal. This is display only — the recorded EDF is always raw µV either way." onClick={()=>setLiveFilterOn(v=>!v)} title="Toggle the live trace between raw and filtered (display only — the captured EDF is always raw)"
               style={{padding:"3px 8px",background:"#0d0d0d",border:"1px solid #2a2a2a",color:liveFilterOn?"#7ec8d9":"#888",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>{liveFilterOn?"FILTERED":"RAW"}</button>
-            <button onClick={()=>setLiveVerifyOn(v=>!v)} title="Show/hide the per-channel verification panel"
+            <button data-tut="CHK: Shows or hides the per-channel verification panel on the right — a live RMS / mains / status readout for judging electrode contact during bring-up." onClick={()=>setLiveVerifyOn(v=>!v)} title="Show/hide the per-channel verification panel"
               style={{padding:"3px 8px",background:"#0d0d0d",border:`1px solid ${liveVerifyOn?"#2a4a54":"#2a2a2a"}`,color:liveVerifyOn?"#7ec8d9":"#888",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>CHK</button>
           </div>
         )}
@@ -11464,7 +11465,7 @@ export default function ReactEEGApp() {
               {I.Shield()} PHI PROTECTED
             </div>
             <button onClick={()=>setActiveTab("acquire")} title="Record — External Source"
-              data-tut="Record — connect external EEG hardware (e.g. OpenBCI) to acquire a live recording. Currently a passive shell until hardware integration lands." style={{
+              data-tut="Record: The live acquisition tab. Connect a piEEG (Pi HAT) via its pieeg-server, watch the live trace and per-channel verification readout, then capture a raw-µV session straight into the Library for review." style={{
               width:32,height:32,padding:0,borderRadius:4,cursor:"pointer",
               background:activeTab==="acquire"?"#1a3a40":"#111",
               border:activeTab==="acquire"?"1px solid #7ec8d9":"1px solid #2a2a2a",
