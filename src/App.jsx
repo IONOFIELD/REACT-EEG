@@ -9573,9 +9573,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
 // ══════════════════════════════════════════════════════════════
 const DEVICE_PROTOCOLS = {
   brainflow: { label: "OpenBCI", color: "#3B82F6", desc: "Direct board API" },
+  "pieeg-server": { label: "piEEG", color: "#10B981", desc: "Live µV stream from pieeg-server (WebSocket)" },
   websocket: { label: "piEEG / WS", color: "#10B981", desc: "Live stream over local WebSocket bridge" },
   simulated: { label: "Simulated", color: "#F59E0B", desc: "Test signals" },
 };
+// Never let an unknown protocol crash the UI — fall back to a neutral descriptor.
+const protocolInfo = (p) => DEVICE_PROTOCOLS[p] || { label: p || "Device", color: "#7ec8d9", desc: "" };
 
 // DEVICE_CATALOG, CONN, CONN_LABELS defined in CONFIGURATION block at top of file
 
@@ -9661,8 +9664,8 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
       {/* Device info strip when connected */}
       {isConnected && selectedDevice && (
         <div style={{display:"flex",alignItems:"center",gap:16,padding:"6px 16px",borderTop:"1px solid #111",background:"#080808",fontSize:10}}>
-          <span style={{color:DEVICE_PROTOCOLS[selectedDevice.protocol].color,fontWeight:700}}>
-            {DEVICE_PROTOCOLS[selectedDevice.protocol].label}
+          <span style={{color:protocolInfo(selectedDevice.protocol).color,fontWeight:700}}>
+            {protocolInfo(selectedDevice.protocol).label}
           </span>
           <span style={{color:"#666"}}>{selectedDevice.name}</span>
           <span style={{color:"#444"}}>|</span>
@@ -10785,7 +10788,7 @@ function AcquireTab() {
           <span style={{fontSize:11,color:"#888"}}>{STUDY_TYPES[studyType]?.label}</span>
           {selectedDevice && (<>
             <span style={{fontSize:10,color:"#555"}}>|</span>
-            <span style={{fontSize:10,color:DEVICE_PROTOCOLS[selectedDevice.protocol].color}}>{selectedDevice.name}</span>
+            <span style={{fontSize:10,color:protocolInfo(selectedDevice.protocol).color}}>{selectedDevice.name}</span>
           </>)}
         </>)}
       </div>
