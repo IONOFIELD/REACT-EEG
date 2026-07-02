@@ -28,7 +28,7 @@ import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderFo
 setHashSalt(import.meta.env.VITE_HASH_SALT);
 // Live acquisition WebSocket-bridge frame parser (see bridge/PROTOCOL.md). Unit-tested in
 // test/live-stream.test.js. The mock + Python bridges emit exactly these frames.
-import { decodeMessage, gapBatches } from "./live-stream.js";
+import { decodeMessage, gapBatches, decodePieegMessage } from "./live-stream.js";
 
 // Display formatter for age under HIPAA Safe Harbor: ages ≥ 90 render as "90+" (capAge
 // stores 90 as the aggregate sentinel). Applied at display time too, so any record stored
@@ -1380,9 +1380,10 @@ const DEVICE_CATALOG = [
   // OpenBCI hardware (BrainFlow)
   { id: "openbci-cyton-8", name: "OpenBCI Cyton", protocol: "brainflow", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, boardId: 0, port: "COM3" },
   { id: "openbci-cyton-16", name: "OpenBCI Cyton + Daisy", protocol: "brainflow", channels: 16, maxSr: 125, resolution: "24-bit", wireless: false, boardId: 2, port: "COM3" },
-  // piEEG (Raspberry Pi HAT) — streamed to the browser over a local WebSocket bridge.
-  { id: "pieeg-8", name: "piEEG (Pi HAT, 8ch)", protocol: "websocket", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:8765" },
-  { id: "pieeg-16", name: "piEEG-16 (Pi HAT, 16ch)", protocol: "websocket", channels: 16, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:8765" },
+  // piEEG (Raspberry Pi HAT) — streamed to the browser directly from the vendor pieeg-server
+  // (github.com/pieeg-club/PiEEG-server) over its JSON WebSocket on port 1616.
+  { id: "pieeg-8", name: "piEEG (Pi HAT, 8ch)", protocol: "pieeg-server", channels: 8, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:1616" },
+  { id: "pieeg-16", name: "piEEG-16 (Pi HAT, 16ch)", protocol: "pieeg-server", channels: 16, maxSr: 250, resolution: "24-bit", wireless: false, bridgeUrl: "ws://localhost:1616" },
 ];
 
 // piEEG default electrode order (matches the bridge's channel ordering).
@@ -9672,11 +9673,13 @@ function DeviceSelector({ selectedDevice, setSelectedDevice, connectionState, on
               placeholder="COM3" style={{...selectStyle,width:80,padding:"5px 8px"}}/></div>
         )}
 
-        {/* Bridge URL for WebSocket devices (piEEG) */}
-        {selectedDevice && selectedDevice.protocol === "websocket" && (
-          <div><div style={microLabel}>Bridge URL</div>
+        {/* Server / bridge URL for WebSocket-streamed devices (piEEG). pieeg-server defaults to
+            ws://localhost:1616 on the Pi; editable for LAN review (ws://<pi-host>:1616). */}
+        {selectedDevice && (selectedDevice.protocol === "pieeg-server" || selectedDevice.protocol === "websocket") && (
+          <div><div style={microLabel}>{selectedDevice.protocol === "pieeg-server" ? "PiEEG Server" : "Bridge URL"}</div>
             <input value={deviceConfig.bridgeUrl||""} onChange={e=>setDeviceConfig({...deviceConfig,bridgeUrl:e.target.value})}
-              placeholder="ws://localhost:8765" title="Local Python/BrainFlow → WebSocket bridge that streams piEEG samples"
+              placeholder={selectedDevice.protocol === "pieeg-server" ? "ws://localhost:1616" : "ws://localhost:8765"}
+              title={selectedDevice.protocol === "pieeg-server" ? "pieeg-server WebSocket (ws://<host>:1616). Run it on the Pi WITHOUT --mock." : "Local Python/BrainFlow → WebSocket bridge that streams piEEG samples"}
               style={{...selectStyle,width:180,padding:"5px 8px"}}/></div>
         )}
 
@@ -10293,8 +10296,12 @@ function AcquireTab() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDevice?.id, eeg.montage, eeg.eegSystem]);
 
-  // Close any open bridge socket when the Acquire tab unmounts.
-  useEffect(() => () => { if (wsRef.current) { try { wsRef.current.close(); } catch {} } }, []);
+  // Close any open socket + cancel any pending reconnect when the Acquire tab unmounts.
+  useEffect(() => () => {
+    userClosingRef.current = true;
+    clearTimeout(reconnectTimerRef.current);
+    if (wsRef.current) { try { wsRef.current.close(); } catch {} }
+  }, []);
 
   // Use app-level annotations keyed by acquire filename
   const acqFilename = subjectId ? generateFilename(subjectId, studyType, new Date().toISOString().split("T")[0]) : "acquire-session";
@@ -10315,30 +10322,36 @@ function AcquireTab() {
 
   // Device state
   const [connectionState, setConnectionState] = useState(CONN.disconnected);
-  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 125, channels: 16, port: "COM3", bridgeUrl: "ws://localhost:8765" });
+  const [deviceConfig, setDeviceConfig] = useState({ sampleRate: 125, channels: 16, port: "COM3", bridgeUrl: "ws://localhost:1616" });
   const [impedances, setImpedances] = useState(null);
   const [showImpedance, setShowImpedance] = useState(false);
 
-  // ── Live WebSocket bridge (piEEG and other protocol:"websocket" devices) ──
-  // The browser cannot talk to a Pi HAT / BrainFlow board directly, so a small local bridge
-  // process (Python/BrainFlow → WebSocket, or bridge/mock-bridge.mjs) streams frames here.
-  // Frame parsing lives in ./live-stream.js (decodeMessage); the wire format is documented in
-  // bridge/PROTOCOL.md. On connect the bridge sends a `hello` we ADOPT (sample rate, channel
-  // count, labels, units) instead of guessing — samples then fill the recording buffer (while
-  // recording) and a rolling view buffer (always, for the live preview).
-  const LIVE_VIEW_SEC = 6;                 // seconds of signal kept for the live preview
+  // ── Live acquisition (piEEG) ──
+  // The browser talks to the vendor pieeg-server (protocol:"pieeg-server", JSON on ws://…:1616)
+  // directly, or to the legacy local bridge (protocol:"websocket", Float32 — kept for
+  // back-compat). Frame parsing lives in ./live-stream.js: decodePieegMessage for pieeg-server,
+  // decodeMessage for the bridge. On connect we ADOPT the server's declared sample rate + channel
+  // count; samples then fill the recording buffer (while recording) and a rolling view ring
+  // (always, for the live preview). See AUDIT-live-acquire.md.
+  const LIVE_VIEW_SEC = 30;                // seconds of signal kept for the live preview ring
   const MAX_LIVE_REC_SEC = 2 * 60 * 60;    // hard cap on a single live recording (2 h) — guards
                                            // against the in-memory capture buffer growing unbounded
   const wsRef = useRef(null);
   const liveBufRef = useRef(null);   // recording buffer: { labels, data:[[]...], sr, uvScale }
   const liveViewRef = useRef(null);  // rolling preview ring: { labels, sr, ring:[Float32Array], head, count, cap }
-  const liveSeqRef = useRef(null);   // last samples `seq` seen (for drop detection)
-  const liveDroppedRef = useRef(0);  // total dropped sample-batches this session
+  const liveSeqRef = useRef(null);   // last bridge samples `seq` seen (drop detection, legacy path)
+  const liveNRef = useRef(null);     // last pieeg-server per-sample `n` seen (drop detection)
+  const liveDroppedRef = useRef(0);  // total dropped samples this session
   const recordingRef = useRef(false);
   const userClosingRef = useRef(false);   // true while the user is intentionally disconnecting
+  const pieegMockRef = useRef(false);     // true after refusing a mock/synthetic stream (blocks reconnect)
+  const reconnectTimerRef = useRef(null); // pending pieeg-server auto-reconnect timer
+  const reconnectAttemptsRef = useRef(0); // consecutive auto-reconnect attempts
+  const isReconnectingRef = useRef(false); // true when the next connect is an auto-reconnect (preserves the attempt count)
+  const handleConnectRef = useRef(null);   // latest handleConnect, so a scheduled reconnect calls the current one
   const stopRecordingRef = useRef(null);  // late-bound so the cap guard can flush a recording
   const liveImpedanceSupportedRef = useRef(false); // whether the connected device measures impedance
-  const [liveConfig, setLiveConfig] = useState(null); // adopted hello shown in the UI
+  const [liveConfig, setLiveConfig] = useState(null); // adopted server/bridge config shown in the UI
 
   // (Re)allocate buffers for a given channel set + rate (on connect and on hello adoption).
   const allocLiveBuffers = (labels, sr, uvScale = 1) => {
@@ -10400,11 +10413,103 @@ function AcquireTab() {
     }
   };
 
+  // Message handler for the vendor pieeg-server (JSON welcome + per-sample {t,n,channels}).
+  const handlePieegMessage = (ev) => {
+    const res = decodePieegMessage(ev.data);
+    if (res.kind === "welcome") {
+      const c = res.config;
+      // Constraint: REACT never displays or records fabricated data. pieeg-server reports its
+      // synthetic (--mock) state in the welcome, so refuse the stream outright.
+      if (c.mock) {
+        pieegMockRef.current = true;
+        notify("PiEEG server is in MOCK (synthetic) mode. REACT will not display or record fabricated data — restart pieeg-server on real hardware, without --mock.", "error", 0);
+        setConnectionState(CONN.error);
+        try { wsRef.current?.close(); } catch {}
+        return;
+      }
+      reconnectAttemptsRef.current = 0;   // a good handshake resets the reconnect backoff
+      // pieeg-server sends no labels; use the electrode map for the known channel counts.
+      const mapped = PIEEG_CHANNEL_MAP[`pieeg-${c.channels}`];
+      const labels = (mapped && mapped.length === c.channels) ? mapped : c.labels;
+      allocLiveBuffers(labels, c.sampleRate, 1);   // µV already; no scaling
+      liveNRef.current = null;
+      liveImpedanceSupportedRef.current = false;   // pieeg-server has no impedance frame
+      setLiveConfig({ device: c.device, sampleRate: c.sampleRate, channels: c.channels, labels, protocol: c.protocol, impedanceSupported: false, mock: false });
+      // Force a RAW stream: the server bandpass-filters by default, but capture must be raw µV
+      // and REACT does its own display filtering. Disable both server-side filters.
+      try {
+        if (c.filter) wsRef.current?.send(JSON.stringify({ cmd: "set_filter", enabled: false }));
+        if (c.notchFilter) wsRef.current?.send(JSON.stringify({ cmd: "set_notch", enabled: false }));
+      } catch {}
+      if (c.filter || c.notchFilter) notify("Disabled the server-side filter so REACT receives (and captures) raw µV; live filtering is applied in-app.", "info");
+      setConnectionState(s => (s >= CONN.ready ? s : CONN.ready));   // no impedance step for pieeg-server
+    } else if (res.kind === "samples") {
+      if (res.n != null) {
+        const dropped = gapBatches(liveNRef.current, res.n);   // per-sample continuity on n
+        if (dropped > 0) { liveDroppedRef.current += dropped; debugLog(`[pieeg] dropped ${dropped} sample(s) (n ${liveNRef.current}→${res.n})`); }
+        liveNRef.current = res.n;
+      }
+      appendSamples(res.rows);
+    }
+    // all other server status messages → ignored by decodePieegMessage
+  };
+
   // Connection flow. WebSocket devices (piEEG) open a real client to the local bridge;
   // BrainFlow direct-board integration is still pending and resolves to an error.
   const handleConnect = useCallback(() => {
     if (!selectedDevice) return;
+    // A manual connect resets the reconnect backoff; an auto-reconnect preserves it.
+    if (isReconnectingRef.current) isReconnectingRef.current = false;
+    else reconnectAttemptsRef.current = 0;
+    clearTimeout(reconnectTimerRef.current);
+    pieegMockRef.current = false;
     setConnectionState(CONN.connecting);
+
+    // ── Vendor pieeg-server (JSON welcome + per-sample {t,n,channels} on ws://…:1616) ──
+    if (selectedDevice.protocol === "pieeg-server") {
+      const url = deviceConfig.bridgeUrl || selectedDevice.bridgeUrl || "ws://localhost:1616";
+      // Fallback channel set used only until the server's welcome is adopted.
+      const labels = PIEEG_CHANNEL_MAP[selectedDevice.id] || ELECTRODE_SETS["10-20"].slice(0, selectedDevice.channels);
+      allocLiveBuffers(labels, selectedDevice.maxSr || 250, 1);
+      liveDroppedRef.current = 0; liveNRef.current = null; setLiveConfig(null); userClosingRef.current = false;
+      let ws;
+      try { ws = new WebSocket(url); ws.binaryType = "arraybuffer"; }
+      catch { setConnectionState(CONN.error); notify(`Invalid PiEEG server URL: ${url}`, "error"); return; }
+      wsRef.current = ws;
+      let errored = false, opened = false;
+      const fail = () => {
+        if (errored) return; errored = true; clearTimeout(to);
+        setConnectionState(CONN.error);
+        notify(`PiEEG server unreachable at ${url}. Start pieeg-server on the Pi (without --mock) and retry.`, "error");
+      };
+      const to = setTimeout(() => { if (ws.readyState !== WebSocket.OPEN) { try { ws.close(); } catch {} fail(); } }, 4000);
+      // pieeg-server sends its welcome automatically on connect — no request needed.
+      ws.onopen = () => { opened = true; clearTimeout(to); setConnectionState(CONN.connected); };
+      ws.onmessage = handlePieegMessage;
+      ws.onerror = () => fail();
+      ws.onclose = () => {
+        clearTimeout(to); if (errored) return;
+        recordingRef.current = false;
+        if (pieegMockRef.current) { setConnectionState(CONN.error); return; }        // refused mock — stay in error
+        if (userClosingRef.current) { setConnectionState(CONN.disconnected); userClosingRef.current = false; return; }
+        if (opened) {
+          // Unexpected drop while streaming — auto-reconnect with a capped backoff so a live
+          // session resumes without hiding the interruption.
+          const MAX_RECONNECT = 5;
+          if (reconnectAttemptsRef.current >= MAX_RECONNECT) {
+            setConnectionState(CONN.error);
+            notify(`PiEEG server unreachable after ${MAX_RECONNECT} attempts. Check the Pi and reconnect.`, "error");
+            return;
+          }
+          reconnectAttemptsRef.current += 1;
+          setConnectionState(CONN.connecting);
+          notify(`PiEEG server disconnected — reconnecting (${reconnectAttemptsRef.current}/${MAX_RECONNECT})…`, "warn");
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(() => { isReconnectingRef.current = true; handleConnectRef.current?.(); }, 2500);
+        } else fail();
+      };
+      return;
+    }
 
     if (selectedDevice.protocol === "websocket") {
       const url = deviceConfig.bridgeUrl || selectedDevice.bridgeUrl || "ws://localhost:8765";
@@ -10447,9 +10552,12 @@ function AcquireTab() {
     setTimeout(() => { setConnectionState(CONN.error); }, 2000);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedDevice, deviceConfig]);
+  handleConnectRef.current = handleConnect;   // so a scheduled auto-reconnect calls the latest
 
   const handleDisconnect = () => {
     userClosingRef.current = true;          // suppress the "unexpected disconnect" notice
+    clearTimeout(reconnectTimerRef.current);// cancel any pending auto-reconnect
+    reconnectAttemptsRef.current = 0; isReconnectingRef.current = false; pieegMockRef.current = false;
     if (wsRef.current) { try { wsRef.current.close(); } catch {} wsRef.current = null; }
     recordingRef.current = false;
     setConnectionState(CONN.disconnected);
@@ -10501,7 +10609,8 @@ function AcquireTab() {
     // streamed (e.g. BrainFlow not yet wired), fall back to a valid-but-flat EDF so the
     // record schema stays consistent.
     const liveBuf = liveBufRef.current;
-    const hasLive = selectedDevice?.protocol === "websocket" && liveBuf && liveBuf.data.some(a => a.length > 0);
+    const isLiveProto = selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket";
+    const hasLive = isLiveProto && liveBuf && liveBuf.data.some(a => a.length > 0);
     let electrodes, channelData, sr;
     if (hasLive) {
       electrodes = liveBuf.labels;
