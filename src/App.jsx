@@ -10824,7 +10824,7 @@ function AcquireTab() {
         )}/>
 
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
-       <div data-tut="Live trace: A rolling multi-channel strip pinned to now — the newest sample is at the right edge and each lane auto-scales to its own recent peak. The header shows channels · rate · window · RAW/FILTERED and any dropped-sample count. It streams the moment you connect, before and during recording." style={{flex:1,position:"relative",overflow:"hidden"}}>
+       <div data-tut="Live trace: A rolling multi-channel strip pinned to now — the newest sample is at the right edge and each lane auto-scales to its own recent peak. The header shows channels · rate · window · RAW/FILTERED and any dropped-sample count. It streams the moment you connect, before and during recording." style={{flex:1,position:"relative",overflow:"hidden",display:"flex",flexDirection:"column"}}>
         {/* Live rolling trace from the acquisition ring — overlays the (empty) epoch viewer while
             connected so you see the incoming signal live, before and during recording. The trace
             shows the FILTERED ring (toggleable); capture stays raw. */}
