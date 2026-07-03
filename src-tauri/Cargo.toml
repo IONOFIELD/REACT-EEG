@@ -1,0 +1,20 @@
+[package]
+name = "react-eeg"
+version = "19.0.0"
+description = "REACT EEG — desktop EEG analysis & storage"
+authors = ["REACT EEG, LLC"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+
+[features]
+# Enables the packaged-app asset protocol in release builds.
+custom-protocol = ["tauri/custom-protocol"]

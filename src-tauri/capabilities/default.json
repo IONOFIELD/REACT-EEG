@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core capabilities for the REACT EEG main window. App commands (initialize_app, load/save_*) are registered via the Rust invoke handler and need no extra permission.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
