@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:tauri": "vite --mode tauri",
     "build": "vite build",
     "build:single": "vite build --mode singlefile",
+    "build:tauri": "vite build --mode tauri",
     "preview": "vite preview",
+    "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -17,6 +20,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
     "@vitejs/plugin-react": "^4.3.1",
     "vite": "^5.4.0",
     "vite-plugin-singlefile": "^2.3.3",
