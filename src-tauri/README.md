@@ -7,11 +7,16 @@ surface the app's `tauriBridge` (`../src/App.jsx`) calls, persisting to plain fi
 
 ## Status
 
-Scaffold + backend are written but **not yet compiled** — the build machine had no MSVC C++
-toolchain. Rust itself is installed; the remaining prerequisite is the Visual Studio C++
-Build Tools (see below). Everything Rust-side (`cargo build`, even `cargo check`) is blocked
-until that lands. The **frontend** Tauri build (`npm run build:tauri` → `dist-tauri/`) is
-verified working (relative asset base for `tauri://localhost`).
+**Working.** Compiles and runs as a native desktop app; the production build produces a
+standalone `react-eeg.exe` (embeds the frontend) plus an NSIS installer
+(`REACT EEG_<version>_x64-setup.exe`). Verified end-to-end: launched standalone with no dev
+server, it renders the app and writes the library to `Documents/REACT EEG/`.
+
+> **Build with the Tauri CLI, not plain `cargo build`.** `cargo build [--release]` produces a
+> **dev-mode** binary that loads the frontend from `devUrl` (`localhost:5173`) — run alone it
+> shows "localhost refused to connect". Only `tauri build` / `tauri dev` build the production
+> context that embeds and serves the frontend. Use `cargo build` only for a quick backend
+> type-check while `npm run dev:tauri` is running.
 
 ## Prerequisites
 
@@ -43,11 +48,15 @@ npm run tauri icon src-tauri/icons/icon-source.png
 # 2. run in dev (hot-reload frontend + native window)
 npm run tauri dev
 
-# 3. produce an unsigned desktop build
-npm run tauri build               # → src-tauri/target/release/ (+ NSIS installer under bundle/)
-#   or, without the npm CLI:
-#   npm run build:tauri && (cd src-tauri && cargo build --release)
+# 3. produce an unsigned desktop build (standalone exe + NSIS installer)
+npm run tauri build               # or, with the cargo CLI: cargo tauri build
+#   → src-tauri/target/release/react-eeg.exe
+#   → src-tauri/target/release/bundle/nsis/REACT EEG_<version>_x64-setup.exe
 ```
+
+The Tauri CLI is available either as `cargo tauri …` (`cargo install tauri-cli`) or
+`npm run tauri …` (`@tauri-apps/cli`, fetched by `npm install`). Its `beforeBuildCommand`
+runs `npm run build:tauri`, so `node`/`npm` must be on PATH.
 
 ## Data location
 
