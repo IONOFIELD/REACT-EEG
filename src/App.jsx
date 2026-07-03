@@ -4,7 +4,8 @@ import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";
 import { buildAnnotationSidecar } from "./sidecar.js";
 // Export-envelope builders (patient-package zip manifest, ExportModal JSON manifest,
 // .reegb bundle) — pure + version-stamped in one place, enforced by test/manifests.test.js.
-import { buildPatientPackageManifest, buildExportManifest, buildReegbBundle } from "./manifests.js";
+import { buildPatientPackageManifest, buildExportManifest, buildReegbBundle,
+  buildLibraryBackup, parseLibraryBackup } from "./manifests.js";
 // ACNS/ILAE annotation taxonomy + migration (ANNOTATION_TYPES aliased to the long-standing
 // ANNOTATION_COLORS name so existing call sites are unchanged).
 import { ANNOTATION_TYPES as ANNOTATION_COLORS, migrateAnnotations } from "./annotations.js";
@@ -7321,7 +7322,8 @@ function AddToCollectionMenu({ record, collections, onToggle, onClose }) {
 function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectionId }) {
   // App-global atoms from context; aliased to the on*-style names this component's body uses.
   const { records, setRecords, updateRecordStatus, edfFileStore, setEdfFileStore,
-    setAnnotationsMap, setClinicalNotesMap, setBaselineMap, collections, setCollections,
+    annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap, baselineMap, setBaselineMap,
+    collections, setCollections,
     openReview: onOpenReview, promoteRecord: onPromoteRecord, demoteRecord: onDemoteRecord } = useAppStore();
   const [search, setSearch] = useState("");
   const [filterType, setFilterType] = useState("ALL");
@@ -7336,10 +7338,62 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
   // across tab switches (Review → Library returns to the same collection).
   const [packageImportResult, setPackageImportResult] = useState(null); // {manifest, imports, error}
   const pkgFileInputRef = useRef(null);
+  const backupFileInputRef = useRef(null);
   const importDialogRef = useRef(null);
   const pkgResultDialogRef = useRef(null);
   useFocusTrap(importDialogRef, showImport, () => setShowImport(false));
   useFocusTrap(pkgResultDialogRef, !!packageImportResult, () => setPackageImportResult(null));
+
+  // ── Whole-library backup / restore ──
+  // Browser storage (IndexedDB) is not a durable backup — it can be cleared by the browser
+  // or the user. This exports everything the browser holds that can't be regenerated
+  // (record index, notes, annotations, collections, baselines) to one JSON file, and
+  // restores it. Raw EDF blobs are excluded (re-importable); see buildLibraryBackup.
+  const handleBackupExport = () => {
+    if (!window.confirm(
+      "Export a library backup?\n\nThis file contains your clinical notes and annotations verbatim (which may include identifiers you typed). It does NOT include the raw EDF signal files. Store it somewhere secure.")) return;
+    const backup = buildLibraryBackup({ records, notesMap: clinicalNotesMap, annotationsMap, collections, baselineMap });
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `REACT-EEG-library-backup-${new Date().toISOString().split("T")[0]}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    notify(`Backed up ${backup.recordCount} record(s), ${Object.keys(backup.annotations).length} annotation set(s), ${Object.keys(backup.notes).length} note(s), ${backup.collections.length} collection(s). Keep this file safe.`, "success");
+  };
+
+  const handleBackupRestore = async (file) => {
+    if (!file) return;
+    let text;
+    try { text = await file.text(); } catch { notify("Could not read the backup file.", "error"); return; }
+    const p = parseLibraryBackup(text);
+    if (p.error) { notify(`Not a valid library backup: ${p.error}`, "error"); return; }
+    // Non-destructive merge: add records not already present (by filename); overlay
+    // notes/annotations/baselines (the backup is the source of truth for those); add
+    // collections not already present (by id). State changes auto-persist via the
+    // root-level save effects (records/notes/annotations/baselines/collections).
+    let added = 0;
+    setRecords(prev => {
+      const have = new Set(prev.map(r => r.filename));
+      const add = p.records.map(migrateRecord).filter(r => !have.has(r.filename));
+      added = add.length;
+      return [...add, ...prev];
+    });
+    if (Object.keys(p.notes).length) setClinicalNotesMap(prev => ({ ...prev, ...p.notes }));
+    if (Object.keys(p.annotations).length) setAnnotationsMap(prev => {
+      const next = { ...prev };
+      for (const [fn, anns] of Object.entries(p.annotations)) next[fn] = migrateAnnotations(anns);
+      return next;
+    });
+    if (Object.keys(p.baselines).length) setBaselineMap(prev => ({ ...prev, ...p.baselines }));
+    if (p.collections.length) setCollections(prev => {
+      const byId = new Map(prev.map(c => [c.id, c]));
+      for (const c of p.collections) if (!byId.has(c.id)) byId.set(c.id, c);
+      return [...byId.values()];
+    });
+    notify(`Restored from backup${p.appVersion ? ` (${p.appVersion})` : ""}: ${added} new record(s) added, ${p.counts.notes} note(s), ${p.counts.annotations} annotation set(s), ${p.counts.collections} collection(s) merged. Re-import any missing .edf files.`, "success", 0);
+  };
 
   const handlePackageImport = async (file) => {
     if (!file) return;
@@ -7580,6 +7634,27 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
           padding:"7px 16px",background:"#111",border:"1px solid #3B82F640",borderRadius:0,
           color:"#3B82F6",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6,letterSpacing:"0.05em"
         }}>{I.Package(13)} EXPORT</button>
+        <button data-tut="Back Up: Save your WHOLE library — records, clinical notes, annotations, collections and baselines — to one JSON file. Browser storage is not a backup and can be cleared, so export this regularly and keep it safe (it excludes the raw EDF signal files, which stay re-importable)."
+          onClick={handleBackupExport} title="Back up the whole library (records, notes, annotations, collections) to a file" style={{
+          padding:"7px 16px",background:"#2a1f05",border:"1px solid #a97a1a60",borderRadius:0,
+          color:"#facc15",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6,letterSpacing:"0.05em"
+        }}>{I.Download ? I.Download(13) : I.Package(13)} BACK UP</button>
+        <button data-tut="Restore: Load a library backup file — records, notes, annotations, collections and baselines are merged back in (existing records are kept; missing ones are added). Re-import any .edf files the backup references."
+          onClick={()=>backupFileInputRef.current?.click()} title="Restore a library backup (.json)" style={{
+          padding:"7px 16px",background:"#111",border:"1px solid #a97a1a40",borderRadius:0,
+          color:"#c9a94a",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6,letterSpacing:"0.05em"
+        }}>{I.Upload ? I.Upload(13) : I.Plus(13)} RESTORE</button>
+        <input ref={backupFileInputRef} type="file" accept=".json,application/json" style={{display:"none"}}
+          onChange={(e)=>{const f = e.target.files?.[0]; if (f) handleBackupRestore(f); e.target.value = "";}}/>
+      </div>
+
+      {/* Durability notice — browser storage is not a backup. Quiet, always-visible. */}
+      <div style={{padding:"5px 24px",background:"#0a0a0a",borderBottom:"1px solid #121212",flexShrink:0,
+        display:"flex",alignItems:"center",justifyContent:"center",gap:7}}>
+        <span aria-hidden style={{color:"#a97a1a",fontSize:11}}>{I.Alert ? I.Alert(12) : "ⓘ"}</span>
+        <span style={{fontSize:10,color:"#6a6a6a",letterSpacing:"0.03em"}}>
+          Your library is stored in this browser only — browser storage can be cleared and is <b style={{color:"#8a8a8a",fontWeight:700}}>not a backup</b>. Use <span style={{color:"#c9a94a"}}>Back Up</span> regularly.
+        </span>
       </div>
 
       {/* Filename-convention reference — a quiet, centered background note so users

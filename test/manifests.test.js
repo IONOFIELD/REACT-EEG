@@ -5,7 +5,8 @@
 // builders, this file or the source-scan tests in versioning.test.js fail.
 import { describe, it, expect } from "vitest";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "../src/version.js";
-import { buildPatientPackageManifest, buildExportManifest, buildReegbBundle } from "../src/manifests.js";
+import { buildPatientPackageManifest, buildExportManifest, buildReegbBundle,
+  buildLibraryBackup, parseLibraryBackup } from "../src/manifests.js";
 
 const STAMPS = ["schemaVersion", "pipelineVersion", "appVersion"];
 
@@ -121,5 +122,92 @@ describe("buildReegbBundle", () => {
     expect(b.edfBase64).toBeNull();
     expect(b.annotations).toEqual([]);
     expect(b.clinicalNotes).toBe("");
+  });
+});
+
+describe("buildLibraryBackup / parseLibraryBackup", () => {
+  const backupArgs = () => ({
+    records: [rec(), rec({ filename: "PHY-TX-A7F3C2-20260101-002.edf", studyType: "TX" })],
+    notesMap: { "PHY-BL-A7F3C2-20260101-001.edf": "resting baseline", "empty.edf": "" },
+    annotationsMap: {
+      "PHY-BL-A7F3C2-20260101-001.edf": [{ id: 1, time: 2.0, duration: 0.5, type: "Spike", channel: -1 }],
+      "none.edf": [],
+    },
+    collections: [{ id: "c1", name: "Study A", filenames: ["PHY-BL-A7F3C2-20260101-001.edf"] }],
+    baselineMap: { "PHY-BL-A7F3C2-20260101-001.edf": "PHY-TX-A7F3C2-20260101-002.edf" },
+  });
+
+  it("stamps schema/pipeline/app versions and carries kind + counts", () => {
+    const b = buildLibraryBackup(backupArgs());
+    expectStamped(b);
+    expect(b.kind).toBe("react-eeg-library-backup");
+    expect(b.formatVersion).toBe(1);
+    expect(b.includesEdf).toBe(false);
+    expect(b.recordCount).toBe(2);
+    expect(b.exportedAt).toBe(new Date(b.exportedAt).toISOString());
+  });
+
+  it("drops empty notes/annotations entries but keeps records/collections/baselines verbatim", () => {
+    const b = buildLibraryBackup(backupArgs());
+    expect(Object.keys(b.notes)).toEqual(["PHY-BL-A7F3C2-20260101-001.edf"]); // "empty.edf" dropped
+    expect(Object.keys(b.annotations)).toEqual(["PHY-BL-A7F3C2-20260101-001.edf"]); // "none.edf" [] dropped
+    expect(b.records.length).toBe(2);
+    expect(b.collections.length).toBe(1);
+    expect(b.baselines["PHY-BL-A7F3C2-20260101-001.edf"]).toBe("PHY-TX-A7F3C2-20260101-002.edf");
+  });
+
+  it("is null-safe (no args → stamped empty backup)", () => {
+    const b = buildLibraryBackup();
+    expectStamped(b);
+    expect(b.recordCount).toBe(0);
+    expect(b.records).toEqual([]);
+    expect(b.notes).toEqual({});
+    expect(b.annotations).toEqual({});
+    expect(b.collections).toEqual([]);
+    expect(b.baselines).toEqual({});
+  });
+
+  it("round-trips through JSON via parseLibraryBackup", () => {
+    const json = JSON.stringify(buildLibraryBackup(backupArgs()), null, 2);
+    const p = parseLibraryBackup(json);
+    expect(p.error).toBeUndefined();
+    expect(p.counts).toEqual({ records: 2, notes: 1, annotations: 1, collections: 1 });
+    expect(p.records.map(r => r.filename)).toEqual([
+      "PHY-BL-A7F3C2-20260101-001.edf", "PHY-TX-A7F3C2-20260101-002.edf",
+    ]);
+    expect(p.notes["PHY-BL-A7F3C2-20260101-001.edf"]).toBe("resting baseline");
+    expect(p.annotations["PHY-BL-A7F3C2-20260101-001.edf"][0].type).toBe("Spike");
+    expect(p.baselines["PHY-BL-A7F3C2-20260101-001.edf"]).toBe("PHY-TX-A7F3C2-20260101-002.edf");
+    expect(p.appVersion).toBe(APP_VERSION);
+  });
+
+  it("drops records without a string filename; coerces bad notes/annotations shapes", () => {
+    const p = parseLibraryBackup({
+      kind: "react-eeg-library-backup",
+      records: [{ filename: "ok.edf" }, { nope: 1 }, null, "junk"],
+      notes: { "ok.edf": "keep", "bad.edf": 42 },
+      annotations: { "ok.edf": [{ time: 1 }], "bad.edf": "not-an-array" },
+      collections: [{ id: "c" }, null, 7],
+      baselines: { a: "b" },
+    });
+    expect(p.records).toEqual([{ filename: "ok.edf" }]);
+    expect(p.notes).toEqual({ "ok.edf": "keep" });
+    expect(Object.keys(p.annotations)).toEqual(["ok.edf"]);
+    expect(p.collections).toEqual([{ id: "c" }]);
+    expect(p.baselines).toEqual({ a: "b" });
+  });
+
+  it("rejects the wrong kind of file / malformed input (never throws)", () => {
+    expect(parseLibraryBackup("{not json").error).toBeTruthy();
+    expect(parseLibraryBackup({ kind: "react-eeg-bundle" }).error).toBeTruthy();
+    expect(parseLibraryBackup(42).error).toBeTruthy();
+    expect(parseLibraryBackup(null).error).toBeTruthy();
+    expect(parseLibraryBackup([]).error).toBeTruthy();
+  });
+
+  it("accepts a kind-less but otherwise valid object (tolerant of hand-assembled files)", () => {
+    const p = parseLibraryBackup({ records: [{ filename: "x.edf" }] });
+    expect(p.error).toBeUndefined();
+    expect(p.counts.records).toBe(1);
   });
 });
