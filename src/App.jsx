@@ -10162,6 +10162,7 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
   const canvasRef = useRef(null);
   const rxRateRef = useRef(0);          // samples/s received, refreshed ~2 Hz
   const rxWinRef = useRef({ n: 0, t: 0 });
+  const scaleRef = useRef({ t: 0, means: [], scales: [] }); // cached per-lane DC + σ-scale
   useEffect(() => {
     if (!active) { const cv = canvasRef.current; if (cv) { const c = cv.getContext("2d"); c && c.clearRect(0, 0, cv.width, cv.height); } return; }
     rxWinRef.current = { n: rxRef?.current || 0, t: performance.now() };
@@ -10216,25 +10217,48 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
         ctx.textAlign = "left";
         const dropped = droppedRef?.current || 0;
         if (dropped > 0) { ctx.fillStyle = "#F59E0B"; ctx.textAlign = "right"; ctx.fillText(`${dropped} dropped`, W - 6, 4); ctx.textAlign = "left"; }
+        // Robust per-lane scaling, recomputed ~5x/s and cached. Center each lane on its DC mean
+        // and scale to a multiple of the mean-removed RMS (σ). Floating/unconnected inputs have
+        // huge DC offsets (tens of thousands of µV) and occasional rail spikes; the old
+        // peak(|x|) over the 30 s window pinned the scale and flattened the trace (looked
+        // "frozen"). σ-based scaling ignores DC and resists single spikes; the trace is clamped
+        // to its lane so a spike can't bleed into neighbours. Cheap: two short passes per lane.
+        if (nowMs - scaleRef.current.t > 200 || scaleRef.current.means.length !== n) {
+          // Scale to the most recent ~4 s (not the whole 30 s), so a connection-time filter
+          // transient or an old artifact scrolls out of the scale quickly instead of holding
+          // the trace flat for the full window.
+          const recent = Math.min(count, Math.round((view.sr || 250) * 4));
+          const means = new Array(n), scales = new Array(n);
+          for (let c = 0; c < n; c++) {
+            const ring = view.ring[c];
+            let sum = 0, cnt = 0;
+            for (let j = 0; j < recent; j += step) { sum += ring[idxAt(j)]; cnt++; }
+            const mean = cnt ? sum / cnt : 0;
+            let ss = 0; for (let j = 0; j < recent; j += step) { const d = ring[idxAt(j)] - mean; ss += d * d; }
+            const std = cnt ? Math.sqrt(ss / cnt) : 0;
+            means[c] = mean;
+            scales[c] = (laneH * 0.42) / (Math.max(std, 0.5) * 3.5); // ~3.5σ fills the lane half
+          }
+          scaleRef.current = { t: nowMs, means, scales };
+        }
+        const laneMeans = scaleRef.current.means, laneScales = scaleRef.current.scales;
         for (let c = 0; c < n; c++) {
           const ring = view.ring[c];
           const yCenter = laneH * (c + 0.5);
-          // robust peak over the filled samples for per-lane auto-scale
-          let peak = 1;
-          for (let j = 0; j < count; j += step) { const a = Math.abs(ring[idxAt(j)]); if (a > peak) peak = a; }
-          const chScale = (laneH * 0.42) / peak;
+          const chScale = laneScales[c] || 1, chMean = laneMeans[c] || 0;
+          const yTop = yCenter - laneH * 0.46, yBot = yCenter + laneH * 0.46;
           // lane separator + label
           ctx.strokeStyle = "#141414"; ctx.lineWidth = 1;
           ctx.beginPath(); ctx.moveTo(labelW, yCenter + laneH / 2); ctx.lineTo(W, yCenter + laneH / 2); ctx.stroke();
           ctx.fillStyle = "#6c8088"; ctx.font = "600 9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "middle"; ctx.textAlign = "right";
           ctx.fillText(labels[c], labelW - 6, yCenter);
-          // trace — drawn newest→oldest at fixed time positions (right edge = now)
+          // trace — DC-removed, σ-scaled, clamped to the lane. newest→oldest, right edge = now.
           ctx.strokeStyle = "#1a8fff"; ctx.lineWidth = 0.9; ctx.beginPath();
           let first = true;
           for (let j = 0; j < count; j += step) {
-            const v = ring[idxAt(j)];
             const x = xForAge(j);
-            const y = yCenter - v * chScale;
+            let y = yCenter - (ring[idxAt(j)] - chMean) * chScale;
+            if (y < yTop) y = yTop; else if (y > yBot) y = yBot;
             if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
           }
           ctx.stroke();
