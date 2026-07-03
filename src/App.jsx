@@ -11237,6 +11237,34 @@ export default function ReactEEGApp() {
     return () => clearTimeout(annTimerRef.current);
   }, [annotationsMap, initialized]);
 
+  // ── Desktop auto-update ──
+  // On launch, ask the updater endpoint (GitHub Releases latest.json) whether a newer signed
+  // build exists; if so, offer to download + install + relaunch. Tauri-only and guarded so the
+  // browser build is untouched; runs a few seconds after mount so it never blocks first paint.
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.__TAURI__) return;
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const { check } = await import("@tauri-apps/plugin-updater");
+        const update = await check();
+        if (cancelled || !update) return;   // null → already up to date
+        const ok = window.confirm(
+          `REACT EEG ${update.version} is available` +
+          (update.currentVersion ? ` (you have ${update.currentVersion})` : "") +
+          `.\n\nInstall now? The update will download and the app will restart.`);
+        if (ok !== true) return;
+        notify(`Downloading REACT EEG ${update.version}…`, "info", 0);
+        await update.downloadAndInstall();
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+      } catch (e) {
+        console.warn("Update check failed:", e);
+      }
+    }, 3000);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, []);
+
   const openReview = (record) => {
     setReviewRecord(record);
     setActiveTab("review");

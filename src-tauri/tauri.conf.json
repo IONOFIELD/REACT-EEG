@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "REACT EEG",
-  "version": "19.0.0",
+  "version": "../package.json",
   "identifier": "com.reacteeg.desktop",
   "build": {
     "frontendDist": "../dist-tauri",
@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
     "publisher": "REACT EEG, LLC",
     "category": "Medical",
     "icon": [
@@ -37,5 +38,13 @@
       "icons/icon.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/IONOFIELD/REACT-EEG/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZGQTAzRUJGNTIwOEVBMTAKUldRUTZnaFN2ejZnYjZDYWUwMmtYck5hem5GQkNSTndLY0l0OW0yZDZlWEwyTEdaZjc4Z1QxK0kK"
+    }
   }
 }
