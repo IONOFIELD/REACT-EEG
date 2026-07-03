@@ -260,12 +260,13 @@ const useAppStore = () => useContext(AppStoreContext);
 
 // ── Persistence: IndexedDB ──
 const EDF_DB_NAME = "ReactEEG_EdfStore";
-const EDF_DB_VERSION = 3; // v1 = edfFiles only; v2 = + library/notes/baselines; v3 = + collections
+const EDF_DB_VERSION = 4; // v1 = edfFiles only; v2 = + library/notes/baselines; v3 = + collections; v4 = + annotations
 const EDF_DB_STORE = "edfFiles";          // raw EDF binary blobs (kept for back-compat)
 const STORE_LIBRARY = "library";          // record metadata array
 const STORE_NOTES = "notes";              // per-filename clinical notes
 const STORE_BASELINES = "baselines";      // baseline-comparison map
 const STORE_COLLECTIONS = "collections";  // collection metadata + filename lists
+const STORE_ANNOTATIONS = "annotations";  // per-filename annotation arrays (browser-mode persistence)
 
 // ── Default collections seeded on first launch (v14.1) ──
 // Start empty — "All Recordings" is implicit; users create and delete collections themselves.
@@ -401,6 +402,10 @@ function openEdfDB() {
       // v2 → v3: add collections store
       if (oldVersion < 3) {
         if (!db.objectStoreNames.contains(STORE_COLLECTIONS)) db.createObjectStore(STORE_COLLECTIONS);
+      }
+      // v3 → v4: add annotations store (browser-mode annotation persistence; previously lost on reload)
+      if (oldVersion < 4) {
+        if (!db.objectStoreNames.contains(STORE_ANNOTATIONS)) db.createObjectStore(STORE_ANNOTATIONS);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -2550,13 +2555,14 @@ const tauriBridge = {
     if (window.__TAURI__) {
       return window.__TAURI__.invoke("save_annotations", { filename, annotationsJson: JSON.stringify(annotations) });
     }
+    await idbPut(STORE_ANNOTATIONS, filename, annotations);
   },
   async loadAnnotations(filename) {
     if (window.__TAURI__) {
       const json = await window.__TAURI__.invoke("load_annotations", { filename });
       return JSON.parse(json);
     }
-    return [];
+    return (await idbGet(STORE_ANNOTATIONS, filename)) || [];
   },
   async saveClinicalNotes(filename, text) {
     if (window.__TAURI__) {
@@ -11311,6 +11317,39 @@ export default function ReactEEGApp() {
     }, 1000);
     return () => clearTimeout(notesTimerRef.current);
   }, [clinicalNotesMap, initialized]);
+
+  // ── Load persisted annotations for all records on init (browser: IDB store; Tauri: FS) ──
+  // Persisted user annotations take precedence over any seeded-from-EDF-TAL defaults.
+  // annLoadedRef gates the auto-save below so the seed-only state can't clobber persisted
+  // annotations before this load merges them in (a race the notes path avoids — notes aren't seeded).
+  const annLoadedRef = useRef(false);
+  useEffect(() => {
+    if (!initialized) return;
+    (async () => {
+      if (records.length > 0) {
+        const map = {};
+        for (const r of records) {
+          const anns = await tauriBridge.loadAnnotations(r.filename);
+          if (Array.isArray(anns) && anns.length) map[r.filename] = migrateAnnotations(anns);
+        }
+        if (Object.keys(map).length > 0) setAnnotationsMap(prev => ({ ...prev, ...map }));
+      }
+      annLoadedRef.current = true;
+    })();
+  }, [initialized]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Debounced auto-save annotations (browser: IDB; Tauri: FS). Gated on annLoadedRef. ──
+  const annTimerRef = useRef(null);
+  useEffect(() => {
+    if (!initialized || !annLoadedRef.current) return;
+    clearTimeout(annTimerRef.current);
+    annTimerRef.current = setTimeout(() => {
+      Object.entries(annotationsMap).forEach(([fn, anns]) => {
+        tauriBridge.saveAnnotations(fn, anns);
+      });
+    }, NOTES_DEBOUNCE_MS);
+    return () => clearTimeout(annTimerRef.current);
+  }, [annotationsMap, initialized]);
 
   const openReview = (record) => {
     setReviewRecord(record);
