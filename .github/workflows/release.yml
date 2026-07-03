@@ -1,0 +1,55 @@
+name: Release desktop app
+
+# Cut a desktop release + auto-update feed by pushing a version tag, e.g.:
+#   git tag v19.1.0 && git push origin v19.1.0
+# The job builds + signs the Windows installer and publishes a GitHub Release containing
+# the installer and `latest.json`. Installed apps read
+# https://github.com/IONOFIELD/REACT-EEG/releases/latest/download/latest.json (configured in
+# src-tauri/tauri.conf.json) and self-update.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY           contents of ~/.tauri/react-eeg-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  the key's password ("" if it was generated without one)
+# GITHUB_TOKEN is provided automatically.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign, and publish the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "REACT EEG ${{ github.ref_name }}"
+          releaseBody: "Automated desktop build. Download the `-setup.exe` to install; existing installs update themselves."
+          releaseDraft: false
+          prerelease: false
