@@ -487,15 +487,24 @@ async function saveEdfToDB(filename, arrayBuffer) {
     // bytes (patient-package .zip, .reegb bundle) is PHI-free by construction. Returns a
     // copy; the caller's in-memory buffer is untouched. See src/deid.js + test/deid.test.js.
     const scrubbed = scrubEdfHeaderForFilename(arrayBuffer, filename);
+    // Desktop (Tauri): write the scrubbed bytes to Documents/REACT EEG/edf/ as a real file.
+    if (typeof window !== "undefined" && window.__TAURI__) {
+      await window.__TAURI__.invoke("save_edf", { filename, edfBase64: arrayBufferToBase64(scrubbed) });
+      return;
+    }
     const db = await openEdfDB();
     const tx = db.transaction(EDF_DB_STORE, "readwrite");
     tx.objectStore(EDF_DB_STORE).put(scrubbed, filename);
     await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
-  } catch (e) { console.warn("Failed to save EDF to IndexedDB:", e); }
+  } catch (e) { console.warn("Failed to save EDF:", e); }
 }
 
 async function getEdfRawFromDB(filename) {
   try {
+    if (typeof window !== "undefined" && window.__TAURI__) {
+      const b64 = await window.__TAURI__.invoke("load_edf", { filename });
+      return b64 ? base64ToArrayBuffer(b64) : null;
+    }
     const db = await openEdfDB();
     const tx = db.transaction(EDF_DB_STORE, "readonly");
     const req = tx.objectStore(EDF_DB_STORE).get(filename);
@@ -525,6 +534,18 @@ function base64ToArrayBuffer(b64) {
 
 async function loadAllEdfsFromDB() {
   try {
+    // Desktop (Tauri): read the EDF files from Documents/REACT EEG/edf/.
+    if (typeof window !== "undefined" && window.__TAURI__) {
+      const results = {};
+      const names = JSON.parse((await window.__TAURI__.invoke("list_edfs")) || "[]");
+      for (const name of names) {
+        const b64 = await window.__TAURI__.invoke("load_edf", { filename: name });
+        if (!b64) continue;
+        const parsed = parseEDFFile(base64ToArrayBuffer(b64));
+        if (parsed && !parsed.error) results[name] = parsed;
+      }
+      return results;
+    }
     const db = await openEdfDB();
     const tx = db.transaction(EDF_DB_STORE, "readonly");
     const store = tx.objectStore(EDF_DB_STORE);
@@ -7434,12 +7455,16 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
           onChange={(e)=>{const f = e.target.files?.[0]; if (f) handleBackupRestore(f); e.target.value = "";}}/>
       </div>
 
-      {/* Durability notice — browser storage is not a backup. Quiet, always-visible. */}
+      {/* Durability notice. On desktop the data lives on the filesystem (Documents/REACT EEG),
+          which is real, backup-able storage; in the browser it lives in IndexedDB, which is not
+          a backup and can be cleared. The message reflects which one is in play. */}
       <div style={{padding:"5px 24px",background:"#0a0a0a",borderBottom:"1px solid #121212",flexShrink:0,
         display:"flex",alignItems:"center",justifyContent:"center",gap:7}}>
         <span aria-hidden style={{color:"#a97a1a",fontSize:11}}>{I.Alert ? I.Alert(12) : "ⓘ"}</span>
         <span style={{fontSize:10,color:"#6a6a6a",letterSpacing:"0.03em"}}>
-          Your library is stored in this browser only — browser storage can be cleared and is <b style={{color:"#8a8a8a",fontWeight:700}}>not a backup</b>. Use <span style={{color:"#c9a94a"}}>Back Up</span> regularly.
+          {(typeof window !== "undefined" && window.__TAURI__)
+            ? <>Your library is saved on this computer at <b style={{color:"#8a8a8a",fontWeight:700}}>Documents/REACT&nbsp;EEG</b> — include it in your usual backups, or use <span style={{color:"#c9a94a"}}>Back Up</span> for a portable snapshot.</>
+            : <>Your library is stored in this browser only — browser storage can be cleared and is <b style={{color:"#8a8a8a",fontWeight:700}}>not a backup</b>. Use <span style={{color:"#c9a94a"}}>Back Up</span> regularly.</>}
         </span>
       </div>
 

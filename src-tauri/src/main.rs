@@ -20,6 +20,7 @@
 // bridge has no EDF command). That works on desktop too; moving EDFs onto the filesystem is
 // a follow-up that also needs a frontend bridge command.
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::fs;
 use std::path::PathBuf;
 
@@ -65,6 +66,7 @@ fn initialize_app() -> Result<String, String> {
     ensure_dir(&dir)?;
     ensure_dir(&dir.join("notes"))?;
     ensure_dir(&dir.join("annotations"))?;
+    ensure_dir(&dir.join("edf"))?;
     Ok(format!("Desktop mode — filesystem persistence at {}", dir.display()))
 }
 
@@ -154,6 +156,43 @@ fn load_collections() -> String {
     if s.is_empty() { "[]".to_string() } else { s }
 }
 
+// ── Raw EDF blobs (per recording) ────────────────────────────────────────────
+// Transported as base64 over the invoke boundary (matches the frontend's existing
+// arrayBufferToBase64/base64ToArrayBuffer helpers). The frontend already header-scrubs the
+// bytes (HIPAA Safe Harbor) before calling save_edf, so what lands on disk is PHI-free.
+
+#[tauri::command]
+fn save_edf(filename: String, edf_base64: String) -> Result<(), String> {
+    let bytes = STANDARD.decode(edf_base64.as_bytes()).map_err(|e| format!("base64 decode: {e}"))?;
+    let p = data_path(&["edf", &filename])?;
+    fs::write(&p, &bytes).map_err(|e| format!("write {:?}: {e}", p))
+}
+
+#[tauri::command]
+fn load_edf(filename: String) -> String {
+    let p = data_dir().join("edf").join(&filename);
+    match fs::read(&p) {
+        Ok(bytes) => STANDARD.encode(bytes),
+        Err(_) => String::new(),
+    }
+}
+
+#[tauri::command]
+fn list_edfs() -> String {
+    let dir = data_dir().join("edf");
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_file() {
+                if let Some(name) = entry.file_name().to_str() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+}
+
 // ── OS integration ───────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -164,9 +203,24 @@ fn open_data_directory() -> Result<(), String> {
 }
 
 #[tauri::command]
-fn show_in_explorer(_study_type: String, _filename: String) -> Result<(), String> {
-    // EDF blobs live in the WebView store rather than on disk (see module note), so there is
-    // no per-file path to reveal yet; open the data directory instead.
+fn show_in_explorer(_study_type: String, filename: String) -> Result<(), String> {
+    // Reveal the EDF file on disk if present; otherwise open the data directory.
+    let edf = data_dir().join("edf").join(&filename);
+    if edf.exists() {
+        #[cfg(target_os = "windows")]
+        {
+            return std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(&edf)
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| format!("reveal {:?}: {e}", edf));
+        }
+        #[cfg(not(target_os = "windows"))]
+        if let Some(parent) = edf.parent() {
+            return open_in_file_manager(&parent.to_path_buf());
+        }
+    }
     let dir = data_dir();
     ensure_dir(&dir)?;
     open_in_file_manager(&dir)
@@ -174,11 +228,12 @@ fn show_in_explorer(_study_type: String, _filename: String) -> Result<(), String
 
 #[tauri::command]
 fn delete_record_files(_study_type: String, filename: String) -> Result<(), String> {
-    // Remove the on-disk sidecars for a deleted record (notes + annotations). The record
-    // itself is dropped from library.json by the next save_library_index.
+    // Remove the on-disk sidecars + EDF for a deleted record. The record itself is dropped
+    // from library.json by the next save_library_index.
     let notes = data_dir().join("notes").join(format!("{filename}.txt"));
     let anns = data_dir().join("annotations").join(format!("{filename}.json"));
-    for p in [notes, anns] {
+    let edf = data_dir().join("edf").join(&filename);
+    for p in [notes, anns, edf] {
         if p.exists() {
             fs::remove_file(&p).map_err(|e| format!("remove {:?}: {e}", p))?;
         }
@@ -214,6 +269,9 @@ fn main() {
             load_baseline_map,
             save_collections,
             load_collections,
+            save_edf,
+            load_edf,
+            list_edfs,
             open_data_directory,
             show_in_explorer,
             delete_record_files,
