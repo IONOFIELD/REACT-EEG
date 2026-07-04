@@ -5399,13 +5399,19 @@ function analyzeFullFileEyeSync(edfData) {
   return { wpliVert, wpliHoriz, corrVert, corrHoriz, wpliLeft, wpliRight, corrLeft, corrRight, blinkSymmetry, syncScore, nEpochs };
 }
 
-function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos }) {
+function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos, ensureEdfLoaded }) {
   // Merged differential flow: pick a baseline (the "before" recording), then the recording to
   // compare it against (the "after"). Any two files may be chosen — across subjects too — but the
   // pair is always ordered chronologically so the earlier recording is the baseline and the later
   // one the comparison (a before→after delta, never retrocausal).
   const [baselineSel, setBaselineSel] = useState(null);
   const [compareSel, setCompareSel] = useState(null);
+  // Lazy-load the two picked files (EDFs aren't held in memory until needed); the comparison
+  // recomputes when they land in edfFileStore.
+  useEffect(() => {
+    if (baselineSel) ensureEdfLoaded?.(baselineSel);
+    if (compareSel) ensureEdfLoaded?.(compareSel);
+  }, [baselineSel, compareSel, ensureEdfLoaded]);
 
   // All library recordings, oldest-first, for chronological picking.
   const allFiles = useMemo(
@@ -6746,7 +6752,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
  * plus a topographic-slowing strip. Each timeline point is clickable to open the
  * corresponding recording in the Review tab.
  */
-function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenReview }) {
+function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenReview, ensureEdfLoaded }) {
   const dialogRef = useRef(null);
   useFocusTrap(dialogRef, true, onClose);
   // Filter to this subject, sort chronologically
@@ -6755,6 +6761,11 @@ function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenRe
       .filter(r => r.subjectHash === subjectHash)
       .sort(compareRecordChronology);
   }, [records, subjectHash]);
+  // Lazy-load this subject's EDFs so the per-visit metrics compute (files aren't held in memory
+  // until needed); the metrics recompute as each lands in edfFileStore.
+  useEffect(() => {
+    subjectRecords.forEach(r => { if (r.hasEdfData) ensureEdfLoaded?.(r.filename); });
+  }, [subjectRecords, ensureEdfLoaded]);
 
   // Compute metrics per recording (memoized so flipping between subjects is cheap)
   const points = useMemo(() => subjectRecords.map(r => {
@@ -7333,16 +7344,23 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
   const noSignalFiles = useMemo(() => {
     const s = new Set();
     for (const r of records) {
-      const edf = edfFileStore?.[r.filename];
-      if (edf && !edfHasAnySignal(edf)) s.add(r.filename);
+      // Prefer the persisted flag (set at creation / backfilled) so this doesn't need the EDF
+      // in memory; fall back to a live check only for a legacy record whose file happens to be
+      // loaded but hasn't been backfilled yet.
+      if (r.hasSignal === false) { s.add(r.filename); continue; }
+      if (r.hasSignal === undefined) {
+        const edf = edfFileStore?.[r.filename];
+        if (edf && !edfHasAnySignal(edf)) s.add(r.filename);
+      }
     }
     return s;
   }, [records, edfFileStore]);
 
   // Single source of truth for the library status dot. Red = no data (EDF missing OR present
   // but every channel flat/empty); otherwise blue=test, green=recorded, yellow=imported.
+  // Reads persisted record fields (hasEdfData/hasSignal) so it works without loading the EDF.
   const dataDot = (r) => {
-    const missing = !edfFileStore?.[r.filename] && r.fileType !== "simulated" && !r.isSimulated;
+    const missing = !r.hasEdfData && r.fileType !== "simulated" && !r.isSimulated;
     if (missing) return { color: "#ef4444", title: "No EDF data", noData: true };
     if (noSignalFiles.has(r.filename)) return { color: "#ef4444", title: "No signal — every channel is flat/empty", noData: true };
     if (r.isTest) return { color: "#3b82f6", title: "Test", noData: false };
@@ -8675,9 +8693,12 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // body uses (openReview→onSelectRecord), so the rest of the ~810-line component is unchanged.
   const { records, setRecords, edfFileStore, setEdfFileStore, annotationsMap, setAnnotationsMap,
     clinicalNotesMap, setClinicalNotesMap, baselineMap, setBaselineMap, updateRecordStatus,
-    collections, openReview: onSelectRecord } = useAppStore();
+    collections, openReview: onSelectRecord, ensureEdfLoaded } = useAppStore();
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
+  // Lazy-load the open recording's EDF the moment a record is selected (files aren't parsed at
+  // startup anymore). edfData flips from null → parsed when it arrives, re-rendering the viewer.
+  useEffect(() => { if (filename && !edfData) ensureEdfLoaded?.(filename); }, [filename, edfData, ensureEdfLoaded]);
   // Per-signal EDF analysis (electrode/type/RMS) — drives the montage-builder green dots
   // (strictly EEG-with-data) and the Raw EDF inspector.
   const edfInfo = useMemo(() => analyzeEdfSignals(edfData), [edfData]);
@@ -8988,7 +9009,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
                   background:isActive?"#1a2a30":"transparent",borderBottom:isActive?"2px solid #7ec8d9":"2px solid transparent",
                   borderRight:"1px solid #1a1a1a",transition:"background 0.1s",maxWidth:260,minWidth:0}}>
                 <span style={{width:6,height:6,borderRadius:"50%",flexShrink:0,
-                  background:!edfFileStore?.[tab.filename]&&tab.fileType!=="simulated"&&!tab.isSimulated?"#ef4444":tab.isTest?"#3b82f6":tab.isAcquired?"#22c55e":"#eab308"}}/>
+                  background:!tab.hasEdfData&&tab.fileType!=="simulated"&&!tab.isSimulated?"#ef4444":tab.isTest?"#3b82f6":tab.isAcquired?"#22c55e":"#eab308"}}/>
                 {subId && <span style={{fontSize:8,fontWeight:700,color:hashColor||"#888",fontFamily:"'IBM Plex Mono', monospace",
                   background:`${hashColor||"#888"}15`,padding:"1px 4px",borderRadius:2,flexShrink:0,letterSpacing:"0.05em"}}
                   title={`Patient: ${subId} (${patHash||"?"})`}>{subId}</span>}
@@ -9100,8 +9121,8 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
                   }} onMouseEnter={e=>e.currentTarget.style.background="#1a1a1a"}
                      onMouseLeave={e=>e.currentTarget.style.background=r.id===record?.id?"#1a2a30":"transparent"}>
                     <span style={{display:"flex",alignItems:"center",gap:6}}>
-                      <span title={!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"No EDF data":r.isTest?"Test":r.isAcquired?"Recorded":"Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
-                        background:!edfFileStore?.[r.filename]&&r.fileType!=="simulated"&&!r.isSimulated?"#ef4444":r.isTest?"#3b82f6":r.isAcquired?"#22c55e":"#eab308"}}/>
+                      <span title={!r.hasEdfData&&r.fileType!=="simulated"&&!r.isSimulated?"No EDF data":r.isTest?"Test":r.isAcquired?"Recorded":"Imported"} style={{display:"inline-block",width:7,height:7,borderRadius:"50%",flexShrink:0,
+                        background:!r.hasEdfData&&r.fileType!=="simulated"&&!r.isSimulated?"#ef4444":r.isTest?"#3b82f6":r.isAcquired?"#22c55e":"#eab308"}}/>
                       <span style={{color:"#7ec8d9"}}>{r.filename}</span>
                     </span>
                     <div style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -9356,7 +9377,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
 
       {/* Floating differential comparison panel (baseline → comparison) */}
       {showCompare && (
-        <ComparePanel records={records} edfFileStore={edfFileStore}
+        <ComparePanel records={records} edfFileStore={edfFileStore} ensureEdfLoaded={ensureEdfLoaded}
           onClose={()=>setShowCompare(false)}
           panelPos={comparePanelPos} setPanelPos={setComparePanelPos}/>
       )}
@@ -11122,9 +11143,10 @@ export default function ReactEEGApp() {
       if (hasPhysioSeeds || existingRecords.length > 0) {
         setRecords(existingRecords.map(migrateRecord));
         setInitialized(true);
-        loadAllEdfsFromDB().then(stored => {
-          if (Object.keys(stored).length > 0) setEdfFileStore(prev => ({ ...prev, ...stored }));
-        });
+        // EDF signals are now loaded lazily (ensureEdfLoaded) when a record is opened, instead
+        // of eagerly parsing the whole library into memory here — so launch stays fast and
+        // bounded regardless of library size. The Library dots read persisted record fields
+        // (hasEdfData / hasSignal), backfilled once in the background for legacy records.
         // Reconcile any NEW public seed files added to the manifest since this library was
         // seeded (e.g. a newly-bundled dataset), without disturbing existing records.
         const seedPaths = new Set(existingRecords.map(r => r.sourceAttribution?.originalPath).filter(Boolean));
@@ -11237,6 +11259,62 @@ export default function ReactEEGApp() {
     return () => clearTimeout(annTimerRef.current);
   }, [annotationsMap, initialized]);
 
+  // ── Lazy EDF loading ──
+  // Parsed EDF signals load on demand (when a record is opened) instead of eagerly at startup,
+  // so a large library doesn't parse every recording into memory on launch. Opened files are
+  // cached in edfFileStore for the session. `edfStoreRef` gives the callback a fresh view of the
+  // store without re-creating it on every store change.
+  const edfStoreRef = useRef(edfFileStore);
+  edfStoreRef.current = edfFileStore;
+  const recordsRef = useRef(records);
+  recordsRef.current = records;
+  const edfLoadingRef = useRef(new Set());
+  const ensureEdfLoaded = useCallback(async (filename) => {
+    if (!filename || edfStoreRef.current[filename] || edfLoadingRef.current.has(filename)) return;
+    edfLoadingRef.current.add(filename);
+    try {
+      const raw = await getEdfRawFromDB(filename);
+      if (raw) {
+        const parsed = parseEDFFile(raw);
+        if (parsed && !parsed.error) setEdfFileStore(prev => prev[filename] ? prev : ({ ...prev, [filename]: parsed }));
+      }
+    } catch (e) { console.warn("ensureEdfLoaded failed:", filename, e); }
+    finally { edfLoadingRef.current.delete(filename); }
+  }, []);
+
+  // One-time background backfill of the persisted `hasSignal` flag for legacy records that
+  // predate it, so the Library status dots stay correct without holding every EDF in memory.
+  // Parses one file at a time (and doesn't retain it), runs only until every record carries the
+  // flag, then never again. New records get hasSignal at creation, so this is empty after once.
+  const backfillRef = useRef(false);
+  useEffect(() => {
+    // Depends only on `initialized` — NOT `records` — because it calls setRecords itself; if
+    // records were a dep, each update would re-run this effect and its cleanup would cancel the
+    // in-flight loop. Reads the current records via a ref instead.
+    if (!initialized || backfillRef.current) return;
+    const pending = recordsRef.current.filter(r => r.hasEdfData && r.hasSignal === undefined && !edfStoreRef.current[r.filename]);
+    if (pending.length === 0) return;
+    backfillRef.current = true;
+    let cancelled = false;
+    (async () => {
+      for (const r of pending) {
+        if (cancelled) break;
+        try {
+          const raw = await getEdfRawFromDB(r.filename);
+          if (raw) {
+            const parsed = parseEDFFile(raw);
+            if (parsed && !parsed.error) {
+              const has = edfHasAnySignal(parsed);
+              setRecords(prev => prev.map(x => x.filename === r.filename ? { ...x, hasSignal: has } : x));
+            }
+          }
+        } catch { /* skip unreadable file */ }
+        await new Promise(res => setTimeout(res, 30)); // yield between files
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [initialized]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Desktop auto-update ──
   // On launch, ask the updater endpoint (GitHub Releases latest.json) whether a newer signed
   // build exists; if so, offer to download + install + relaunch. Tauri-only and guarded so the
@@ -11294,8 +11372,16 @@ export default function ReactEEGApp() {
   const [promoteRejection, setPromoteRejection] = useState(null);
   const promoteRejectDialogRef = useRef(null);
   useFocusTrap(promoteRejectDialogRef, !!promoteRejection, () => setPromoteRejection(null));
-  const promoteRecord = (record) => {
-    const edf = edfFileStore?.[record.filename];
+  const promoteRecord = async (record) => {
+    // EDFs load lazily, so the file may not be in memory when promoting. Load it just-in-time
+    // for the compliance check (which reads signal-based criteria) without caching it.
+    let edf = edfFileStore?.[record.filename];
+    if (!edf && record.hasEdfData) {
+      try {
+        const raw = await getEdfRawFromDB(record.filename);
+        if (raw) { const p = parseEDFFile(raw); if (p && !p.error) edf = p; }
+      } catch { /* fall through with null edf */ }
+    }
     const result = checkProtocolCompliance(record, edf || null);
     if (!result.compliant) {
       setPromoteRejection({ record, result });
@@ -11587,7 +11673,7 @@ export default function ReactEEGApp() {
         records, setRecords, edfFileStore, setEdfFileStore,
         annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap,
         baselineMap, setBaselineMap, collections, setCollections,
-        updateRecordStatus, promoteRecord, demoteRecord, openReview,
+        updateRecordStatus, promoteRecord, demoteRecord, openReview, ensureEdfLoaded,
       }}>
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab onOpenTimeline={(hash)=>setTimelineSubjectHash(hash)} selectedCollectionId={libraryCollectionId} setSelectedCollectionId={setLibraryCollectionId}/>}
@@ -11609,7 +11695,7 @@ export default function ReactEEGApp() {
       {/* Subject Timeline modal */}
       {timelineSubjectHash && (
         <SubjectTimeline subjectHash={timelineSubjectHash} records={records}
-          edfFileStore={edfFileStore}
+          edfFileStore={edfFileStore} ensureEdfLoaded={ensureEdfLoaded}
           onClose={()=>setTimelineSubjectHash(null)}
           onOpenReview={openReview}/>
       )}
