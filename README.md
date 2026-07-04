@@ -164,6 +164,23 @@ npm run dev
 
 Open http://localhost:5173/react-eeg/ in your browser.
 
+### Testing
+
+```bash
+npm test          # vitest run (single pass)
+npm run test:watch
+```
+
+**The suite uses only REAL data — no synthetic fixtures anywhere.** Every DSP/EDF test reads a
+bundled public-domain PhysioNet recording from [`public/seed-edfs/`](public/seed-edfs/) (see
+`test/seed-fixtures.js`). Those files are **committed to the repo**, so a fresh clone can run the
+tests immediately — no fetch step. If a seed is missing (e.g. deleted locally), the suite **fails
+loudly** with a restore hint rather than silently skipping:
+
+```bash
+git checkout -- public/seed-edfs/
+```
+
 ### Deploy to GitHub Pages
 
 1. Push this repo to GitHub

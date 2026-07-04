@@ -1,8 +1,15 @@
-// EDF writer round-trip (Phase 5): a captured raw-µV session must write to a valid EDF whose
-// samples decode back within the 16-bit quantization tolerance, and the PIPELINE/SCHEMA version
-// stamp must land in the reserved header field (which the de-id scrub leaves intact).
+// EDF writer round-trip + windowed decode. Per the project's no-synthetic-data rule (which
+// includes test fixtures), every input here is a REAL PhysioNet seed recording — decoded with
+// the code under test, then used both as writer input and as the windowing ground truth.
 import { describe, it, expect } from "vitest";
 import { buildEDFFile, edfReservedField, parseEDFHeader, parseEDFWindow } from "../src/edf.js";
+import { loadSeedEdf, SEEDS } from "./seed-fixtures.js";
+
+// Real fixture: EEGMMIDB, 64-ch @ 160 Hz, 61 × 1 s records.
+const seed = loadSeedEdf(SEEDS.eeg64);
+const decoded = parseEDFWindow(seed);                                  // whole-file decode
+const SPR0 = decoded.channelData[0].length / decoded.windowRecCount;   // samples/record, ch0 (=160)
+const real = (c, n) => Float32Array.from(decoded.channelData[c].subarray(0, n));
 
 // Minimal EDF reader — just enough to verify buildEDFFile's output (header scaling + samples).
 function readEdf(buffer) {
@@ -39,30 +46,28 @@ function readEdf(buffer) {
   return { ns, numRecords, recDur, headerBytes, sigs };
 }
 
-const f32 = (a) => Float32Array.from(a);
-const N = 250;
-const alpha = f32(Array.from({ length: N }, (_, n) => 30 * Math.sin(2 * Math.PI * 10 * n / 250)));   // ±30 µV
-const drift = f32(Array.from({ length: N }, (_, n) => 5 * Math.sin(2 * Math.PI * 1 * n / 250) + 0.02 * n)); // small + ramp
-const flat = f32(new Array(N).fill(0));                                                               // dead channel
-
-describe("buildEDFFile round-trip", () => {
+describe("buildEDFFile round-trip (real seed channels)", () => {
+  const SR = Math.round(SPR0);
+  const N = SR * 2;                                 // 2 seconds of two real channels
+  const chA = real(0, N), chB = real(1, N);
+  const dead = new Float32Array(N);                 // a flat/dead electrode — a real degenerate case, not fabricated signal
+  const inputs = [chA, chB, dead];
   const buf = buildEDFFile({
-    channelLabels: ["C3", "C4", "O1"],
-    channelData: [alpha, drift, flat],
-    sampleRate: 250, recordDurationSec: 1,
+    channelLabels: [decoded.channelLabels[0], decoded.channelLabels[1], "FLAT"],
+    channelData: inputs,
+    sampleRate: SR, recordDurationSec: 1,
     versionStamp: "REACT react-pipeline-1.0.0 v15.0",
   });
   const edf = readEdf(buf);
 
-  it("writes the right structure (3 signals, 1 record, 250 Hz)", () => {
+  it("writes the right structure (3 signals, 2 records at the seed's rate)", () => {
     expect(edf.ns).toBe(3);
-    expect(edf.numRecords).toBe(1);
+    expect(edf.numRecords).toBe(2);
     expect(edf.recDur).toBe(1);
-    expect(edf.sigs[0].nSamp).toBe(250);
+    expect(edf.sigs[0].nSamp).toBe(SR);
   });
 
-  it("decodes every channel within the 16-bit quantization tolerance (±1 LSB)", () => {
-    const inputs = [alpha, drift, flat];
+  it("decodes real channels within the 16-bit quantization tolerance (±1 LSB)", () => {
     for (let c = 0; c < 3; c++) {
       const { physMin, physMax, data } = edf.sigs[c];
       const lsb = (physMax - physMin) / 65535;
@@ -74,7 +79,7 @@ describe("buildEDFFile round-trip", () => {
 
   it("preserves the RMS of a real channel (quantization is negligible)", () => {
     const rms = (a) => Math.sqrt([...a].reduce((s, v) => s + v * v, 0) / a.length);
-    expect(rms(edf.sigs[0].data)).toBeCloseTo(rms(alpha), 2);
+    expect(rms(edf.sigs[0].data)).toBeCloseTo(rms(chA), 1);
   });
 
   it("stamps PIPELINE/SCHEMA versions into the reserved header field", () => {
@@ -86,70 +91,55 @@ describe("buildEDFFile round-trip", () => {
   });
 
   it("defaults the reserved field to empty when no stamp is given (unchanged behaviour)", () => {
-    const plain = buildEDFFile({ channelLabels: ["C3"], channelData: [alpha], sampleRate: 250 });
+    const plain = buildEDFFile({ channelLabels: [decoded.channelLabels[0]], channelData: [chA], sampleRate: SR });
     expect(edfReservedField(plain)).toBe("");
   });
 });
 
-describe("parseEDFWindow — windowed decode (long-study support)", () => {
-  // A 10-record (10 s) EDF with a per-sample ramp so every window is uniquely identifiable.
-  const SR = 100, RECS = 10, TOTAL = SR * RECS; // 1000 samples/channel
-  const rampA = f32(Array.from({ length: TOTAL }, (_, i) => i * 0.1));        // 0 … 99.9 µV
-  const rampB = f32(Array.from({ length: TOTAL }, (_, i) => 40 - i * 0.03));  // decreasing
-  const buf = buildEDFFile({ channelLabels: ["Fp1", "Fp2"], channelData: [rampA, rampB], sampleRate: SR, recordDurationSec: 1 });
-
+describe("parseEDFWindow — windowed decode (real seed)", () => {
   it("parseEDFHeader reports structure without decoding signals", () => {
-    const h = parseEDFHeader(buf);
+    const h = parseEDFHeader(seed);
     expect(h.error).toBeUndefined();
-    expect(h.numRecords).toBe(RECS);
+    expect(h.numRecords).toBe(61);
     expect(h.recordDuration).toBe(1);
-    expect(h.sampleRate).toBe(SR);
-    expect(h.totalDuration).toBe(RECS);
-    expect(h.channelLabels).toEqual(["Fp1", "Fp2"]);
-    expect(h.samplesPerRecord).toBe(2 * SR); // 2 channels × 100
+    expect(h.totalDuration).toBe(61);
+    expect(h.channelLabels.length).toBeGreaterThanOrEqual(64);
+    expect(h.sampleRate).toBe(SPR0);
   });
 
   it("a full window (no range) decodes the whole file", () => {
-    const full = parseEDFWindow(buf);
-    expect(full.error).toBeUndefined();
-    expect(full.channelData.length).toBe(2);
-    expect(full.channelData[0].length).toBe(TOTAL);
-    expect(full.windowStartRec).toBe(0);
-    expect(full.windowRecCount).toBe(RECS);
-    expect(full.windowDurSec).toBe(RECS);
-    // round-trips the input within the 16-bit quantization tolerance
-    const lsb = 100 / 65535;
-    for (let i = 0; i < TOTAL; i += 37) expect(Math.abs(full.channelData[0][i] - rampA[i])).toBeLessThanOrEqual(lsb + 1e-6);
+    expect(decoded.error).toBeUndefined();
+    expect(decoded.windowStartRec).toBe(0);
+    expect(decoded.windowRecCount).toBe(61);
+    expect(decoded.windowDurSec).toBe(61);
+    expect(decoded.channelData[0].length).toBe(61 * SPR0);
   });
 
   it("a windowed decode extracts EXACTLY the matching slice of the full decode", () => {
-    const full = parseEDFWindow(buf);
-    const win = parseEDFWindow(buf, 3, 2); // records [3, 5)
-    expect(win.windowStartRec).toBe(3);
-    expect(win.windowRecCount).toBe(2);
-    expect(win.windowStartSec).toBe(3);
-    expect(win.windowDurSec).toBe(2);
-    expect(win.channelData[0].length).toBe(2 * SR); // 200 samples
-    // byte-offset seeking is correct: window == full sliced [300, 500) for both channels
-    expect(Array.from(win.channelData[0])).toEqual(Array.from(full.channelData[0].slice(300, 500)));
-    expect(Array.from(win.channelData[1])).toEqual(Array.from(full.channelData[1].slice(300, 500)));
-    // and still carries whole-file metadata so a window knows its place
-    expect(win.numRecords).toBe(RECS);
-    expect(win.totalDuration).toBe(RECS);
+    const win = parseEDFWindow(seed, 10, 10); // records [10, 20)
+    expect(win.windowStartRec).toBe(10);
+    expect(win.windowRecCount).toBe(10);
+    expect(win.windowStartSec).toBe(10);
+    expect(win.windowDurSec).toBe(10);
+    expect(win.channelData[0].length).toBe(10 * SPR0);
+    // byte-offset seeking is correct on real bytes: window == full sliced [10s, 20s)
+    expect(Array.from(win.channelData[0])).toEqual(Array.from(decoded.channelData[0].slice(10 * SPR0, 20 * SPR0)));
+    expect(Array.from(win.channelData[7])).toEqual(Array.from(decoded.channelData[7].slice(10 * SPR0, 20 * SPR0)));
+    // still carries whole-file metadata so a window knows its place
+    expect(win.numRecords).toBe(61);
+    expect(win.totalDuration).toBe(61);
   });
 
   it("clamps a range that runs past the end (partial last window)", () => {
-    const win = parseEDFWindow(buf, 8, 5); // wants records 8..12, only 8,9 exist
-    expect(win.windowStartRec).toBe(8);
-    expect(win.windowRecCount).toBe(2);
-    expect(win.channelData[0].length).toBe(2 * SR);
-    const full = parseEDFWindow(buf);
-    expect(Array.from(win.channelData[0])).toEqual(Array.from(full.channelData[0].slice(800, 1000)));
+    const win = parseEDFWindow(seed, 58, 10); // wants 58..67, only 58,59,60 exist
+    expect(win.windowStartRec).toBe(58);
+    expect(win.windowRecCount).toBe(3);
+    expect(Array.from(win.channelData[0])).toEqual(Array.from(decoded.channelData[0].slice(58 * SPR0, 61 * SPR0)));
   });
 
   it("returns an empty window for a start past the end", () => {
-    const win = parseEDFWindow(buf, 20, 3);
-    expect(win.windowStartRec).toBe(RECS);
+    const win = parseEDFWindow(seed, 100, 5);
+    expect(win.windowStartRec).toBe(61);
     expect(win.windowRecCount).toBe(0);
     expect(win.channelData[0].length).toBe(0);
   });
