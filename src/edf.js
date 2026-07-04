@@ -123,6 +123,11 @@ export function parseEDFHeader(arrayBuffer) {
   const rf = (o, l) => parseFloat(rs(o, l)) || 0;
   if (String.fromCharCode(...bytes.slice(0, 8)) !== "0       ") return { error: "bad EDF magic" };
 
+  // Identity fields (offsets 8/88) mirror parseEDFFile so the runtime compliance PHI scan works on
+  // windowed loads too. The persisted bytes are de-id-scrubbed (saveEdfToDB), so these are the
+  // scrubbed values — surfacing them lets the check confirm "no PHI" rather than report "unknown".
+  const patientId = rs(8, 80);
+  const recordingId = rs(88, 80);
   const headerBytes = ri(184, 8);
   const numRecords = ri(236, 8);
   const recordDuration = rf(244, 8);
@@ -163,6 +168,7 @@ export function parseEDFHeader(arrayBuffer) {
   // rate — correct only for uniform-rate files, wrong for mixed-rate clinical EDFs.
   const signals = dataSigs.map(s => ({ label: s.label, numSamples: s.numSamples, sampleRate: s.sampleRate, physDim: s.physDim }));
   return {
+    patientId, recordingId,
     headerBytes, numRecords, recordDuration, numSignals, sigs, dataSigs, samplesPerRecord, signals,
     totalDuration: numRecords * recordDuration,
     sampleRate: dataSigs[0]?.sampleRate || 256,
@@ -201,6 +207,7 @@ export function parseEDFWindow(arrayBuffer, startRec = 0, recCount = Infinity) {
     }
   }
   return {
+    patientId: h.patientId, recordingId: h.recordingId,
     channelData, channelLabels: h.channelLabels, signals: h.signals, numSignals: h.dataSigs.length,
     sampleRate: h.sampleRate, recordDuration: h.recordDuration,
     numRecords: h.numRecords, totalDuration: h.totalDuration,

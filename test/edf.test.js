@@ -178,6 +178,10 @@ describe("parseEDFWindow — windowed decode (real seed)", () => {
     expect(h.signals[0].label).toBe(h.channelLabels[0]);
     expect(h.signals[0]).toHaveProperty("physDim");
     expect(decoded.signals[0].sampleRate).toBe(SPR0); // window carries it too
+    // identity fields (offsets 8/88) surface too, so the runtime compliance PHI scan works on windows
+    expect(typeof h.patientId).toBe("string");
+    expect(typeof h.recordingId).toBe("string");
+    expect(typeof decoded.patientId).toBe("string");
   });
 
   it("carries the OWN sample rate of each signal on a mixed-rate file (masking-bug guard)", () => {
