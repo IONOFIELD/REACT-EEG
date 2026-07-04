@@ -158,8 +158,12 @@ export function parseEDFHeader(arrayBuffer) {
   }
   const samplesPerRecord = sigs.reduce((s, x) => s + x.numSamples, 0);
   const dataSigs = sigs.filter(s => !s.isAnnotation);
+  // `signals` mirrors parseEDFFile's shape (App.jsx:1691) so the window path's accessors can look
+  // up each channel's OWN sample rate + physical dimension. Without it they fall back to a single
+  // rate — correct only for uniform-rate files, wrong for mixed-rate clinical EDFs.
+  const signals = dataSigs.map(s => ({ label: s.label, numSamples: s.numSamples, sampleRate: s.sampleRate, physDim: s.physDim }));
   return {
-    headerBytes, numRecords, recordDuration, numSignals, sigs, dataSigs, samplesPerRecord,
+    headerBytes, numRecords, recordDuration, numSignals, sigs, dataSigs, samplesPerRecord, signals,
     totalDuration: numRecords * recordDuration,
     sampleRate: dataSigs[0]?.sampleRate || 256,
     channelLabels: dataSigs.map(s => s.label),
@@ -197,7 +201,7 @@ export function parseEDFWindow(arrayBuffer, startRec = 0, recCount = Infinity) {
     }
   }
   return {
-    channelData, channelLabels: h.channelLabels, numSignals: h.dataSigs.length,
+    channelData, channelLabels: h.channelLabels, signals: h.signals, numSignals: h.dataSigs.length,
     sampleRate: h.sampleRate, recordDuration: h.recordDuration,
     numRecords: h.numRecords, totalDuration: h.totalDuration,
     windowStartRec: r0, windowRecCount: nRec,
