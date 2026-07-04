@@ -103,6 +103,108 @@ export function buildEDFFile({ channelLabels, channelData, sampleRate, recordDur
   return buffer;
 }
 
+// ── Windowed decode (long-study support) ──
+// parseEDFFile (App.jsx) decodes the WHOLE file into memory, which OOMs on multi-hour LTM
+// recordings. EDF stores fixed-size data records back-to-back after the header, so any record
+// range can be seeked directly by byte offset — these helpers decode just a window. Pure and
+// unit-tested (test/edf.test.js) so a window manager can load a bounded slice on demand.
+
+/**
+ * Parse only the EDF main + signal headers (no signal decode — cheap). Returns the metadata a
+ * windowed decoder needs, or { error } for a malformed/unsupported file.
+ */
+export function parseEDFHeader(arrayBuffer) {
+  if (!arrayBuffer || arrayBuffer.byteLength < 256) return { error: "EDF too small" };
+  const bytes = new Uint8Array(arrayBuffer);
+  if (bytes[0] === 0xFF) return { error: "BDF (24-bit) unsupported" };
+  const dec = new TextDecoder("ascii");
+  const rs = (o, l) => dec.decode(bytes.slice(o, o + l)).trim();
+  const ri = (o, l) => parseInt(rs(o, l)) || 0;
+  const rf = (o, l) => parseFloat(rs(o, l)) || 0;
+  if (String.fromCharCode(...bytes.slice(0, 8)) !== "0       ") return { error: "bad EDF magic" };
+
+  const headerBytes = ri(184, 8);
+  const numRecords = ri(236, 8);
+  const recordDuration = rf(244, 8);
+  const numSignals = ri(252, 4);
+  if (numSignals <= 0 || numSignals > 512 || numRecords <= 0) return { error: "invalid EDF header" };
+
+  const b = 256;
+  const offLabel = b;
+  const offPhysDim = offLabel + numSignals * 16 + numSignals * 80;
+  const offPhysMin = offPhysDim + numSignals * 8;
+  const offPhysMax = offPhysMin + numSignals * 8;
+  const offDigMin = offPhysMax + numSignals * 8;
+  const offDigMax = offDigMin + numSignals * 8;
+  const offNSamp = offDigMax + numSignals * 8 + numSignals * 80;
+
+  const sigs = [];
+  for (let i = 0; i < numSignals; i++) {
+    const label = rs(offLabel + i * 16, 16);
+    const physMin = rf(offPhysMin + i * 8, 8);
+    const physMax = rf(offPhysMax + i * 8, 8);
+    const digMin = ri(offDigMin + i * 8, 8);
+    const digMax = ri(offDigMax + i * 8, 8);
+    const numSamples = ri(offNSamp + i * 8, 8);
+    const dr = digMax - digMin, pr = physMax - physMin;
+    const scale = dr !== 0 ? pr / dr : 1;
+    sigs.push({
+      label, numSamples,
+      isAnnotation: label.toUpperCase().includes("ANNOTATION"),
+      physDim: rs(offPhysDim + i * 8, 8),
+      scale, offset: physMin - digMin * scale,
+      sampleRate: recordDuration > 0 ? Math.round(numSamples / recordDuration) : 256,
+    });
+  }
+  const samplesPerRecord = sigs.reduce((s, x) => s + x.numSamples, 0);
+  const dataSigs = sigs.filter(s => !s.isAnnotation);
+  return {
+    headerBytes, numRecords, recordDuration, numSignals, sigs, dataSigs, samplesPerRecord,
+    totalDuration: numRecords * recordDuration,
+    sampleRate: dataSigs[0]?.sampleRate || 256,
+    channelLabels: dataSigs.map(s => s.label),
+  };
+}
+
+/**
+ * Decode only records [startRec, startRec+recCount) of an EDF into per-channel Float32Arrays,
+ * in the same shape parseEDFFile returns (plus window metadata). recCount defaults to the whole
+ * file, so parseEDFWindow(buf) === a full decode. The range is clamped to [0, numRecords].
+ * @returns {{channelData, channelLabels, sampleRate, recordDuration, numRecords, totalDuration,
+ *           windowStartRec, windowRecCount, windowStartSec, windowDurSec, numSignals} | {error}}
+ */
+export function parseEDFWindow(arrayBuffer, startRec = 0, recCount = Infinity) {
+  const h = parseEDFHeader(arrayBuffer);
+  if (h.error) return { error: h.error };
+  const r0 = Math.max(0, Math.min(h.numRecords, Math.floor(startRec) || 0));
+  const want = recCount === Infinity ? h.numRecords : Math.max(0, Math.floor(recCount) || 0);
+  const r1 = Math.min(h.numRecords, r0 + want);
+  const nRec = r1 - r0;
+  const dv = new DataView(arrayBuffer);
+  const channelData = h.dataSigs.map(s => new Float32Array(s.numSamples * nRec));
+  for (let rec = r0; rec < r1; rec++) {
+    let rOff = h.headerBytes + rec * h.samplesPerRecord * 2;
+    for (let si = 0; si < h.sigs.length; si++) {
+      const s = h.sigs[si];
+      const ns = s.numSamples;
+      if (s.isAnnotation) { rOff += ns * 2; continue; }
+      const di = h.dataSigs.indexOf(s);
+      const dest = (rec - r0) * ns;
+      for (let n = 0; n < ns; n++) {
+        if (rOff + 1 < arrayBuffer.byteLength) channelData[di][dest + n] = dv.getInt16(rOff, true) * s.scale + s.offset;
+        rOff += 2;
+      }
+    }
+  }
+  return {
+    channelData, channelLabels: h.channelLabels, numSignals: h.dataSigs.length,
+    sampleRate: h.sampleRate, recordDuration: h.recordDuration,
+    numRecords: h.numRecords, totalDuration: h.totalDuration,
+    windowStartRec: r0, windowRecCount: nRec,
+    windowStartSec: r0 * h.recordDuration, windowDurSec: nRec * h.recordDuration,
+  };
+}
+
 // Read the EDF main-header reserved field (offset 192, 44 bytes), trimmed. Used to recover the
 // versionStamp on import and in tests. Returns "" if the buffer is too small.
 export function edfReservedField(buffer) {

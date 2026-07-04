@@ -2,7 +2,7 @@
 // samples decode back within the 16-bit quantization tolerance, and the PIPELINE/SCHEMA version
 // stamp must land in the reserved header field (which the de-id scrub leaves intact).
 import { describe, it, expect } from "vitest";
-import { buildEDFFile, edfReservedField } from "../src/edf.js";
+import { buildEDFFile, edfReservedField, parseEDFHeader, parseEDFWindow } from "../src/edf.js";
 
 // Minimal EDF reader — just enough to verify buildEDFFile's output (header scaling + samples).
 function readEdf(buffer) {
@@ -88,5 +88,74 @@ describe("buildEDFFile round-trip", () => {
   it("defaults the reserved field to empty when no stamp is given (unchanged behaviour)", () => {
     const plain = buildEDFFile({ channelLabels: ["C3"], channelData: [alpha], sampleRate: 250 });
     expect(edfReservedField(plain)).toBe("");
+  });
+});
+
+describe("parseEDFWindow — windowed decode (long-study support)", () => {
+  // A 10-record (10 s) EDF with a per-sample ramp so every window is uniquely identifiable.
+  const SR = 100, RECS = 10, TOTAL = SR * RECS; // 1000 samples/channel
+  const rampA = f32(Array.from({ length: TOTAL }, (_, i) => i * 0.1));        // 0 … 99.9 µV
+  const rampB = f32(Array.from({ length: TOTAL }, (_, i) => 40 - i * 0.03));  // decreasing
+  const buf = buildEDFFile({ channelLabels: ["Fp1", "Fp2"], channelData: [rampA, rampB], sampleRate: SR, recordDurationSec: 1 });
+
+  it("parseEDFHeader reports structure without decoding signals", () => {
+    const h = parseEDFHeader(buf);
+    expect(h.error).toBeUndefined();
+    expect(h.numRecords).toBe(RECS);
+    expect(h.recordDuration).toBe(1);
+    expect(h.sampleRate).toBe(SR);
+    expect(h.totalDuration).toBe(RECS);
+    expect(h.channelLabels).toEqual(["Fp1", "Fp2"]);
+    expect(h.samplesPerRecord).toBe(2 * SR); // 2 channels × 100
+  });
+
+  it("a full window (no range) decodes the whole file", () => {
+    const full = parseEDFWindow(buf);
+    expect(full.error).toBeUndefined();
+    expect(full.channelData.length).toBe(2);
+    expect(full.channelData[0].length).toBe(TOTAL);
+    expect(full.windowStartRec).toBe(0);
+    expect(full.windowRecCount).toBe(RECS);
+    expect(full.windowDurSec).toBe(RECS);
+    // round-trips the input within the 16-bit quantization tolerance
+    const lsb = 100 / 65535;
+    for (let i = 0; i < TOTAL; i += 37) expect(Math.abs(full.channelData[0][i] - rampA[i])).toBeLessThanOrEqual(lsb + 1e-6);
+  });
+
+  it("a windowed decode extracts EXACTLY the matching slice of the full decode", () => {
+    const full = parseEDFWindow(buf);
+    const win = parseEDFWindow(buf, 3, 2); // records [3, 5)
+    expect(win.windowStartRec).toBe(3);
+    expect(win.windowRecCount).toBe(2);
+    expect(win.windowStartSec).toBe(3);
+    expect(win.windowDurSec).toBe(2);
+    expect(win.channelData[0].length).toBe(2 * SR); // 200 samples
+    // byte-offset seeking is correct: window == full sliced [300, 500) for both channels
+    expect(Array.from(win.channelData[0])).toEqual(Array.from(full.channelData[0].slice(300, 500)));
+    expect(Array.from(win.channelData[1])).toEqual(Array.from(full.channelData[1].slice(300, 500)));
+    // and still carries whole-file metadata so a window knows its place
+    expect(win.numRecords).toBe(RECS);
+    expect(win.totalDuration).toBe(RECS);
+  });
+
+  it("clamps a range that runs past the end (partial last window)", () => {
+    const win = parseEDFWindow(buf, 8, 5); // wants records 8..12, only 8,9 exist
+    expect(win.windowStartRec).toBe(8);
+    expect(win.windowRecCount).toBe(2);
+    expect(win.channelData[0].length).toBe(2 * SR);
+    const full = parseEDFWindow(buf);
+    expect(Array.from(win.channelData[0])).toEqual(Array.from(full.channelData[0].slice(800, 1000)));
+  });
+
+  it("returns an empty window for a start past the end", () => {
+    const win = parseEDFWindow(buf, 20, 3);
+    expect(win.windowStartRec).toBe(RECS);
+    expect(win.windowRecCount).toBe(0);
+    expect(win.channelData[0].length).toBe(0);
+  });
+
+  it("rejects a malformed buffer without throwing", () => {
+    expect(parseEDFHeader(new ArrayBuffer(10)).error).toBeTruthy();
+    expect(parseEDFWindow(new ArrayBuffer(10)).error).toBeTruthy();
   });
 });
