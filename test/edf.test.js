@@ -3,7 +3,29 @@
 // the code under test, then used both as writer input and as the windowing ground truth.
 import { describe, it, expect } from "vitest";
 import { buildEDFFile, edfReservedField, parseEDFHeader, parseEDFWindow } from "../src/edf.js";
+import { applyHighPass } from "../src/dsp.js";
 import { loadSeedEdf, SEEDS } from "./seed-fixtures.js";
+
+// A hand-built 2-signal EDF at DIFFERENT per-signal rates. This is a MATH VECTOR (constructed
+// header bytes to exercise a code path), NOT a fabricated recording — the real seeds are all
+// uniform-rate and would silently hide the per-signal-rate fallback bug.
+function buildMixedRateEdf({ rA = 100, rB = 50, records = 3 }) {
+  const ns = 2, headerBytes = 256 + ns * 256, spr = rA + rB;
+  const buf = new ArrayBuffer(headerBytes + records * spr * 2);
+  const bytes = new Uint8Array(buf), dv = new DataView(buf);
+  const w = (o, l, s) => { const p = (s + "").padEnd(l).slice(0, l); for (let i = 0; i < l; i++) bytes[o + i] = p.charCodeAt(i); };
+  w(0, 8, "0       "); w(184, 8, String(headerBytes)); w(236, 8, String(records)); w(244, 8, "1"); w(252, 4, String(ns));
+  const b = 256;
+  ["ChA", "ChB"].forEach((lab, i) => w(b + i * 16, 16, lab));
+  [0, 1].forEach(i => { w(b + ns * 96 + i * 8, 8, "uV"); w(b + ns * 104 + i * 8, 8, "-100.0"); w(b + ns * 112 + i * 8, 8, "100.0"); w(b + ns * 120 + i * 8, 8, "-32768"); w(b + ns * 128 + i * 8, 8, "32767"); });
+  w(b + ns * 216 + 0 * 8, 8, String(rA)); w(b + ns * 216 + 1 * 8, 8, String(rB));
+  let off = headerBytes;
+  for (let r = 0; r < records; r++) {
+    for (let s = 0; s < rA; s++) { dv.setInt16(off, ((r * rA + s) % 20000) - 10000, true); off += 2; }
+    for (let s = 0; s < rB; s++) { dv.setInt16(off, ((r * rB + s) % 20000) - 10000, true); off += 2; }
+  }
+  return buf;
+}
 
 // Real fixture: EEGMMIDB, 64-ch @ 160 Hz, 61 × 1 s records.
 const seed = loadSeedEdf(SEEDS.eeg64);
@@ -147,5 +169,37 @@ describe("parseEDFWindow — windowed decode (real seed)", () => {
   it("rejects a malformed buffer without throwing", () => {
     expect(parseEDFHeader(new ArrayBuffer(10)).error).toBeTruthy();
     expect(parseEDFWindow(new ArrayBuffer(10)).error).toBeTruthy();
+  });
+
+  it("emits per-signal metadata mirroring parseEDFFile (label/sampleRate/physDim)", () => {
+    const h = parseEDFHeader(seed);
+    expect(h.signals.length).toBe(h.channelLabels.length);
+    expect(h.signals[0].sampleRate).toBe(SPR0);
+    expect(h.signals[0].label).toBe(h.channelLabels[0]);
+    expect(h.signals[0]).toHaveProperty("physDim");
+    expect(decoded.signals[0].sampleRate).toBe(SPR0); // window carries it too
+  });
+
+  it("carries the OWN sample rate of each signal on a mixed-rate file (masking-bug guard)", () => {
+    const buf = buildMixedRateEdf({ rA: 100, rB: 50, records: 3 });
+    const h = parseEDFHeader(buf);
+    expect(h.error).toBeUndefined();
+    expect(h.signals.map(s => s.sampleRate)).toEqual([100, 50]);   // <-- would be [100,100] without the field
+    const win = parseEDFWindow(buf, 1, 1);                         // record [1,2)
+    expect(win.signals.map(s => s.sampleRate)).toEqual([100, 50]);
+    expect(win.channelData[0].length).toBe(100);                  // 1 record of the 100 Hz signal
+    expect(win.channelData[1].length).toBe(50);                   // 1 record of the 50 Hz signal
+  });
+
+  it("guarded-window filter matches the whole-file filter within the crop (seam equivalence)", () => {
+    // The load-bearing claim: filter a guard-extended window, crop the guard, and it equals the
+    // whole-file filter at the same absolute samples — so a window seam introduces no artifact.
+    const G = 3;                                                   // 3-record guard = 3 s ≥ 3/hpf for hpf=1
+    const whole = applyHighPass(decoded.channelData[0], 1, SPR0);
+    const win = parseEDFWindow(seed, 20 - G, 10 + 2 * G);         // records [17, 33)
+    const wf = applyHighPass(win.channelData[0], 1, SPR0);
+    let maxAbs = 0;
+    for (let i = 0; i < 10 * SPR0; i++) maxAbs = Math.max(maxAbs, Math.abs(wf[G * SPR0 + i] - whole[20 * SPR0 + i]));
+    expect(maxAbs).toBeLessThan(0.5); // µV — the HPF transient settles inside the guard
   });
 });
