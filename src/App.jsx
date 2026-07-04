@@ -33,7 +33,7 @@ import { decodeMessage, gapBatches, decodePieegMessage } from "./live-stream.js"
 // Live per-channel verification metrics (RMS / mains dominance / status) — pure, unit-tested.
 import { channelQuality } from "./live-metrics.js";
 // EDF writer (extracted for round-trip testing; supports a reserved-field version stamp).
-import { buildEDFFile } from "./edf.js";
+import { buildEDFFile, parseEDFHeader, parseEDFWindow } from "./edf.js";
 // FastICA artifact removal (extracted for unit-testing; seeded PRNG → reproducible output).
 import { trainICA, applyTrainedICA } from "./ica.js";
 
@@ -374,6 +374,15 @@ const SENSITIVITY_BASE = 73.5;     // mm/μV scaling factor (IFCN-style)
 // (and right) edge of every epoch. Cropped off after filtering. 3 s covers the 1 Hz default
 // HP time constant with margin; only the true file start (no prior data) can still reflect.
 const FILTER_GUARD_SEC = 3;
+// ── Windowed EDF loading (long-study support, F1) ──
+// Recordings longer than WINDOWED_LOAD_SEC load only a WINDOW_SEC slice of records at a time
+// (via parseEDFWindow) instead of the whole file, capping decode/derivation memory and — on
+// Tauri (S3) — the disk→memory transfer. Set HIGH so only files that already struggle whole-file
+// take this path; everything shorter (all seeds, all acquires) keeps the proven whole-file path
+// byte-for-byte. Acquired files are routed to whole-file by sourceType flag regardless of length.
+const WINDOWED_LOAD_SEC = 3600;   // > 1 h → windowed
+const WINDOW_SEC = 120;           // render-window span (>> any filter guard, > SPECTRO_SEC=30)
+const WINDOW_GUARD_SEC = 30;      // trailing/leading decode margin so filtfilt settles on real data (= dsp padLen cap)
 const CHAIN_BREAK_GAP_PX = 8;
 const SPLASH_DURATION_MS = 2800;
 const NOTES_DEBOUNCE_MS = 1000;
@@ -1738,8 +1747,9 @@ function getEDFEpochWindow(edfData, channelIndex, epochStart, epochSec, targetSr
   if (!edfData?.channelData || channelIndex >= edfData.channelData.length) return null;
   const sigSr = edfData.signals[channelIndex]?.sampleRate || edfData.sampleRate;
   const raw = edfData.channelData[channelIndex];
-  const coreStart = Math.floor(epochStart * sigSr);
-  if (coreStart >= raw.length) return null;
+  // Rebase whole-file epoch time to window-relative (windowStartSec = 0 for unwindowed files → inert).
+  const coreStart = Math.floor((epochStart - (edfData.windowStartSec || 0)) * sigSr);
+  if (coreStart < 0 || coreStart >= raw.length) return null;
   const coreLenSrc = Math.floor(epochSec * sigSr);
   const guardSrc = Math.max(0, Math.floor((guardSec || 0) * sigSr));
   const winStart = Math.max(0, coreStart - guardSrc);
@@ -2589,7 +2599,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
   // them for the playback cursor; Acquire omits them). isLiveSimulation/simClipRef are a
   // dormant live-sim feature — undefined here, kept declared so the draw code can read them.
   const {
-    channels, waveformData, fullChannels, epochSec, epochStart, epochEnd, sampleRate,
+    channels, waveformData, fullChannels, epochSec, epochStart, epochEnd, sampleRate, windowStartSec = 0,
     sensitivity, channelSensitivity = {}, annotations = [], annotationDraft,
     selectedAnnotationType, hoveredTime, isAddingAnnotation, isMeasuring,
     measureSel, measureDragRef, containerRef, canvasRef, montage,
@@ -2723,7 +2733,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
     };
     const getTile = (idx) => {
       const c = tileCacheRef.current;
-      const key = `${channels.length}|${montage}|${sensitivity}|${JSON.stringify(channelSensitivity)}|${sampleRate}|${Math.round(pxPerSec*100)}|${Math.round(H)}`;
+      const key = `${channels.length}|${montage}|${sensitivity}|${JSON.stringify(channelSensitivity)}|${sampleRate}|${Math.round(pxPerSec*100)}|${Math.round(H)}|${windowStartSec||0}`;
       if (c.key !== key || c.fc !== fullChannels) { c.key = key; c.fc = fullChannels; c.tiles.clear(); c.order = []; }
       let tile = c.tiles.get(idx);
       if (!tile) {
@@ -2782,7 +2792,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
 
     // Tile blit — the visible window of pre-rendered whole-file traces, 1:1 (instant scrub).
     if (useTiles) {
-      const x0 = epochStart * pxPerSec;                 // cache-px at the viewport's left edge
+      const x0 = (epochStart - (windowStartSec || 0)) * pxPerSec;  // window-relative cache-px at the viewport's left edge
       const firstTile = Math.max(0, Math.floor(x0 / TILE_W));
       const lastTile = Math.floor((x0 + plotW - 1) / TILE_W);
       ctx.save();
@@ -5428,10 +5438,14 @@ function ComparePanel({ records, edfFileStore, onClose, panelPos, setPanelPos, e
     const [recA, recB] = (r1.date || "") <= (r2.date || "") ? [r1, r2] : [r2, r1];
     const edfA = edfFileStore?.[recA.filename];
     const edfB = edfFileStore?.[recB.filename];
-    const analysisA = edfA ? analyzeFullFile(edfA) : null;
-    const analysisB = edfB ? analyzeFullFile(edfB) : null;
-    const eyeA = edfA ? analyzeFullFileEyeSync(edfA) : null;
-    const eyeB = edfB ? analyzeFullFileEyeSync(edfB) : null;
+    // Head-scan store split: on a windowed (long) file edfFileStore holds the sliding render window;
+    // read the immutable head window (_head) so these whole-file summaries stay deterministic and
+    // don't shift with the user's scroll position. Whole-file recordings have no _head → unchanged.
+    const scanA = edfA && (edfA._head || edfA), scanB = edfB && (edfB._head || edfB);
+    const analysisA = scanA ? analyzeFullFile(scanA) : null;
+    const analysisB = scanB ? analyzeFullFile(scanB) : null;
+    const eyeA = scanA ? analyzeFullFileEyeSync(scanA) : null;
+    const eyeB = scanB ? analyzeFullFileEyeSync(scanB) : null;
     if (!analysisA && !analysisB) return { error: "No EDF data available for these files. Import real EDF data to compare.", recA, recB };
     return { recA, recB, analysisA, analysisB, eyeA, eyeB };
   }, [baselineSel, compareSel, records, edfFileStore]);
@@ -5921,7 +5935,11 @@ function ReviewScrubBar({ edfData, annotations = [], totalDuration, totalEpochs,
   const canvasRef = useRef(null);
   const [width, setWidth] = useState(800);
   const STRIP_H = 20; // spectrogram strip height (px) — taller for the finer delta–beta bins
-  const spec = useMemo(() => computeGlobalSpectrogram(edfData), [edfData]);
+  // On a windowed (long) file, drive the minimap from the immutable head window so it stays put
+  // instead of sliding with each load-on-seek. (S4 replaces this with a true whole-file sparse
+  // overview; for now the head window is a stable, file-head-representative stand-in.)
+  const specSrc = edfData?._head || edfData;
+  const spec = useMemo(() => computeGlobalSpectrogram(specSrc), [specSrc]);
 
   useEffect(() => {
     const el = wrapRef.current;
@@ -6487,7 +6505,10 @@ function useEEGState(totalDuration = 600, edfData = null) {
   // unchanged; with it off (default) this is a pure array slice → smooth scrolling.
   const waveformData = useMemo(() => {
     const Nep = Math.round(sampleRate * epochSec);
-    const start = Math.round(epochStart * sampleRate);
+    // Rebase whole-file epoch time to window-relative. windowStartSec is undefined for unwindowed
+    // (whole-file) recordings, so `start` is unchanged there and every branch below is inert.
+    const windowed = edfData?.windowStartSec !== undefined;
+    const start = Math.round((epochStart - (edfData?.windowStartSec || 0)) * sampleRate);
     const guard = Math.round(FILTER_GUARD_SEC * sampleRate);
     const padTo = (a) => { if (a.length >= Nep) return a; const p = new Float32Array(Nep); p.set(a); return p; };
     const __wf = fullChannels.map((fc, ci) => {
@@ -6495,6 +6516,11 @@ function useEEGState(totalDuration = 600, edfData = null) {
       const fd = fc && fc.data;
       let raw;
       if (!fd) {
+        raw = new Float32Array(Nep);
+      } else if (windowed && (start < 0 || start >= fd.length)) {
+        // Epoch is outside the currently loaded window (mid-file) → blank for this one frame; the
+        // load-on-seek effect fetches the covering window. NOT hit at the true file end (there
+        // start < fd.length so the padTo branch renders the real tail — no wiped last screen).
         raw = new Float32Array(Nep);
       } else if (waveletDenoise && !AUX_CHANNELS.has(ch)) {
         // Guard-extended slice so the wavelet edges settle, then crop to the visible epoch.
@@ -6511,7 +6537,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
       return raw;
     });
     return __wf;
-  }, [fullChannels, epochSec, epochStart, currentEpoch, sampleRate, waveletDenoise, channels]);
+  }, [fullChannels, epochSec, epochStart, currentEpoch, sampleRate, waveletDenoise, channels, edfData]);
 
   // ICA artifact cleaning — train the mixing matrix once per file+filter combo,
   // apply per-epoch via the cheap projection path.
@@ -6723,6 +6749,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
     // (wavelet denoise / ICA), since those aren't baked into fullChannels — the canvas falls back
     // to the per-epoch path-draw when this is null. Each entry: { data: Float32Array(wholeSignal) }.
     fullChannels: (waveletDenoise || icaClean) ? null : fullChannels,
+    windowStartSec: edfData?.windowStartSec || 0,   // 0 for whole-file; window origin for windowed loads
     annotations, setAnnotations, selectedAnnotationType, setSelectedAnnotationType,
     isAddingAnnotation, setIsAddingAnnotation, annotationDraft, setAnnotationDraft,
     showAnnotationPanel, setShowAnnotationPanel, hoveredTime, setHoveredTime,
@@ -6770,7 +6797,8 @@ function SubjectTimeline({ subjectHash, records, edfFileStore, onClose, onOpenRe
   // Compute metrics per recording (memoized so flipping between subjects is cheap)
   const points = useMemo(() => subjectRecords.map(r => {
     const edf = edfFileStore?.[r.filename];
-    const metrics = edf ? computeRecordMetrics(edf) : { peakAlphaFreq: null, thetaBetaRatio: null, alphaDeltaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
+    const scan = edf && (edf._head || edf);   // head window for windowed files → deterministic timeline metrics
+    const metrics = scan ? computeRecordMetrics(scan) : { peakAlphaFreq: null, thetaBetaRatio: null, alphaDeltaRatio: null, slowingIndex: null, asymmetry: null, slowingByElectrode: {}, alphaByElectrode: {} };
     return { record: r, metrics };
   }), [subjectRecords, edfFileStore]);
 
@@ -8693,7 +8721,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
   // body uses (openReview→onSelectRecord), so the rest of the ~810-line component is unchanged.
   const { records, setRecords, edfFileStore, setEdfFileStore, annotationsMap, setAnnotationsMap,
     clinicalNotesMap, setClinicalNotesMap, baselineMap, setBaselineMap, updateRecordStatus,
-    collections, openReview: onSelectRecord, ensureEdfLoaded } = useAppStore();
+    collections, openReview: onSelectRecord, ensureEdfLoaded, loadWindow } = useAppStore();
   const filename = record?.filename || "";
   const edfData = edfFileStore?.[filename] || null;
   // Lazy-load the open recording's EDF the moment a record is selected (files aren't parsed at
@@ -8720,6 +8748,21 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
     return Math.abs(h);
   }, [record?.filename]);
   const eeg = useEEGState(totalDur, edfData);
+  // Load-on-seek (windowed/long files only): when the current epoch leaves the loaded window AND
+  // the file continues past it, fetch the covering window. A guard margin (M) inside the window
+  // triggers the load a beat early so the swap lands before the edge renders blank. Whole-file
+  // recordings have windowStartSec === undefined → inert. At the true file end (window reaches
+  // totalDuration) nothing loads and the real tail renders via padding (no wiped last screen).
+  useEffect(() => {
+    const ed = edfData;
+    if (!ed || ed.windowStartSec === undefined || !ed._source || !loadWindow) return;
+    const epochStart = eeg.currentEpoch * eeg.epochSec;
+    const rel = epochStart - ed.windowStartSec;
+    const M = FILTER_GUARD_SEC;
+    const beforeWindow = rel < M && ed.windowStartSec > 0;
+    const pastWindow = (rel + eeg.epochSec) > (ed.windowDurSec - M) && (ed.windowStartSec + ed.windowDurSec) < ed.totalDuration - 1e-3;
+    if (beforeWindow || pastWindow) loadWindow(ed._source.filename, epochStart);
+  }, [eeg.currentEpoch, eeg.epochSec, edfData, loadWindow]);
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [showPatternTable, setShowPatternTable] = useState(false);
   const [showAnnotations, setShowAnnotations] = useState(false);
@@ -9212,7 +9255,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
             <button data-tut="Data Sheet: Generates a printable single-page summary — metadata, band powers and topography — in a new window, ready to print or save as PDF." onClick={(e)=>{
               e.stopPropagation();
               if (!record) return;
-              const html = generateDataSheetHTML(record, edfData);
+              const html = generateDataSheetHTML(record, edfData?._head || edfData);   // head window for windowed files (deterministic whole-file summary)
               const win = window.open("", "_blank", "width=900,height=1100");
               if (!win) { notify("Pop-up blocked — allow pop-ups for this site to generate the Data Sheet.", "warn"); return; }
               win.document.write(html);
@@ -11275,11 +11318,58 @@ export default function ReactEEGApp() {
     try {
       const raw = await getEdfRawFromDB(filename);
       if (raw) {
-        const parsed = parseEDFFile(raw);
+        // F1 gate: only long IMPORTS window. Short files, acquired recordings (routed by sourceType,
+        // never by duration — the acquire duration source isn't length-capped), and any header
+        // failure take the byte-for-byte-unchanged whole-file path.
+        const header = parseEDFHeader(raw);
+        const rec = recordsRef.current.find(r => r.filename === filename);
+        const acquired = !!rec && (rec.sourceType === "pieeg" || rec.sourceType === "acquire");
+        let parsed;
+        if (!header || header.error || acquired || header.totalDuration <= WINDOWED_LOAD_SEC) {
+          parsed = parseEDFFile(raw);
+        } else {
+          // Long import → windowed. Load the HEAD window (windowStartSec = 0, so every accessor is
+          // already correct at t=0 with no rebase) plus a trailing guard for filter settling.
+          const recDur = header.recordDuration || 1;
+          const winRec = Math.max(1, Math.ceil(WINDOW_SEC / recDur));
+          const guardRec = Math.ceil(WINDOW_GUARD_SEC / recDur);
+          parsed = parseEDFWindow(raw, 0, winRec + guardRec);
+          if (parsed && !parsed.error) {
+            parsed._source = { filename, recDur, numRecords: header.numRecords, winRec, guardRec };
+            parsed._head = parsed;   // this window IS the head; load-on-seek carries it forward
+          }
+        }
         if (parsed && !parsed.error) setEdfFileStore(prev => prev[filename] ? prev : ({ ...prev, [filename]: parsed }));
       }
     } catch (e) { console.warn("ensureEdfLoaded failed:", filename, e); }
     finally { edfLoadingRef.current.delete(filename); }
+  }, []);
+
+  // Load-on-seek for windowed (long) files: replace the sliding window with one covering the
+  // whole-file time `targetSec`. REPLACES edfFileStore[filename] (new object identity → avgRefFull/
+  // fullChannels re-derive → tile cache clears via c.fc!==fullChannels), unlike the idempotent
+  // ensureEdfLoaded. No-op for whole-file (unwindowed) recordings. S2 re-reads the whole raw blob;
+  // S3 swaps this for a Tauri byte-range read.
+  const seekLoadingRef = useRef(new Set());
+  const loadWindow = useCallback(async (filename, targetSec) => {
+    const cur = edfStoreRef.current[filename];
+    if (!cur || !cur._source || seekLoadingRef.current.has(filename)) return;
+    seekLoadingRef.current.add(filename);
+    try {
+      const src = cur._source;
+      const targetRec = Math.floor(targetSec / src.recDur);
+      const r0 = Math.max(0, targetRec - src.guardRec);   // guard before target so filters settle before it renders
+      const raw = await getEdfRawFromDB(filename);
+      if (raw) {
+        const win = parseEDFWindow(raw, r0, src.winRec + 2 * src.guardRec);
+        if (win && !win.error) {
+          win._source = src;
+          win._head = cur._head || cur;                    // carry the immutable head window forward
+          setEdfFileStore(prev => ({ ...prev, [filename]: win }));
+        }
+      }
+    } catch (e) { console.warn("loadWindow failed:", filename, e); }
+    finally { seekLoadingRef.current.delete(filename); }
   }, []);
 
   // One-time background backfill of the persisted `hasSignal` flag for legacy records that
@@ -11673,7 +11763,7 @@ export default function ReactEEGApp() {
         records, setRecords, edfFileStore, setEdfFileStore,
         annotationsMap, setAnnotationsMap, clinicalNotesMap, setClinicalNotesMap,
         baselineMap, setBaselineMap, collections, setCollections,
-        updateRecordStatus, promoteRecord, demoteRecord, openReview, ensureEdfLoaded,
+        updateRecordStatus, promoteRecord, demoteRecord, openReview, ensureEdfLoaded, loadWindow,
       }}>
       <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",borderTop:"1px solid #2a2a2a"}}>
         {activeTab === "library" && <LibraryTab onOpenTimeline={(hash)=>setTimelineSubjectHash(hash)} selectedCollectionId={libraryCollectionId} setSelectedCollectionId={setLibraryCollectionId}/>}
