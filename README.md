@@ -210,10 +210,6 @@ baseline and serial-subtraction arithmetic. License: CC BY 4.0.
 - Goldberger, A.L., et al. *PhysioBank, PhysioToolkit, and PhysioNet.* Circulation
   101(23):e215-e220, 2000. https://physionet.org/content/eegmat/1.0.0/
 
-## License
-
-Proprietary - REACT EEG, LLC
-
 ---
 
 Built for biometric data acquisition and storage. Not a diagnostic tool.
