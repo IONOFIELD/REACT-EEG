@@ -123,6 +123,19 @@ describe("buildReegbBundle", () => {
     expect(b.annotations).toEqual([]);
     expect(b.clinicalNotes).toBe("");
   });
+
+  // M-1: the .reegb import reader restores bundle.baselineFilename, so the writer must
+  // carry the record's pinned baseline (was hardcoded null → silent round-trip data loss).
+  it("writes the pinned baseline when provided (lossless round-trip)", () => {
+    const b = buildReegbBundle({ ...args, baselineFilename: "PHY-BL-A7F3C2-20260101-001.edf" });
+    expect(b.baselineFilename).toBe("PHY-BL-A7F3C2-20260101-001.edf");
+  });
+
+  it("coalesces a missing/empty baseline to null without throwing", () => {
+    expect(() => buildReegbBundle({ ...args, baselineFilename: undefined })).not.toThrow();
+    expect(buildReegbBundle({ ...args, baselineFilename: undefined }).baselineFilename).toBeNull();
+    expect(buildReegbBundle({ ...args, baselineFilename: "" }).baselineFilename).toBeNull();
+  });
 });
 
 describe("buildLibraryBackup / parseLibraryBackup", () => {
