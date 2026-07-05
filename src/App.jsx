@@ -22,6 +22,7 @@ import {
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
 import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, scanLibraryForPHI, setHashSalt } from "./deid.js";
+import { httpBaseFromWs, recordingsUrl, downloadUrl, parseRecordings } from "./pieeg-recordings.js";
 
 // Per-deployment subject-hash salt (HIPAA Safe Harbor / G7): set at BUILD time via the
 // VITE_HASH_SALT env var so different sites don't produce linkable subject hashes. Applied once
@@ -10362,6 +10363,96 @@ function AcquireTab() {
   const [impedances, setImpedances] = useState(null);
   const [showImpedance, setShowImpedance] = useState(false);
 
+  // ── Pull recorded sessions from the PiEEG server (server.py /api/recordings + /download/edf) ──
+  // The Pi's authoritative recorder is importable as EDF+ over HTTP on the same host:port as the
+  // live WS stream. Pure URL/parse helpers live in ./pieeg-recordings.js; this fetches, imports
+  // through the same saveEdfToDB→library path as a live capture, and tags provenance sourceType
+  // "pieeg" / nonClinical. See AUDIT-live-acquire-v19.md.
+  const [piRecUrl, setPiRecUrl] = useState("");          // "" → derive from the device bridgeUrl
+  const [piRecordings, setPiRecordings] = useState(null); // null=not listed, []=listed empty, [...]=sessions
+  const [piRecBusy, setPiRecBusy] = useState(false);      // listing in flight
+  const [piRecImporting, setPiRecImporting] = useState(""); // session id currently importing
+  const [piRecError, setPiRecError] = useState("");
+  const piHttpBase = () => httpBaseFromWs(piRecUrl || deviceConfig.bridgeUrl || "ws://localhost:1616");
+
+  const handleListPiRecordings = async () => {
+    const base = piHttpBase();
+    if (!base) { setPiRecError("Enter a valid PiEEG address (e.g. ws://10.0.0.47:1616)."); return; }
+    setPiRecBusy(true); setPiRecError(""); setPiRecordings(null);
+    try {
+      const res = await fetch(recordingsUrl(base), { cache: "no-store" });
+      if (!res.ok) throw new Error(`server returned ${res.status}`);
+      const list = parseRecordings(await res.json());
+      setPiRecordings(list);
+      notify(list.length ? `Found ${list.length} PiEEG recording(s).` : "No recordings on the PiEEG server yet.",
+        list.length ? "ok" : "info");
+    } catch (e) {
+      setPiRecError(`Could not reach the PiEEG server at ${base}. ${e.message || ""}`.trim());
+      notify(`PiEEG recordings: ${e.message || "connection failed"}.`, "error");
+    } finally {
+      setPiRecBusy(false);
+    }
+  };
+
+  const handleImportPiRecording = async (session) => {
+    const base = piHttpBase();
+    if (!base || !session) return;
+    setPiRecImporting(session); setPiRecError("");
+    try {
+      const res = await fetch(downloadUrl(base, session, "edf"), { cache: "no-store" });
+      if (!res.ok) throw new Error(`download failed (${res.status})`);
+      const edfBuffer = await res.arrayBuffer();
+      const parsed = parseEDFFile(edfBuffer);
+      if (!parsed || parsed.error) throw new Error(parsed?.error || "not a readable EDF");
+      // Name by REACT convention so it flows through de-id/library like any other EDF. A pull has no
+      // REACT subject, so use the operator's current Subject ID if set, else the Pi session name.
+      const subjForName = subjectId || `PiEEG-${session}`;
+      const today = new Date().toISOString().split("T")[0];
+      const reactFilename = generateFilename(subjForName, studyType, today);
+      await saveEdfToDB(reactFilename, edfBuffer);       // scrubs the header on store (same chokepoint)
+      if (setEdfFileStore) setEdfFileStore(prev => ({ ...prev, [reactFilename]: parsed }));
+      const durationSec = parsed.totalDuration || 0;
+      const newRecord = {
+        id: `PIEEG-${Date.now()}`,
+        subjectHash: hashSubjectId(subjForName),
+        subjectId: subjForName,
+        sport: "", position: "",
+        studyType,
+        date: generalizeDateToYear(today),   // Safe Harbor: year only (the Pi header date is scrubbed on store)
+        filename: reactFilename,
+        channels: parsed.numSignals,
+        duration: Math.round(durationSec / 60 * 10) / 10,
+        durationSec,
+        sampleRate: parsed.sampleRate,
+        fileSize: Math.round(edfBuffer.byteLength / 1024 / 1024 * 10) / 10,
+        montage: detectEdfSystem(parsed) || eeg.eegSystem || "10-20",
+        status: "pending",
+        isTest: false,
+        isAcquired: false,   // imported from the recorder, not live-captured in this session
+        // provenance: authoritative recording pulled from the PiEEG device (research/education, non-diagnostic)
+        sourceType: "pieeg",
+        nonClinical: true,
+        notes: `Imported from PiEEG recorder — session ${session} (research/education, non-diagnostic)`,
+        uploadedAt: new Date().toISOString(),
+        sourceFile: null,
+        hasEdfData: true,
+        pipelineVersion: PIPELINE_VERSION,
+        schemaVersion: SCHEMA_VERSION,
+        processingLog: [],
+        repositoryStatus: "library",
+        collectionIds: [],
+        complianceResult: null,
+      };
+      if (setRecords) setRecords(prev => [newRecord, ...prev]);
+      notify(`Imported PiEEG session "${session}" → ${reactFilename}`, "ok");
+    } catch (e) {
+      setPiRecError(`Import of "${session}" failed: ${e.message || "error"}.`);
+      notify(`PiEEG import failed: ${e.message || "error"}.`, "error");
+    } finally {
+      setPiRecImporting("");
+    }
+  };
+
   // ── Live acquisition (piEEG) ──
   // The browser talks to the vendor pieeg-server (protocol:"pieeg-server", JSON on ws://…:1616)
   // directly, or to the legacy local bridge (protocol:"websocket", Float32 — kept for
@@ -10778,6 +10869,33 @@ function AcquireTab() {
       <DeviceSelector selectedDevice={selectedDevice} setSelectedDevice={setSelectedDevice}
         connectionState={connectionState} onConnect={handleConnect} onDisconnect={handleDisconnect}
         deviceConfig={deviceConfig} setDeviceConfig={setDeviceConfig}/>
+
+      {/* Pull recorded sessions from the PiEEG server (authoritative recorder → EDF+ import) */}
+      <div style={{display:"flex",alignItems:"center",gap:8,padding:"6px 16px",borderBottom:"1px solid #1a1a1a",background:"#0a0a0a",flexShrink:0,flexWrap:"wrap"}}>
+        <div style={microLabel}>PiEEG recordings</div>
+        <input value={piRecUrl} onChange={e=>setPiRecUrl(e.target.value)}
+          placeholder={deviceConfig.bridgeUrl || "ws://10.0.0.47:1616"}
+          title="PiEEG server address (ws:// or http://). Defaults to the device bridge URL."
+          style={{...selectStyle, minWidth:200}}/>
+        <button onClick={handleListPiRecordings} disabled={piRecBusy}
+          style={{padding:"6px 12px",background:piRecBusy?"#0a0a0a":"#0c1c24",border:"1px solid #1a3040",borderRadius:0,color:"#7ec8d9",fontSize:11,fontWeight:700,cursor:piRecBusy?"default":"pointer",letterSpacing:"0.05em"}}>
+          {piRecBusy?"Listing…":"List recordings"}</button>
+        {piRecordings && <span style={{fontSize:11,color:"#7ec8d9"}}>{piRecordings.length} session(s)</span>}
+        {piRecError && <span style={{fontSize:11,color:"#EF4444",maxWidth:360,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}} title={piRecError}>{piRecError}</span>}
+      </div>
+      {piRecordings && piRecordings.length > 0 && (
+        <div style={{maxHeight:150,overflowY:"auto",borderBottom:"1px solid #1a1a1a",background:"#080808",flexShrink:0}}>
+          {piRecordings.map(r => (
+            <div key={r.session} style={{display:"flex",alignItems:"center",gap:10,padding:"5px 16px",borderBottom:"1px solid #111"}}>
+              <span style={{fontFamily:"'IBM Plex Mono', monospace",fontSize:11,color:"#ccc",flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.session}</span>
+              <span style={{fontSize:10,color:"#666"}}>{(r.journalBytes/1024/1024).toFixed(1)} MB{r.hasEdf?" · edf":""}{r.hasBdf?" · bdf":""}</span>
+              <button onClick={()=>handleImportPiRecording(r.session)} disabled={!!piRecImporting}
+                style={{padding:"4px 10px",background:piRecImporting===r.session?"#0a0a0a":"#10241a",border:"1px solid #1a4030",borderRadius:0,color:"#10B981",fontSize:10,fontWeight:700,cursor:piRecImporting?"default":"pointer"}}>
+                {piRecImporting===r.session?"Importing…":"Import EDF"}</button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Recording controls bar */}
       <div style={{display:"flex",alignItems:"center",gap:12,padding:"8px 16px",borderBottom:"1px solid #1a1a1a",background:"#0c0c0c",flexShrink:0}}>
