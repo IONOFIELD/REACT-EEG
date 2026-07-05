@@ -113,6 +113,34 @@ export function scanTextForPHI(text) {
   return hits;
 }
 
+// Whole-library PHI sweep for the backup export. Mirrors the per-record gate loops in
+// handleBundleSubject (.zip) / handleSaveBundle (.reegb) but over the ENTIRE library the
+// backup embeds verbatim: the union of clinical-notes filenames, annotation filenames and
+// record filenames (record.notes). Returns the same "• field (filename): cats" finding
+// strings those gates build — category names only, never the raw matched value. Pure and
+// null-tolerant so it is unit-testable without a DOM/React harness.
+export function scanLibraryForPHI(records, clinicalNotesMap, annotationsMap) {
+  const notes = clinicalNotesMap && typeof clinicalNotesMap === "object" ? clinicalNotesMap : {};
+  const anns = annotationsMap && typeof annotationsMap === "object" ? annotationsMap : {};
+  const recNotesByFile = new Map();
+  for (const r of Array.isArray(records) ? records : []) {
+    if (r && typeof r.filename === "string") recNotesByFile.set(r.filename, r.notes || "");
+  }
+  const files = new Set([...Object.keys(notes), ...Object.keys(anns), ...recNotesByFile.keys()]);
+  const findings = [];
+  for (const fn of files) {
+    const noteHits = scanTextForPHI(notes[fn] || "");
+    if (noteHits.length) findings.push(`• notes (${fn}): ${noteHits.join(", ")}`);
+    const recNoteHits = scanTextForPHI(recNotesByFile.get(fn) || "");
+    if (recNoteHits.length) findings.push(`• record notes (${fn}): ${recNoteHits.join(", ")}`);
+    (Array.isArray(anns[fn]) ? anns[fn] : []).forEach((a, i) => {
+      const hits = scanTextForPHI((a && (a.label || a.text)) || "");
+      if (hits.length) findings.push(`• annotation #${i + 1} (${fn}): ${hits.join(", ")}`);
+    });
+  }
+  return findings;
+}
+
 // Extract the hash and year from a REACT-convention filename whose trailing segments
 // are always …-<HASH(6 hex)>-<YYYYMMDD>-<SEQ>.edf. Used to drive the on-store header
 // scrub. Returns { hash, year } with year as a 4-digit string, or nulls if unmatched.

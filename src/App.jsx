@@ -21,7 +21,7 @@ import {
 } from "./dsp.js";
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
-import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, setHashSalt } from "./deid.js";
+import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, scanLibraryForPHI, setHashSalt } from "./deid.js";
 
 // Per-deployment subject-hash salt (HIPAA Safe Harbor / G7): set at BUILD time via the
 // VITE_HASH_SALT env var so different sites don't produce linkable subject hashes. Applied once
@@ -7196,7 +7196,17 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
   // (record index, notes, annotations, collections, baselines) to one JSON file, and
   // restores it. Raw EDF blobs are excluded (re-importable); see buildLibraryBackup.
   const handleBackupExport = () => {
-    if (!window.confirm(
+    // G4: scan the free-text this backup carries verbatim (clinical notes, record notes +
+    // annotation labels) for likely PHI, matching the patient-package (.zip) and .reegb gates.
+    // Field names + categories are shown, never the raw matched value.
+    const phiFindings = scanLibraryForPHI(records, clinicalNotesMap, annotationsMap);
+    if (phiFindings.length) {
+      if (!window.confirm(
+        `Possible PHI detected in free-text that will be included in this library backup:\n\n${phiFindings.slice(0, 12).join("\n")}` +
+        `${phiFindings.length > 12 ? `\n…and ${phiFindings.length - 12} more` : ""}\n\n` +
+        `This file contains your clinical notes and annotations verbatim. It does NOT include the raw EDF signal files. Remove the flagged content first, or export anyway?`
+      )) return;
+    } else if (!window.confirm(
       "Export a library backup?\n\nThis file contains your clinical notes and annotations verbatim (which may include identifiers you typed). It does NOT include the raw EDF signal files. Store it somewhere secure.")) return;
     const backup = buildLibraryBackup({ records, notesMap: clinicalNotesMap, annotationsMap, collections, baselineMap });
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
@@ -8861,6 +8871,7 @@ function ReviewTab({ record, onClearReview, notesShownFilesRef, openTabs, setOpe
         edfBase64: rawEdf ? arrayBufferToBase64(rawEdf) : null,
         annotations: annotationsMap[filename] || [],
         clinicalNotes: clinicalNotesMap[filename] || "",
+        baselineFilename: baselineMap[filename] || null,
       });
       const blob = new Blob([JSON.stringify(bundle)], { type: "application/json" });
       const url = URL.createObjectURL(blob);

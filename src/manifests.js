@@ -66,8 +66,9 @@ export function buildExportManifest(records) {
  * @param {string|null} args.edfBase64
  * @param {Array}  args.annotations
  * @param {string} args.clinicalNotes
+ * @param {string|null} args.baselineFilename — the record's pinned baseline (baselineMap[record.filename]), or null
  */
-export function buildReegbBundle({ record, edfBase64 = null, annotations, clinicalNotes } = {}) {
+export function buildReegbBundle({ record, edfBase64 = null, annotations, clinicalNotes, baselineFilename = null } = {}) {
   return {
     version: 1,
     kind: "react-eeg-bundle",
@@ -79,7 +80,7 @@ export function buildReegbBundle({ record, edfBase64 = null, annotations, clinic
     edfBase64,
     annotations: Array.isArray(annotations) ? annotations : [],
     clinicalNotes: clinicalNotes || "",
-    baselineFilename: null, // per-file baseline pinning removed in v16.4
+    baselineFilename: baselineFilename || null, // the record's pinned baseline .edf, if any (restored on .reegb import)
   };
 }
 

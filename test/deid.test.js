@@ -7,7 +7,7 @@ import { describe, it, expect } from "vitest";
 import {
   hashSubjectId, generateFilename, parseEdfPatientField,
   generalizeDateToYear, capAge, parseHashYearFromFilename,
-  scrubEdfHeader, scrubEdfHeaderForFilename, scanTextForPHI, setHashSalt,
+  scrubEdfHeader, scrubEdfHeaderForFilename, scanTextForPHI, scanLibraryForPHI, setHashSalt,
 } from "../src/deid.js";
 
 const ascii = (buf, off, len) => new TextDecoder("ascii").decode(new Uint8Array(buf, off, len));
@@ -177,6 +177,49 @@ describe("scanTextForPHI (free-text export warning)", () => {
     expect(hits).toContain("MRN");
     expect(hits).toContain("email");
     expect(hits).toContain("date");
+  });
+});
+
+// N1: the whole-library backup embeds clinical notes + record notes + annotations verbatim,
+// so its export must sweep exactly those three sources — the union of clinical-notes files,
+// annotation files and record files — the same way the .zip / .reegb gates do per record.
+describe("scanLibraryForPHI (N1 — whole-library backup gate)", () => {
+  it("flags PHI in a clinical note by filename", () => {
+    const out = scanLibraryForPHI([], { "a.edf": "SSN 123-45-6789" }, {});
+    expect(out).toContain("• notes (a.edf): SSN");
+  });
+  it("scans record.notes and the union catches record-only files (no clinicalNotesMap entry)", () => {
+    // b.edf has no clinicalNotesMap key — only a record with .notes. The union must still reach it.
+    const out = scanLibraryForPHI([{ filename: "b.edf", notes: "contact jane@hospital.org" }], {}, {});
+    expect(out).toContain("• record notes (b.edf): email");
+  });
+  it("scans both annotation .label and .text, with per-file 1-based indexing", () => {
+    const anns = { "c.edf": [
+      { label: "call 415-555-0199" },          // #1 — phone via label
+      { text: "see MRN: 4456" },               // #2 — MRN via text (short digits → MRN only)
+    ] };
+    const out = scanLibraryForPHI([], {}, anns);
+    expect(out).toContain("• annotation #1 (c.edf): phone");
+    expect(out).toContain("• annotation #2 (c.edf): MRN");
+  });
+  it("flags a file present ONLY in annotationsMap (proves the union drives the sweep)", () => {
+    const out = scanLibraryForPHI([], {}, { "d.edf": [{ label: "acct 123456789" }] });
+    expect(out).toContain("• annotation #1 (d.edf): long-digit-run");
+  });
+  it("returns [] for a clean library and never leaks the raw matched value", () => {
+    expect(scanLibraryForPHI(
+      [{ filename: "x.edf", notes: "alpha reactive, no epileptiform activity" }],
+      { "x.edf": "mild diffuse theta slowing" },
+      { "x.edf": [{ label: "eyes open" }] },
+    )).toEqual([]);
+    // A finding must name the category, not echo the identifier back into the warning.
+    const out = scanLibraryForPHI([], { "y.edf": "SSN 123-45-6789" }, {});
+    expect(out.join("\n")).not.toContain("123-45-6789");
+  });
+  it("is null-tolerant (malformed maps / records do not throw)", () => {
+    expect(scanLibraryForPHI(null, null, null)).toEqual([]);
+    expect(scanLibraryForPHI(undefined, { "z.edf": 42 }, { "z.edf": "not-an-array" })).toEqual([]);
+    expect(scanLibraryForPHI([{ notes: "MRN 778899" }], {}, {})).toEqual([]); // record w/o filename skipped
   });
 });
 
