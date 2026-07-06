@@ -23,6 +23,7 @@ import {
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
 import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, scanLibraryForPHI, setHashSalt } from "./deid.js";
 import { httpBaseFromWs, recordingsUrl, downloadUrl, parseRecordings } from "./pieeg-recordings.js";
+import { authMessage, shouldAuthenticate, loadDemoToken } from "./pieeg-demo-auth.js";
 
 // Per-deployment subject-hash salt (HIPAA Safe Harbor / G7): set at BUILD time via the
 // VITE_HASH_SALT env var so different sites don't produce linkable subject hashes. Applied once
@@ -10650,12 +10651,34 @@ function AcquireTab() {
       };
       const to = setTimeout(() => { if (ws.readyState !== WebSocket.OPEN) { try { ws.close(); } catch {} fail(); } }, 4000);
       // pieeg-server sends its welcome automatically on connect — no request needed.
-      ws.onopen = () => { opened = true; clearTimeout(to); setConnectionState(CONN.connected); };
+      // HARDENED DEMO (wss://…:1621) exception: it requires the shared token as the FIRST message,
+      // before it sends the hello (no token → server closes 4401). The plaintext kiosk (ws://) needs
+      // none, so we gate the token-send on a wss URL and leave that path exactly as it was. The token
+      // is loaded at runtime from a gitignored file and is never logged or put in the URL.
+      ws.onopen = async () => {
+        opened = true; clearTimeout(to); setConnectionState(CONN.connected);
+        if (!shouldAuthenticate(url)) return;                 // ws:// kiosk / legacy: unchanged
+        const token = await loadDemoToken(import.meta.env.BASE_URL);
+        if (!token) {
+          notify("PiEEG demo: no token configured. Create the gitignored file public/pieeg-demo-token (see docs/DEMO_CONNECT.md); the server will refuse the connection without it.", "error");
+          return;
+        }
+        try { ws.send(authMessage(token)); } catch {}          // first message; never logged
+      };
       ws.onmessage = handlePieegMessage;
       ws.onerror = () => fail();
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         clearTimeout(to); if (errored) return;
         recordingRef.current = false;
+        // Hardened-demo auth/capacity closes are terminal — do NOT auto-reconnect (a retry with the
+        // same token just loops). 4401 = missing/wrong token; 4409 = another client already connected.
+        if (e && (e.code === 4401 || e.code === 4409)) {
+          setConnectionState(CONN.error);
+          notify(e.code === 4401
+            ? "PiEEG demo: authentication failed (4401) — token missing or wrong. Check public/pieeg-demo-token against the Pi's config/demo_token."
+            : "PiEEG demo: stream busy (4409) — another client is already connected to the Pi.", "error");
+          return;
+        }
         if (pieegMockRef.current) { setConnectionState(CONN.error); return; }        // refused mock — stay in error
         if (userClosingRef.current) { setConnectionState(CONN.disconnected); userClosingRef.current = false; return; }
         if (opened) {

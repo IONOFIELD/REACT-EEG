@@ -12,6 +12,10 @@ src-tauri/gen
 # Local tooling / machine-specific config (absolute paths)
 .claude/
 
+# Hardened-demo shared token — a SECRET the operator drops here on the laptop (copied from the Pi
+# by a private channel). Served locally by vite; must NEVER be committed. See docs/DEMO_CONNECT.md.
+public/pieeg-demo-token
+
 # Local-only data + notes (not part of the app/deploy)
 seed-edfs-archive/
 # Vendored PiEEG-server source, kept locally as a protocol reference only — NOT part of
