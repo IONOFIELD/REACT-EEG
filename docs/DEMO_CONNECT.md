@@ -64,19 +64,16 @@ For the point-to-point cable link, set the laptop's **wired** adapter to a stati
 
 ---
 
-## ⚠️ Known review item — select the 8-channel device
+## Handshake — the app adopts the stream's declared config
 
-The hardened demo sends its handshake as `{"type":"hello", …}` (the kiosk/`ws_server` shape). REACT's
-pieeg parser recognizes the **vendor** welcome `{"status":"connected", …}` and therefore **ignores**
-the demo's `type:"hello"` — so it does **not** adopt the stream's declared sample-rate/channel-count
-from that message. Instead it uses the values pre-set when you pick the device: **“piEEG (Pi HAT,
-8ch)” pre-sets 8 channels @ 250 Hz, which matches the demo stream**, so the recording is correct.
-
-**Do not pick the 16-channel entry for this demo** — the counts would disagree and the EDF would be
-mis-shaped. Adopting the `type:"hello"` welcome directly is a small, additive parser change we have
-intentionally **not** made without review (it must not disturb the working recorder). The data
-frames themselves (`{"type":"frame","seq","n","t","channels"}`) are handled unchanged — REACT reads
-`n` and the µV `channels` as before.
+The hardened demo sends its handshake as `{"type":"hello", …}` (the kiosk/`ws_server` shape) rather
+than the vendor `{"status":"connected", …}`. REACT now **adopts either form** — it reads the
+`sample_rate` and `channels` the stream declares (the demo streams **8 channels @ 250 Hz**), so the
+EDF is recorded with the correct shape regardless of which device you picked. Selecting **“piEEG (Pi
+HAT, 8ch)”** as the input source is still recommended (it supplies the electrode *labels*), but the
+rate and channel *count* come from the stream's hello. The data frames
+(`{"type":"frame","seq","n","t","channels"}`) are handled unchanged — REACT reads `n` and the µV
+`channels`.
 
 ---
 

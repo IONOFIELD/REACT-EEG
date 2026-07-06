@@ -195,6 +195,15 @@ describe("decodePieegMessage", () => {
     expect(r.config.channels).toBe(16);
     expect(r.config.mock).toBe(false);
   });
+  it("also treats the kiosk/demo hello ({type:'hello'}) as a welcome, adopting rate + channels", () => {
+    // ws_server.py (kiosk) and demo_stream.py (hardened) send {type:'hello',sample_rate,channels}
+    // instead of {status:'connected'}; adopt it the same way so sr/channels come from the stream.
+    const r = decodePieegMessage(JSON.stringify({ type: "hello", sample_rate: 250, decimate: 1, effective_rate: 250, channels: 8, mode: "wifi" }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.sampleRate).toBe(250);
+    expect(r.config.channels).toBe(8);
+    expect(r.config.mock).toBe(false);   // no mock field in the demo hello → not refused
+  });
   it("flags mock mode via the welcome so the client can refuse it", () => {
     const r = decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, mock: true }));
     expect(r.kind).toBe("welcome");

@@ -168,9 +168,12 @@ export function normalizePieegWelcome(msg) {
 
 // Decode one pieeg-server WebSocket message (JSON text; tolerant of a UTF-8 binary payload).
 // → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"ignore" }
-// Sample iff `n` is a number AND `channels` is an array; welcome iff status==="connected";
-// everything else (record_status, lsl_status, spike_config, …) is ignored. `rows` is a
-// single-sample batch so it feeds the same appendSamples path as the bridge decoder.
+// Sample iff `n` is a number AND `channels` is an array. Welcome iff status==="connected" (the
+// vendor server.py form) OR type==="hello" (the kiosk ws_server.py / hardened demo_stream.py form,
+// which carries the same sample_rate + channels) — both are normalized identically so the client
+// adopts the stream's declared rate/channel count regardless of which pieeg server it connects to.
+// Everything else (record_status, lsl_status, spike_config, …) is ignored. `rows` is a single-sample
+// batch so it feeds the same appendSamples path as the bridge decoder.
 export function decodePieegMessage(data) {
   let text = null;
   if (typeof data === "string") text = data;
@@ -184,7 +187,7 @@ export function decodePieegMessage(data) {
   if (text == null) return { kind: "ignore" };
   let msg; try { msg = JSON.parse(text); } catch { return { kind: "ignore" }; }
   if (!msg || typeof msg !== "object") return { kind: "ignore" };
-  if (msg.status === "connected") return { kind: "welcome", config: normalizePieegWelcome(msg) };
+  if (msg.status === "connected" || msg.type === "hello") return { kind: "welcome", config: normalizePieegWelcome(msg) };
   if (typeof msg.n === "number" && Array.isArray(msg.channels)) {
     return { kind: "samples", rows: [msg.channels.map(Number)], n: msg.n, t: typeof msg.t === "number" ? msg.t : null };
   }

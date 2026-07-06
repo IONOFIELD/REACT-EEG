@@ -10571,7 +10571,8 @@ function AcquireTab() {
     }
   };
 
-  // Message handler for the vendor pieeg-server (JSON welcome + per-sample {t,n,channels}).
+  // Message handler for the pieeg-server family: adopts the welcome (vendor {status:"connected"} OR
+  // kiosk/demo {type:"hello"}), then appends per-sample {t,n,channels} frames. Unchanged recorder path.
   const handlePieegMessage = (ev) => {
     const res = decodePieegMessage(ev.data);
     if (res.kind === "welcome") {
