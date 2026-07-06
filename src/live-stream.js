@@ -187,8 +187,26 @@ export function normalizePieegLeadoff(list) {
   return off;
 }
 
+// Normalize the per-channel green/amber/red contact verdict from a lead-off frame's `state` field
+// (ADS1299: green = both inputs connected, amber = exactly one off — e.g. a lost shared reference
+// shows EVERY channel amber, red = both off). 0-indexed by ch-1; unknown/invalid → null. Same
+// tolerance as normalizePieegLeadoff; servers that omit `state` yield nulls (client falls back to off).
+export function normalizePieegContactState(list) {
+  if (!Array.isArray(list)) return [];
+  let maxCh = 0;
+  for (const e of list) { const c = e && Math.floor(Number(e.ch)); if (Number.isFinite(c) && c > maxCh) maxCh = c; }
+  const state = new Array(maxCh).fill(null);
+  for (const e of list) {
+    const c = e && Math.floor(Number(e.ch));
+    if (Number.isFinite(c) && c >= 1 && c <= maxCh) {
+      state[c - 1] = (e.state === "green" || e.state === "amber" || e.state === "red") ? e.state : null;
+    }
+  }
+  return state;
+}
+
 // Decode one pieeg-server WebSocket message (JSON text; tolerant of a UTF-8 binary payload).
-// → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"leadoff", off:[…] } | { kind:"ignore" }
+// → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"leadoff", off:[…], state:[…] } | { kind:"ignore" }
 // Sample iff `n` is a number AND `channels` is an array. Welcome iff status==="connected" (the
 // vendor server.py form) OR type==="hello" (the kiosk ws_server.py / hardened demo_stream.py form,
 // which carries the same sample_rate + channels) — both are normalized identically so the client
@@ -213,7 +231,7 @@ export function decodePieegMessage(data) {
   // numeric `n`, and `channels` is a list of {ch,off} objects (not numbers), so it can never be
   // mistaken for — nor corrupt — the raw sample path.
   if (msg.status === "leadoff" && Array.isArray(msg.channels)) {
-    return { kind: "leadoff", off: normalizePieegLeadoff(msg.channels), t: typeof msg.ts === "number" ? msg.ts : null };
+    return { kind: "leadoff", off: normalizePieegLeadoff(msg.channels), state: normalizePieegContactState(msg.channels), t: typeof msg.ts === "number" ? msg.ts : null };
   }
   if (typeof msg.n === "number" && Array.isArray(msg.channels)) {
     return { kind: "samples", rows: [msg.channels.map(Number)], n: msg.n, t: typeof msg.t === "number" ? msg.t : null };

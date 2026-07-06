@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   LIVE_PROTOCOL, impedanceStatus, unitToMicrovolts, normalizeHello,
   decodeImpedance, deinterleave, scaleRows, gapBatches, decodeMessage,
-  normalizePieegWelcome, decodePieegMessage, normalizePieegLeadoff,
+  normalizePieegWelcome, decodePieegMessage, normalizePieegLeadoff, normalizePieegContactState,
 } from "../src/live-stream.js";
 
 describe("impedanceStatus", () => {
@@ -303,5 +303,25 @@ describe("decodePieegMessage — lead-off + contact detection", () => {
     expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, impedance_supported: true })).config.impedanceSupported).toBe(true);
     expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8 })).config.impedanceSupported).toBe(false);
     expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, impedance_supported: "true" })).config.impedanceSupported).toBe(false);
+  });
+  it("decodes the green/amber/red contact state alongside the off flags", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "leadoff", channels: [{ ch: 1, off: false, state: "green" }, { ch: 2, off: true, state: "red" }], ts: 100 }));
+    expect(r.kind).toBe("leadoff");
+    expect(r.off).toEqual([false, true]);
+    expect(r.state).toEqual(["green", "red"]);
+  });
+});
+
+describe("normalizePieegContactState", () => {
+  it("maps the green/amber/red verdict per channel (0-indexed, ch 1-based)", () => {
+    expect(normalizePieegContactState([{ ch: 1, state: "green" }, { ch: 2, state: "amber" }, { ch: 3, state: "red" }]))
+      .toEqual(["green", "amber", "red"]);
+  });
+  it("nulls unknown / missing state and fills gaps with null", () => {
+    expect(normalizePieegContactState([{ ch: 2, state: "red" }, { ch: 1 }, { ch: 3, state: "bogus" }]))
+      .toEqual([null, "red", null]);
+  });
+  it("returns [] for a non-array (older servers omit state entirely)", () => {
+    for (const x of [undefined, null, "red", 3]) expect(normalizePieegContactState(x)).toEqual([]);
   });
 });
