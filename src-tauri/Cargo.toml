@@ -1,6 +1,6 @@
 [package]
 name = "react-eeg"
-version = "19.0.0"
+version = "20.0.0"
 description = "REACT EEG — desktop EEG analysis & storage"
 authors = ["REACT EEG, LLC"]
 edition = "2021"
