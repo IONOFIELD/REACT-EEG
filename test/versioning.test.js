@@ -22,7 +22,7 @@ describe("version constants", () => {
   });
 
   it("follow the documented formats (version.js scheme)", () => {
-    expect(APP_VERSION).toMatch(/^v\d+\.\d+$/);
+    expect(APP_VERSION).toMatch(/^v\d+\.\d+\.\d+$/);
     expect(PIPELINE_VERSION).toMatch(/^react-pipeline-\d+\.\d+\.\d+$/);
     expect(SCHEMA_VERSION).toMatch(/^v\d+\.\d+$/);
   });
