@@ -161,6 +161,9 @@ export function normalizePieegWelcome(msg) {
     filter: m.filter === true,               // server-side bandpass state (on by default!)
     notchFilter: m.notch_filter === true,
     notchFreq: Number.isFinite(m.notch_freq) ? m.notch_freq : 60,
+    // LIMITATION: REACT can only refuse a stream the SERVER labels mock:true (strict boolean);
+    // it cannot detect an unlabeled synthetic feed, so a real session depends on the Pi never
+    // running --mock (and now advertising it) — the one integrity check REACT can't self-enforce.
     mock: m.mock === true,                    // synthetic-data mode — client must refuse
     impedanceSupported: false,               // pieeg-server has no impedance frame
   };
