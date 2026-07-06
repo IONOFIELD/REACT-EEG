@@ -260,6 +260,22 @@ const CHANGELOG = [
     "v14 baseline — compliance checker, Collections, Repository tab",
     "Subject Timeline, printable Data Sheet, patient-package .zip bundles",
   ]},
+  { version: "v13.0", items: [
+    "Production-readiness milestone before the v14 modular rewrite — a full architecture audit and hardening pass over the single-file review/acquire platform",
+  ]},
+  { version: "v12.0", items: [
+    "Real DSP — Butterworth band-pass/notch biquad cascades, Daubechies-4 wavelet denoising, and ICA-based artifact removal (with corrected bilinear-transform filter coefficients)",
+    "Acquire moved to a compact icon button; default sensitivity 20 mm/µV with chain spacing between montage groups",
+  ]},
+  { version: "v11.0", items: [
+    "Advanced spectral analysis — WPLI connectivity, IRASA fractal/oscillatory separation, automated artifact detection, and spectral line-noise removal",
+    "Cross-file comparison panel with real spectral analysis, L/R eye-sync comparison, and multi-tab persistence across restarts",
+    "Physiological EOG model, EKG mV→µV scaling, per-file clinical notes, sex/age in the import form + filename, and a click-drag measurement tool",
+  ]},
+  { version: "v10.2", items: [
+    "The first REACT EEG build in this repository — multi-tab review with epoch scrolling, EDF recording and generation, and OpenBCI acquire mode",
+    "Custom EEG-system montages, a three-state channel-visibility control, and realistic EOG/EKG artifact simulation with bio-cal (PG1/PG2 eye-lead aliases)",
+  ]},
 ];
 
 // ── App-global data store (Context) ──
