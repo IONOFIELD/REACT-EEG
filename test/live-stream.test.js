@@ -209,6 +209,25 @@ describe("decodePieegMessage", () => {
     expect(r.kind).toBe("welcome");
     expect(r.config.mock).toBe(true);
   });
+  // The hardened demo (demo_stream.py --mock) now advertises its synthetic mode in the
+  // {type:'hello'} welcome; REACT must honor that flag the same way it honors the vendor's.
+  it("honors mock:true carried by the {type:'hello'} demo welcome (refusable synthetic stream)", () => {
+    const r = decodePieegMessage(JSON.stringify({ type: "hello", sample_rate: 250, channels: 8, mock: true }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.mock).toBe(true);
+  });
+  it("treats a {type:'hello'} welcome with no mock field as real hardware (mock:false)", () => {
+    const r = decodePieegMessage(JSON.stringify({ type: "hello", sample_rate: 250, channels: 8 }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.mock).toBe(false);
+  });
+  it("does NOT accept a stringy 'true' as the mock flag — the Pi contract is a JSON boolean", () => {
+    // Strict `mock === true` guard: a truthy string must neither fabricate a mock refusal nor
+    // (were the sense inverted) downgrade a real one. Only a JSON boolean true refuses a stream.
+    const r = decodePieegMessage(JSON.stringify({ type: "hello", sample_rate: 250, channels: 8, mock: "true" }));
+    expect(r.kind).toBe("welcome");
+    expect(r.config.mock).toBe(false);
+  });
   it("decodes a per-sample {t,n,channels} frame into a single-row batch, carrying n", () => {
     const r = decodePieegMessage(JSON.stringify({ t: 1711234567.123, n: 42, channels: [1.5, -2.5, 3] }));
     expect(r.kind).toBe("samples");
