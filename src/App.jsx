@@ -84,6 +84,12 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v20.1.1", items: [
+    "Live trace now renders at a FIXED, true-µV sensitivity instead of auto-scaling — the amplitude no longer jitters as the signal varies, so it reads honestly for judging electrode quality; a new Sens −/+ control and header readout set the µV/div (matching Review)",
+    "Live trace holds still — a peak, once drawn, keeps its exact position as it scrolls (the display baseline is captured once and frozen), fixing the whole-waveform vertical sway",
+    "Live re-reference toggle (REF / CAR / BIP) — view the live trace as raw referential, common-average, or a bipolar chain that cancels shared common-mode noise (display only; the recorded EDF is always raw µV)",
+    "Per-electrode contact readout — when the device reports lead-off (e.g. the PiEEG's ADS1299), the Channel Check panel shows a green/amber/red contact chip per electrode (good contact / one input off / no contact), display-only",
+  ]},
   { version: "v20.0", items: [
     "Native desktop app — REACT EEG now installs and runs as a standalone Windows application (Tauri / WebView2): its own window, no browser and no terminal, with records persisted under Documents\\REACT EEG. Launch from the desktop shortcut; rebuild with `npm run build:desktop`",
     "Hardened live streaming to the PiEEG — the Record tab can connect over an encrypted, token-authenticated WebSocket (wss://<host>:1621): the client sends a shared token as its first message and trusts the Pi's certificate via the OS trust store, so live EEG crosses the wire encrypted. The token is loaded at runtime from an external file — never bundled, logged, or placed in the URL",
@@ -10150,11 +10156,13 @@ function ImpedancePanel({ impedances, onClose, onAccept, readOnly = false, devic
 // the moment the bridge is connected — before and during recording. Auto-scales each lane
 // to its own recent peak so any channel/gain fills cleanly. Read-only overlay; it does not
 // touch the Review epoch viewer underneath.
-function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, droppedRef, rxRef, filterText = "" }) {
+function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, droppedRef, rxRef, filterText = "", sensitivity = 20, deriveMode = "mono" }) {
   const canvasRef = useRef(null);
   const rxRateRef = useRef(0);          // samples/s received, refreshed ~2 Hz
   const rxWinRef = useRef({ n: 0, t: 0 });
-  const scaleRef = useRef({ t: 0, means: [], scales: [] }); // cached per-lane DC + σ-scale
+  const scaleRef = useRef({ key: "", means: null });  // FROZEN per-lane DC baseline (position-only, time-invariant)
+  const sensRef = useRef(sensitivity); sensRef.current = sensitivity;  // fixed live µV/px scale (read fresh in rAF)
+  const derivRef = useRef(deriveMode); derivRef.current = deriveMode;  // referential | car | bipolar (read fresh in rAF)
   useEffect(() => {
     if (!active) { const cv = canvasRef.current; if (cv) { const c = cv.getContext("2d"); c && c.clearRect(0, 0, cv.width, cv.height); } return; }
     rxWinRef.current = { n: rxRef?.current || 0, t: performance.now() };
@@ -10189,6 +10197,11 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
         const labelW = 46, plotW = Math.max(1, W - labelW);
         const laneH = H / n;
         const { cap, head, count } = view;
+        // FIXED clinical µV→px scale — the SAME convention as the review toolbar (73.5/effSens),
+        // so the live trace amplitude is true, stable, and matches what the raw EDF records. No
+        // adaptive/auto gain: the signal is shown UNALTERED so electrode quality is judged honestly.
+        const effSens = Math.max(1, sensRef.current);
+        const pxPerUv = effSens / 73.5;
         // FIXED time scale: the window always spans the full ring (cap samples = LIVE_VIEW_SEC),
         // with the newest sample pinned to the right edge and each pixel a constant time slice.
         // The trace fills in from the right as the buffer warms up — it never stretches/compresses,
@@ -10197,11 +10210,26 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
         const xForAge = (age) => labelW + plotW - (age / maxAge) * plotW;  // age 0 = newest = right edge
         const step = Math.max(1, Math.floor(cap / plotW));
         const idxAt = (age) => (head - 1 - age + cap * 2) % cap;           // ring index `age` samples back
+        // Live re-reference (DISPLAY ONLY; capture stays raw µV). Floating / high-impedance
+        // electrodes are swamped by COMMON-MODE interference that a referential (monopolar) view
+        // shows full-scale but a re-reference cancels: "bipolar" = each electrode minus its
+        // neighbour (ring-closed), like the PiEEG Scope — cancels common mode AND localises a bad
+        // electrode to its two traces; "car" = minus the common average; "mono" = raw as-recorded.
+        // This is the same idea REACT's Review montage already applies, which is why a recording
+        // reads clean in Review (bipolar) while a mono live trace of the same data looks noisy.
+        const mode = derivRef.current;
+        const valAt = (c, ri) => {
+          if (mode === "bipolar") { const nx = (c + 1) % n; return view.ring[c][ri] - view.ring[nx][ri]; }
+          if (mode === "car") { let s = 0; for (let k = 0; k < n; k++) s += view.ring[k][ri]; return view.ring[c][ri] - s / n; }
+          return view.ring[c][ri];
+        };
+        const laneLabel = (c) => mode === "bipolar" ? `${labels[c]}-${labels[(c + 1) % n]}` : labels[c];
         // header: fixed window length + status
         ctx.font = "9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "top"; ctx.textAlign = "left";
         ctx.fillStyle = recording ? "#EF4444" : "#10B981";
         const modeTag = filtered ? (filterText ? `FILT ${filterText}` : "FILT") : "RAW";
-        ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s · ${modeTag}`, labelW + 6, 4);
+        const derivTag = mode === "bipolar" ? "BIP" : mode === "car" ? "CAR" : "REF";
+        ctx.fillText(`${recording ? "● REC" : "● LIVE"}  ${labels.length}ch · ${view.sr}Hz · ${(cap / view.sr).toFixed(0)}s · ${derivTag} · ${modeTag} · ${effSens}mm/µV`, labelW + 6, 4);
         // rx-rate readout — green when flowing, amber when stalled (data stopped arriving).
         const rx = rxRateRef.current;
         ctx.fillStyle = rx > 0 ? "#10B981" : "#F59E0B"; ctx.textAlign = "right";
@@ -10209,47 +10237,41 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
         ctx.textAlign = "left";
         const dropped = droppedRef?.current || 0;
         if (dropped > 0) { ctx.fillStyle = "#F59E0B"; ctx.textAlign = "right"; ctx.fillText(`${dropped} dropped`, W - 6, 4); ctx.textAlign = "left"; }
-        // Robust per-lane scaling, recomputed ~5x/s and cached. Center each lane on its DC mean
-        // and scale to a multiple of the mean-removed RMS (σ). Floating/unconnected inputs have
-        // huge DC offsets (tens of thousands of µV) and occasional rail spikes; the old
-        // peak(|x|) over the 30 s window pinned the scale and flattened the trace (looked
-        // "frozen"). σ-based scaling ignores DC and resists single spikes; the trace is clamped
-        // to its lane so a spike can't bleed into neighbours. Cheap: two short passes per lane.
-        if (nowMs - scaleRef.current.t > 200 || scaleRef.current.means.length !== n) {
-          // Scale to the most recent ~4 s (not the whole 30 s), so a connection-time filter
-          // transient or an old artifact scrolls out of the scale quickly instead of holding
-          // the trace flat for the full window.
-          const recent = Math.min(count, Math.round((view.sr || 250) * 4));
-          const means = new Array(n), scales = new Array(n);
+        // Per-lane DC baseline for POSITION-ONLY centering, CAPTURED ONCE per (filter, derivation,
+        // channel-set) and then HELD CONSTANT. This is the fix for the "sway": the y-transform MUST be
+        // time-invariant, so a sample already drawn NEVER moves. Re-subtracting a freshly-computed mean
+        // each frame made the whole laid-down waveform drift vertically in unison (the shared common-
+        // mode drift moved every lane's mean together). In the filtered view the HPF already zero-
+        // centres so this baseline is ~0; in raw view it captures the DC offset once. It re-captures
+        // ONLY when the user flips filter/derivation or reconnects (baseKey changes) — never per frame.
+        const baseKey = `${filtered ? "F" : "R"}|${mode}|${n}`;
+        const haveBase = scaleRef.current.key === baseKey && scaleRef.current.means && scaleRef.current.means.length === n;
+        if (!haveBase && count >= Math.min(cap, Math.round((view.sr || 250) * 0.5))) {
+          const recent = Math.min(count, Math.round((view.sr || 250) * 2));
+          const means = new Array(n);
           for (let c = 0; c < n; c++) {
-            const ring = view.ring[c];
             let sum = 0, cnt = 0;
-            for (let j = 0; j < recent; j += step) { sum += ring[idxAt(j)]; cnt++; }
-            const mean = cnt ? sum / cnt : 0;
-            let ss = 0; for (let j = 0; j < recent; j += step) { const d = ring[idxAt(j)] - mean; ss += d * d; }
-            const std = cnt ? Math.sqrt(ss / cnt) : 0;
-            means[c] = mean;
-            scales[c] = (laneH * 0.42) / (Math.max(std, 0.5) * 3.5); // ~3.5σ fills the lane half
+            for (let j = 0; j < recent; j += step) { sum += valAt(c, idxAt(j)); cnt++; }
+            means[c] = cnt ? sum / cnt : 0;  // one-shot capture, then frozen
           }
-          scaleRef.current = { t: nowMs, means, scales };
+          scaleRef.current = { key: baseKey, means };
         }
-        const laneMeans = scaleRef.current.means, laneScales = scaleRef.current.scales;
+        const laneMeans = (scaleRef.current.key === baseKey && scaleRef.current.means) ? scaleRef.current.means : null;
         for (let c = 0; c < n; c++) {
-          const ring = view.ring[c];
           const yCenter = laneH * (c + 0.5);
-          const chScale = laneScales[c] || 1, chMean = laneMeans[c] || 0;
+          const chMean = laneMeans ? (laneMeans[c] || 0) : 0;
           const yTop = yCenter - laneH * 0.46, yBot = yCenter + laneH * 0.46;
           // lane separator + label
           ctx.strokeStyle = "#141414"; ctx.lineWidth = 1;
           ctx.beginPath(); ctx.moveTo(labelW, yCenter + laneH / 2); ctx.lineTo(W, yCenter + laneH / 2); ctx.stroke();
           ctx.fillStyle = "#6c8088"; ctx.font = "600 9px 'IBM Plex Mono', monospace"; ctx.textBaseline = "middle"; ctx.textAlign = "right";
-          ctx.fillText(labels[c], labelW - 6, yCenter);
-          // trace — DC-removed, σ-scaled, clamped to the lane. newest→oldest, right edge = now.
+          ctx.fillText(laneLabel(c), labelW - 6, yCenter);
+          // trace — re-referenced (per mode), DC-centered, FIXED µV/px (no auto-gain), lane-clamped.
           ctx.strokeStyle = "#1a8fff"; ctx.lineWidth = 0.9; ctx.beginPath();
           let first = true;
           for (let j = 0; j < count; j += step) {
             const x = xForAge(j);
-            let y = yCenter - (ring[idxAt(j)] - chMean) * chScale;
+            let y = yCenter - (valAt(c, idxAt(j)) - chMean) * pxPerUv;
             if (y < yTop) y = yTop; else if (y > yBot) y = yBot;
             if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
           }
@@ -10271,7 +10293,7 @@ function LiveWaveform({ rawRef, filtRef, filtered = false, active, recording, dr
 // last ~2 s: RMS (µV), whether mains (50/60 Hz) dominates, and a live/flatline/noisy status —
 // so a floating or badly-seated electrode is obvious at a glance. Compact + scrollable so it
 // fits the small appliance screen (≥ ~800×480). Pure metrics live in ./live-metrics.js.
-function LiveChannelPanel({ rawRef, active, mains = 60 }) {
+function LiveChannelPanel({ rawRef, leadoffRef, active, mains = 60 }) {
   const [rows, setRows] = useState([]);
   useEffect(() => {
     if (!active) { setRows([]); return; }
@@ -10280,11 +10302,19 @@ function LiveChannelPanel({ rawRef, active, mains = 60 }) {
       if (!view || view.count === 0) { setRows([]); return; }
       const { ring, labels, sr, cap, head, count } = view;
       const win = Math.min(count, Math.round(sr * 2));
+      // Hardware lead-off/contact (ADS1299), if the server sends it — used only while fresh (~3 s),
+      // so it never lingers after the stream stops or the device stops reporting it.
+      const lo = leadoffRef && leadoffRef.current;
+      const fresh = lo && (performance.now() - lo.t) < 3000;   // hardware contact used only while fresh (~3 s)
+      const offArr = (fresh && Array.isArray(lo.off)) ? lo.off : null;
+      const stateArr = (fresh && Array.isArray(lo.state)) ? lo.state : null;
       const out = labels.map((lab, c) => {
         const w = new Float32Array(win);
         for (let j = 0; j < win; j++) w[j] = ring[c][(head - win + j + cap * 2) % cap];
         const q = channelQuality(w, sr, { mains });
-        return { label: lab, stdUv: q.stdUv, mains60: q.mains60, status: q.status };
+        // Contact verdict: prefer the server's green/amber/red `state`; else derive from the off flag.
+        const contact = (stateArr && stateArr[c]) ? stateArr[c] : (offArr ? (offArr[c] === true ? "red" : "green") : null);
+        return { label: lab, stdUv: q.stdUv, mains60: q.mains60, status: q.status, contact };
       });
       setRows(out);
     };
@@ -10299,8 +10329,14 @@ function LiveChannelPanel({ rawRef, active, mains = 60 }) {
     flatline: { color: "#555",    label: "FLAT" },
     noisy:    { color: "#F59E0B", label: "NOISY" },
   };
+  // Hardware electrode-contact verdict (ADS1299 lead-off, when the server reports it).
+  const CONTACT = {
+    green: { color: "#22c55e", label: "OK",  title: "Good electrode contact (both inputs connected)" },
+    amber: { color: "#F59E0B", label: "½",   title: "Partial contact — one input off (a lost shared reference shows every channel amber)" },
+    red:   { color: "#ef4444", label: "OFF", title: "No electrode contact (lead-off — both inputs floating)" },
+  };
   return (
-    <div data-tut="Channel check: A live bring-up readout, one row per channel, from the last ~2 s of raw signal. The dot is the verdict — green LIVE (plausible EEG), grey FLAT (dead/floating input), amber NOISY (railed or mains-dominated). The number is RMS in µV; ⌁60 flags a channel swamped by mains hum. Use it to spot a loose or badly-seated electrode at a glance." style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
+    <div data-tut="Channel check: A live bring-up readout, one row per channel, from the last ~2 s of raw signal. The dot is the verdict — green LIVE (plausible EEG), grey FLAT (dead/floating input), amber NOISY (railed or mains-dominated). The number is RMS in µV; ⌁60 flags a channel swamped by mains hum. When the device reports lead-off (e.g. the PiEEG's ADS1299), a contact chip shows OK (green) / ½ (amber — one input off; a lost shared reference makes every channel amber) / OFF (red — no contact). Use it to spot a loose or badly-seated electrode at a glance." style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
       <div style={{ padding: "6px 8px", borderBottom: "1px solid #1a1a1a", fontSize: 9, letterSpacing: "0.12em", color: "#6c8088", fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
         <span>CHANNEL CHECK</span><span style={{ color: "#444" }}>RMS µV</span>
       </div>
@@ -10308,13 +10344,17 @@ function LiveChannelPanel({ rawRef, active, mains = 60 }) {
         {rows.length === 0 && <div style={{ padding: "8px", fontSize: 10, color: "#666" }}>waiting for samples…</div>}
         {rows.map((r, i) => {
           const s = STATUS[r.status] || STATUS.flatline;
+          const cc = CONTACT[r.contact];   // hardware contact verdict, if the server reports lead-off
+          // A bad contact (red/amber) makes the waveform verdict meaningless, so let it drive the dot.
+          const dotColor = (r.contact === "red" || r.contact === "amber") ? cc.color : s.color;
           return (
-            <div key={i} title={`${r.label}: ${s.label}${r.mains60 ? " · 60 Hz dominant" : ""} · σ ${r.stdUv.toFixed(1)} µV`}
+            <div key={i} title={`${r.label}: ${s.label}${cc ? " · contact " + cc.label : ""}${r.mains60 ? " · 60 Hz dominant" : ""} · σ ${r.stdUv.toFixed(1)} µV`}
               style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", borderBottom: "1px solid #111", fontSize: 10 }}>
-              <span style={{ width: 7, height: 7, borderRadius: "50%", background: s.color, flexShrink: 0 }} />
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, flexShrink: 0 }} />
               <span style={{ width: 40, color: "#aaa", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.label}</span>
               <span style={{ flex: 1, textAlign: "right", color: r.status === "flatline" ? "#555" : "#cbd5d9" }}>{r.stdUv.toFixed(1)}</span>
               {r.mains60 && <span style={{ color: "#F59E0B", fontSize: 8, fontWeight: 700 }} title="Mains (60 Hz) dominates this channel">⌁60</span>}
+              {cc && <span style={{ color: cc.color, fontSize: 8, fontWeight: 700, letterSpacing: "0.06em" }} title={cc.title}>{cc.label}</span>}
             </div>
           );
         })}
@@ -10505,9 +10545,17 @@ function AcquireTab() {
   const handleConnectRef = useRef(null);   // latest handleConnect, so a scheduled reconnect calls the current one
   const stopRecordingRef = useRef(null);  // late-bound so the cap guard can flush a recording
   const liveImpedanceSupportedRef = useRef(false); // whether the connected device measures impedance
+  const liveLeadoffRef = useRef(null); // latest ADS1299 lead-off/contact status: { off:[bool…], t } (or null)
   const [liveConfig, setLiveConfig] = useState(null); // adopted server/bridge config shown in the UI
   const [liveFilterOn, setLiveFilterOn] = useState(true); // live trace shows filtered (true) or raw (false)
   const [liveVerifyOn, setLiveVerifyOn] = useState(true); // show the per-channel verification panel
+  // Live-trace re-reference (display only; captured EDF stays raw µV): "mono" = raw referential
+  // (the honest, unaltered per-electrode view — the default, and the truest electrode-quality
+  // readout), "car" = minus the common average (removes shared/common-mode noise), "bipolar" =
+  // each electrode minus its ring-closed neighbour. NOTE: with FLOATING / high-impedance electrodes
+  // the noise is largely INDEPENDENT per channel, so no re-reference makes it look clean — that only
+  // comes from real low-impedance scalp contact (measured on-wire: bipolar 1.0x, CAR ~1.3x).
+  const [liveDeriveMode, setLiveDeriveMode] = useState("mono");
 
   // (Re)allocate buffers for a given channel set + rate (on connect and on welcome adoption).
   // Two rolling rings are kept: RAW (capture-independent preview + the per-channel verification
@@ -10615,8 +10663,9 @@ function AcquireTab() {
       const labels = (mapped && mapped.length === c.channels) ? mapped : c.labels;
       allocLiveBuffers(labels, c.sampleRate, 1);   // µV already; no scaling
       liveNRef.current = null;
-      liveImpedanceSupportedRef.current = false;   // pieeg-server has no impedance frame
-      setLiveConfig({ device: c.device, sampleRate: c.sampleRate, channels: c.channels, labels, protocol: c.protocol, impedanceSupported: false, mock: false });
+      liveImpedanceSupportedRef.current = c.impedanceSupported;   // ADS1299 lead-off contact detection, if advertised
+      liveLeadoffRef.current = null;                              // drop any stale contact status on (re)connect
+      setLiveConfig({ device: c.device, sampleRate: c.sampleRate, channels: c.channels, labels, protocol: c.protocol, impedanceSupported: c.impedanceSupported, mock: false });
       // Force a RAW stream: the server bandpass-filters by default, but capture must be raw µV
       // and REACT does its own display filtering. Disable both server-side filters.
       try {
@@ -10641,6 +10690,10 @@ function AcquireTab() {
         liveNRef.current = res.n;
       }
       appendSamples(res.rows);
+    } else if (res.kind === "leadoff") {
+      // Per-electrode contact status (ADS1299 lead-off) — display only, out-of-band from the sample
+      // stream, timestamped so the panel drops it once stale. Never touches the capture buffer.
+      liveLeadoffRef.current = { off: res.off, state: res.state, t: performance.now() };
     }
     // all other server status messages → ignored by decodePieegMessage
   };
@@ -11039,19 +11092,32 @@ function AcquireTab() {
         )}/>
 
       <div style={{flex:1,display:"flex",overflow:"hidden"}}>
-       <div data-tut="Live trace: A rolling multi-channel strip pinned to now — the newest sample is at the right edge and each lane auto-scales to its own recent peak. The header shows channels · rate · window · RAW/FILTERED and any dropped-sample count. It streams the moment you connect, before and during recording." style={{flex:1,position:"relative",overflow:"hidden",display:"flex",flexDirection:"column"}}>
+       <div data-tut="Live trace: A rolling multi-channel strip pinned to now — the newest sample is at the right edge and each lane is drawn at a FIXED µV sensitivity (adjust with −/+) — true, unaltered amplitude so electrode signal quality reads honestly. The header shows channels · rate · window · RAW/FILTERED · sensitivity and any dropped-sample count. It streams the moment you connect, before and during recording." style={{flex:1,position:"relative",overflow:"hidden",display:"flex",flexDirection:"column"}}>
         {/* Live rolling trace from the acquisition ring — overlays the (empty) epoch viewer while
             connected so you see the incoming signal live, before and during recording. The trace
             shows the FILTERED ring (toggleable); capture stays raw. */}
         {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && (
           <LiveWaveform rawRef={liveViewRef} filtRef={liveFiltViewRef} filtered={liveFilterOn}
-            filterText={`${eeg.hpf||0}–${eeg.lpf||0}·N${eeg.notch||0}`}
+            filterText={`${eeg.hpf||0}–${eeg.lpf||0}·N${eeg.notch||0}`} sensitivity={eeg.sensitivity}
+            deriveMode={liveDeriveMode}
             active={connectionState >= CONN.connected}
             recording={isRecording && !isPaused} droppedRef={liveDroppedRef} rxRef={liveRxRef}/>
         )}
         {/* Live view toggles: raw/filtered trace + show/hide the channel-check panel */}
         {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && connectionState >= CONN.connected && (
           <div style={{position:"absolute",top:6,right:8,zIndex:10,display:"flex",gap:6}}>
+            <div data-tut="Sensitivity: Sets the LIVE TRACE amplitude scale — the same fixed µV sensitivity used in Review, so the live signal is shown at its true amplitude and matches what the recording plays back. Display only; the captured EDF is always raw µV. Use −/+ to make the waveforms taller or shorter." title="Live trace sensitivity (fixed µV amplitude scale — display only; capture stays raw µV)"
+              style={{display:"flex",alignItems:"center",background:"#0d0d0d",border:"1px solid #2a2a2a"}}>
+              <button onClick={()=>eeg.setSensitivity(p=>Math.max(p-1,SENSITIVITY_MIN))} title="Decrease sensitivity (shorter waveforms)"
+                style={{background:"none",border:"none",color:"#888",cursor:"pointer",fontSize:12,fontWeight:700,lineHeight:1,padding:"3px 6px",fontFamily:"'IBM Plex Mono', monospace"}}>−</button>
+              <span style={{fontSize:9,color:"#7ec8d9",fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",minWidth:46,textAlign:"center",letterSpacing:"0.04em"}}>{eeg.sensitivity} mm/µV</span>
+              <button onClick={()=>eeg.setSensitivity(p=>Math.min(p+1,SENSITIVITY_MAX))} title="Increase sensitivity (taller waveforms)"
+                style={{background:"none",border:"none",color:"#888",cursor:"pointer",fontSize:12,fontWeight:700,lineHeight:1,padding:"3px 6px",fontFamily:"'IBM Plex Mono', monospace"}}>+</button>
+            </div>
+            <button title="Live trace reference: BIP (bipolar — each electrode minus its neighbour; cancels common-mode noise like the PiEEG Scope) → CAR (minus the common average) → REF (raw referential / monopolar). Display only — the recorded EDF is always raw µV."
+              data-tut="Reference (BIP / CAR / REF): How the LIVE TRACE is derived for display. BIP (bipolar) subtracts neighbouring electrodes to cancel shared common-mode noise — the clean, clinical view your PiEEG Scope uses, and the best way to spot a single bad electrode. CAR subtracts the common average. REF shows raw single-electrode (referential) traces. Display only — the captured EDF is always raw µV either way."
+              onClick={()=>setLiveDeriveMode(m=>m==="bipolar"?"car":m==="car"?"mono":"bipolar")}
+              style={{padding:"3px 8px",background:"#0d0d0d",border:`1px solid ${liveDeriveMode==="mono"?"#2a2a2a":"#2a4a54"}`,color:liveDeriveMode==="mono"?"#888":"#7ec8d9",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>{liveDeriveMode==="bipolar"?"BIP":liveDeriveMode==="car"?"CAR":"REF"}</button>
             <button data-tut="Filtered / Raw: Switches the LIVE TRACE between the in-app filtered view (HPF/LPF/notch from the toolbar, applied by a streaming filter) and the raw amplifier signal. This is display only — the recorded EDF is always raw µV either way." onClick={()=>setLiveFilterOn(v=>!v)} title="Toggle the live trace between raw and filtered (display only — the captured EDF is always raw)"
               style={{padding:"3px 8px",background:"#0d0d0d",border:"1px solid #2a2a2a",color:liveFilterOn?"#7ec8d9":"#888",cursor:"pointer",fontSize:9,fontWeight:700,fontFamily:"'IBM Plex Mono', monospace",letterSpacing:"0.06em"}}>{liveFilterOn?"FILTERED":"RAW"}</button>
             <button data-tut="CHK: Shows or hides the per-channel verification panel on the right — a live RMS / mains / status readout for judging electrode contact during bring-up." onClick={()=>setLiveVerifyOn(v=>!v)} title="Show/hide the per-channel verification panel"
@@ -11117,7 +11183,7 @@ function AcquireTab() {
        </div>
        {/* Per-channel verification panel (bring-up): RMS / mains / live·flat·noisy per channel */}
        {(selectedDevice?.protocol === "pieeg-server" || selectedDevice?.protocol === "websocket") && liveVerifyOn && connectionState >= CONN.connected && (
-         <LiveChannelPanel rawRef={liveViewRef} active={true} mains={eeg.notch || 60}/>
+         <LiveChannelPanel rawRef={liveViewRef} leadoffRef={liveLeadoffRef} active={true} mains={eeg.notch || 60}/>
        )}
       </div>
 
