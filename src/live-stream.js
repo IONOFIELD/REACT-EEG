@@ -165,12 +165,30 @@ export function normalizePieegWelcome(msg) {
     // it cannot detect an unlabeled synthetic feed, so a real session depends on the Pi never
     // running --mock (and now advertising it) — the one integrity check REACT can't self-enforce.
     mock: m.mock === true,                    // synthetic-data mode — client must refuse
-    impedanceSupported: false,               // pieeg-server has no impedance frame
+    // Contact detection: a server that emits {status:"leadoff"} frames (ADS1299 lead-off) advertises
+    // it here as impedance_supported:true; the client then shows a per-electrode contact readout.
+    impedanceSupported: m.impedance_supported === true,
   };
 }
 
+// Normalize a pieeg-server lead-off status frame ({status:"leadoff", channels:[{ch,off}, …]}) into a
+// 0-indexed boolean array where off[i] === true means channel i+1's electrode is NOT making contact
+// (ADS1299 LOFF_STATP/N set). Tolerant of sparse / unordered / missing entries; unknown channels are
+// false. `ch` is 1-based (matching the ADS1299 CH1..CHN numbering the server reports).
+export function normalizePieegLeadoff(list) {
+  if (!Array.isArray(list)) return [];
+  let maxCh = 0;
+  for (const e of list) { const c = e && Math.floor(Number(e.ch)); if (Number.isFinite(c) && c > maxCh) maxCh = c; }
+  const off = new Array(maxCh).fill(false);
+  for (const e of list) {
+    const c = e && Math.floor(Number(e.ch));
+    if (Number.isFinite(c) && c >= 1 && c <= maxCh) off[c - 1] = e.off === true;
+  }
+  return off;
+}
+
 // Decode one pieeg-server WebSocket message (JSON text; tolerant of a UTF-8 binary payload).
-// → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"ignore" }
+// → { kind:"welcome", config } | { kind:"samples", rows:[[…]], n } | { kind:"leadoff", off:[…] } | { kind:"ignore" }
 // Sample iff `n` is a number AND `channels` is an array. Welcome iff status==="connected" (the
 // vendor server.py form) OR type==="hello" (the kiosk ws_server.py / hardened demo_stream.py form,
 // which carries the same sample_rate + channels) — both are normalized identically so the client
@@ -191,6 +209,12 @@ export function decodePieegMessage(data) {
   let msg; try { msg = JSON.parse(text); } catch { return { kind: "ignore" }; }
   if (!msg || typeof msg !== "object") return { kind: "ignore" };
   if (msg.status === "connected" || msg.type === "hello") return { kind: "welcome", config: normalizePieegWelcome(msg) };
+  // Lead-off / electrode-contact status (ADS1299). Distinct from a sample frame: it carries no
+  // numeric `n`, and `channels` is a list of {ch,off} objects (not numbers), so it can never be
+  // mistaken for — nor corrupt — the raw sample path.
+  if (msg.status === "leadoff" && Array.isArray(msg.channels)) {
+    return { kind: "leadoff", off: normalizePieegLeadoff(msg.channels), t: typeof msg.ts === "number" ? msg.ts : null };
+  }
   if (typeof msg.n === "number" && Array.isArray(msg.channels)) {
     return { kind: "samples", rows: [msg.channels.map(Number)], n: msg.n, t: typeof msg.t === "number" ? msg.t : null };
   }
