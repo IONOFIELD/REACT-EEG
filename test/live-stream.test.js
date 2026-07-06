@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   LIVE_PROTOCOL, impedanceStatus, unitToMicrovolts, normalizeHello,
   decodeImpedance, deinterleave, scaleRows, gapBatches, decodeMessage,
-  normalizePieegWelcome, decodePieegMessage,
+  normalizePieegWelcome, decodePieegMessage, normalizePieegLeadoff, normalizePieegContactState,
 } from "../src/live-stream.js";
 
 describe("impedanceStatus", () => {
@@ -262,5 +262,66 @@ describe("decodePieegMessage", () => {
     expect(gapBatches(41, 42)).toBe(0);   // in order
     expect(gapBatches(41, 45)).toBe(3);   // 42,43,44 dropped
     expect(gapBatches(41, 41)).toBe(0);   // duplicate / restart
+  });
+});
+
+// ── pieeg lead-off / electrode-contact detection (ADS1299 LOFF) ──
+describe("normalizePieegLeadoff", () => {
+  it("maps [{ch,off}] to a 0-indexed boolean array (ch is 1-based)", () => {
+    expect(normalizePieegLeadoff([{ ch: 1, off: true }, { ch: 2, off: false }])).toEqual([true, false]);
+  });
+  it("handles sparse + unordered channels, filling gaps with false", () => {
+    expect(normalizePieegLeadoff([{ ch: 3, off: true }, { ch: 1, off: false }])).toEqual([false, false, true]);
+  });
+  it("treats off strictly (only boolean true = off) and skips junk / out-of-range entries", () => {
+    // "true"/1 are NOT off — an electrode is only reported off on a real boolean true.
+    expect(normalizePieegLeadoff([{ ch: 1, off: "true" }, { ch: 2, off: 1 }, { ch: 3, off: true }])).toEqual([false, false, true]);
+    expect(normalizePieegLeadoff([{ off: true }, null, { ch: 0, off: true }, { ch: 2, off: true }])).toEqual([false, true]);
+  });
+  it("returns [] for a non-array", () => {
+    for (const x of [null, undefined, {}, "leadoff", 5]) expect(normalizePieegLeadoff(x)).toEqual([]);
+  });
+});
+
+describe("decodePieegMessage — lead-off + contact detection", () => {
+  it("decodes a {status:'leadoff'} frame to a per-channel off array + timestamp", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "leadoff", channels: [{ ch: 1, off: true }, { ch: 2, off: false }], ts: 1711234567.5 }));
+    expect(r.kind).toBe("leadoff");
+    expect(r.off).toEqual([true, false]);
+    expect(r.t).toBe(1711234567.5);
+  });
+  it("a lead-off frame has no numeric n → is never mistaken for a sample batch (ts absent → t null)", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "leadoff", channels: [{ ch: 1, off: false }] }));
+    expect(r.kind).toBe("leadoff");
+    expect(r.t).toBe(null);
+  });
+  it("a malformed lead-off frame (no / non-array channels) is ignored, not decoded", () => {
+    expect(decodePieegMessage(JSON.stringify({ status: "leadoff" })).kind).toBe("ignore");
+    expect(decodePieegMessage(JSON.stringify({ status: "leadoff", channels: "nope" })).kind).toBe("ignore");
+  });
+  it("welcome advertises contact detection only when impedance_supported === true (strict boolean)", () => {
+    expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, impedance_supported: true })).config.impedanceSupported).toBe(true);
+    expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8 })).config.impedanceSupported).toBe(false);
+    expect(decodePieegMessage(JSON.stringify({ status: "connected", channels: 8, impedance_supported: "true" })).config.impedanceSupported).toBe(false);
+  });
+  it("decodes the green/amber/red contact state alongside the off flags", () => {
+    const r = decodePieegMessage(JSON.stringify({ status: "leadoff", channels: [{ ch: 1, off: false, state: "green" }, { ch: 2, off: true, state: "red" }], ts: 100 }));
+    expect(r.kind).toBe("leadoff");
+    expect(r.off).toEqual([false, true]);
+    expect(r.state).toEqual(["green", "red"]);
+  });
+});
+
+describe("normalizePieegContactState", () => {
+  it("maps the green/amber/red verdict per channel (0-indexed, ch 1-based)", () => {
+    expect(normalizePieegContactState([{ ch: 1, state: "green" }, { ch: 2, state: "amber" }, { ch: 3, state: "red" }]))
+      .toEqual(["green", "amber", "red"]);
+  });
+  it("nulls unknown / missing state and fills gaps with null", () => {
+    expect(normalizePieegContactState([{ ch: 2, state: "red" }, { ch: 1 }, { ch: 3, state: "bogus" }]))
+      .toEqual([null, "red", null]);
+  });
+  it("returns [] for a non-array (older servers omit state entirely)", () => {
+    for (const x of [undefined, null, "red", 3]) expect(normalizePieegContactState(x)).toEqual([]);
   });
 });
