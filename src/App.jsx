@@ -84,6 +84,13 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v20.0", items: [
+    "Native desktop app — REACT EEG now installs and runs as a standalone Windows application (Tauri / WebView2): its own window, no browser and no terminal, with records persisted under Documents\\REACT EEG. Launch from the desktop shortcut; rebuild with `npm run build:desktop`",
+    "Hardened live streaming to the PiEEG — the Record tab can connect over an encrypted, token-authenticated WebSocket (wss://<host>:1621): the client sends a shared token as its first message and trusts the Pi's certificate via the OS trust store, so live EEG crosses the wire encrypted. The token is loaded at runtime from an external file — never bundled, logged, or placed in the URL",
+    "The live decoder adopts either handshake — the vendor {status:\"connected\"} welcome or the kiosk/demo {type:\"hello\"} welcome — taking the stream's declared sample rate and channel count from whichever the server sends",
+    "Pull recorded sessions from the PiEEG — a new Record-tab panel lists the Pi's on-device recordings and imports one as EDF+ straight into the library through the normal de-identify path",
+    "Privacy hardening — the whole-library backup export now runs the same free-text PHI scan as the patient-package and .reegb exports before writing, and a .reegb bundle round-trips a pinned baseline losslessly (previously dropped on re-import)",
+  ]},
   { version: "v19.0", items: [
     "Live PiEEG acquisition — the Record tab connects directly to the vendor pieeg-server (ws://<host>:1616), adopts its declared sample rate and channel count, and forces a raw µV stream (disabling the server-side filter) so captures stay unfiltered. Refuses a synthetic (--mock) stream outright — REACT never displays or records fabricated data",
     "Live trace + per-channel verification panel for hardware bring-up — a rolling now-pinned strip (raw or in-app-filtered via a new streaming filter) plus a live RMS / mains-dominance / live·flatline·noisy readout per channel, so a floating or badly-seated electrode is obvious at a glance. Dropped samples are flagged and reconciled into the recorded timeline",
