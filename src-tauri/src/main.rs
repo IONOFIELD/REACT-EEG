@@ -82,6 +82,17 @@ fn load_config() -> String {
     if s.is_empty() { "{}".to_string() } else { s }
 }
 
+// ── Hardened-demo token ──────────────────────────────────────────────────────
+// The shared secret for the Pi's wss demo endpoint. Read at RUNTIME from an external file
+// (`<Documents>/REACT EEG/demo_token`) so it is NEVER baked into the app bundle, never logged,
+// never placed in a URL. Returns "" if absent — the frontend then surfaces a clear error and the
+// server closes the socket 4401. The operator drops the token file there once (see docs).
+
+#[tauri::command]
+fn load_demo_token() -> String {
+    read_string(&data_dir().join("demo_token")).trim().to_string()
+}
+
 // ── Library index ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -261,6 +272,7 @@ fn main() {
             initialize_app,
             get_data_directory,
             load_config,
+            load_demo_token,
             load_library_index,
             save_library_index,
             save_annotations,

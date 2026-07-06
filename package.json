@@ -9,6 +9,7 @@
     "build": "vite build",
     "build:single": "vite build --mode singlefile",
     "build:tauri": "vite build --mode tauri",
+    "build:desktop": "node scripts/build-desktop.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
