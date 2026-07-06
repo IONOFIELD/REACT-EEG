@@ -88,7 +88,7 @@ const CHANGELOG = [
     "Live trace now renders at a FIXED, true-µV sensitivity instead of auto-scaling — the amplitude no longer jitters as the signal varies, so it reads honestly for judging electrode quality; a new Sens −/+ control and header readout set the µV/div (matching Review)",
     "Live trace holds still — a peak, once drawn, keeps its exact position as it scrolls (the display baseline is captured once and frozen), fixing the whole-waveform vertical sway",
     "Live re-reference toggle (REF / CAR / BIP) — view the live trace as raw referential, common-average, or a bipolar chain that cancels shared common-mode noise (display only; the recorded EDF is always raw µV)",
-    "Groundwork for per-electrode contact detection — the Channel Check panel shows a red OFF badge for any electrode a lead-off-capable server reports as not making contact",
+    "Per-electrode contact readout — when the device reports lead-off (e.g. the PiEEG's ADS1299), the Channel Check panel shows a green/amber/red contact chip per electrode (good contact / one input off / no contact), display-only",
   ]},
   { version: "v20.0", items: [
     "Native desktop app — REACT EEG now installs and runs as a standalone Windows application (Tauri / WebView2): its own window, no browser and no terminal, with records persisted under Documents\\REACT EEG. Launch from the desktop shortcut; rebuild with `npm run build:desktop`",
@@ -10305,12 +10305,16 @@ function LiveChannelPanel({ rawRef, leadoffRef, active, mains = 60 }) {
       // Hardware lead-off/contact (ADS1299), if the server sends it — used only while fresh (~3 s),
       // so it never lingers after the stream stops or the device stops reporting it.
       const lo = leadoffRef && leadoffRef.current;
-      const offArr = (lo && Array.isArray(lo.off) && (performance.now() - lo.t) < 3000) ? lo.off : null;
+      const fresh = lo && (performance.now() - lo.t) < 3000;   // hardware contact used only while fresh (~3 s)
+      const offArr = (fresh && Array.isArray(lo.off)) ? lo.off : null;
+      const stateArr = (fresh && Array.isArray(lo.state)) ? lo.state : null;
       const out = labels.map((lab, c) => {
         const w = new Float32Array(win);
         for (let j = 0; j < win; j++) w[j] = ring[c][(head - win + j + cap * 2) % cap];
         const q = channelQuality(w, sr, { mains });
-        return { label: lab, stdUv: q.stdUv, mains60: q.mains60, status: q.status, off: offArr ? offArr[c] === true : null };
+        // Contact verdict: prefer the server's green/amber/red `state`; else derive from the off flag.
+        const contact = (stateArr && stateArr[c]) ? stateArr[c] : (offArr ? (offArr[c] === true ? "red" : "green") : null);
+        return { label: lab, stdUv: q.stdUv, mains60: q.mains60, status: q.status, contact };
       });
       setRows(out);
     };
@@ -10325,8 +10329,14 @@ function LiveChannelPanel({ rawRef, leadoffRef, active, mains = 60 }) {
     flatline: { color: "#555",    label: "FLAT" },
     noisy:    { color: "#F59E0B", label: "NOISY" },
   };
+  // Hardware electrode-contact verdict (ADS1299 lead-off, when the server reports it).
+  const CONTACT = {
+    green: { color: "#22c55e", label: "OK",  title: "Good electrode contact (both inputs connected)" },
+    amber: { color: "#F59E0B", label: "½",   title: "Partial contact — one input off (a lost shared reference shows every channel amber)" },
+    red:   { color: "#ef4444", label: "OFF", title: "No electrode contact (lead-off — both inputs floating)" },
+  };
   return (
-    <div data-tut="Channel check: A live bring-up readout, one row per channel, from the last ~2 s of raw signal. The dot is the verdict — green LIVE (plausible EEG), grey FLAT (dead/floating input), amber NOISY (railed or mains-dominated). The number is RMS in µV; ⌁60 flags a channel swamped by mains hum. Use it to spot a loose or badly-seated electrode at a glance." style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
+    <div data-tut="Channel check: A live bring-up readout, one row per channel, from the last ~2 s of raw signal. The dot is the verdict — green LIVE (plausible EEG), grey FLAT (dead/floating input), amber NOISY (railed or mains-dominated). The number is RMS in µV; ⌁60 flags a channel swamped by mains hum. When the device reports lead-off (e.g. the PiEEG's ADS1299), a contact chip shows OK (green) / ½ (amber — one input off; a lost shared reference makes every channel amber) / OFF (red — no contact). Use it to spot a loose or badly-seated electrode at a glance." style={{ display: "flex", flexDirection: "column", height: "100%", background: "#0a0a0a", borderLeft: "1px solid #1a1a1a", fontFamily: "'IBM Plex Mono', monospace", minWidth: 168 }}>
       <div style={{ padding: "6px 8px", borderBottom: "1px solid #1a1a1a", fontSize: 9, letterSpacing: "0.12em", color: "#6c8088", fontWeight: 700, display: "flex", justifyContent: "space-between" }}>
         <span>CHANNEL CHECK</span><span style={{ color: "#444" }}>RMS µV</span>
       </div>
@@ -10334,14 +10344,17 @@ function LiveChannelPanel({ rawRef, leadoffRef, active, mains = 60 }) {
         {rows.length === 0 && <div style={{ padding: "8px", fontSize: 10, color: "#666" }}>waiting for samples…</div>}
         {rows.map((r, i) => {
           const s = STATUS[r.status] || STATUS.flatline;
+          const cc = CONTACT[r.contact];   // hardware contact verdict, if the server reports lead-off
+          // A bad contact (red/amber) makes the waveform verdict meaningless, so let it drive the dot.
+          const dotColor = (r.contact === "red" || r.contact === "amber") ? cc.color : s.color;
           return (
-            <div key={i} title={`${r.label}: ${s.label}${r.off === true ? " · LEAD-OFF (no contact)" : ""}${r.mains60 ? " · 60 Hz dominant" : ""} · σ ${r.stdUv.toFixed(1)} µV`}
+            <div key={i} title={`${r.label}: ${s.label}${cc ? " · contact " + cc.label : ""}${r.mains60 ? " · 60 Hz dominant" : ""} · σ ${r.stdUv.toFixed(1)} µV`}
               style={{ display: "flex", alignItems: "center", gap: 6, padding: "3px 8px", borderBottom: "1px solid #111", fontSize: 10 }}>
-              <span style={{ width: 7, height: 7, borderRadius: "50%", background: r.off === true ? "#ef4444" : s.color, flexShrink: 0 }} />
+              <span style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, flexShrink: 0 }} />
               <span style={{ width: 40, color: "#aaa", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.label}</span>
               <span style={{ flex: 1, textAlign: "right", color: r.status === "flatline" ? "#555" : "#cbd5d9" }}>{r.stdUv.toFixed(1)}</span>
               {r.mains60 && <span style={{ color: "#F59E0B", fontSize: 8, fontWeight: 700 }} title="Mains (60 Hz) dominates this channel">⌁60</span>}
-              {r.off === true && <span style={{ color: "#ef4444", fontSize: 8, fontWeight: 700, letterSpacing: "0.06em" }} title="Electrode lead-off — not making scalp contact (ADS1299)">OFF</span>}
+              {cc && <span style={{ color: cc.color, fontSize: 8, fontWeight: 700, letterSpacing: "0.06em" }} title={cc.title}>{cc.label}</span>}
             </div>
           );
         })}
@@ -10680,7 +10693,7 @@ function AcquireTab() {
     } else if (res.kind === "leadoff") {
       // Per-electrode contact status (ADS1299 lead-off) — display only, out-of-band from the sample
       // stream, timestamped so the panel drops it once stale. Never touches the capture buffer.
-      liveLeadoffRef.current = { off: res.off, t: performance.now() };
+      liveLeadoffRef.current = { off: res.off, state: res.state, t: performance.now() };
     }
     // all other server status messages → ignored by decodePieegMessage
   };
