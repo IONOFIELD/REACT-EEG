@@ -2,8 +2,7 @@
 
 Rapid Electroencephalographic Audit of Cortical Trends
 
-The newest edition of REACT EEG — a fully fleshed-out library and analysis tool for EEGs:
-de-identified EEG file management, waveform review, and live acquisition.
+Desktop EEG review, de-identification, and live acquisition. Import EDF, annotate (ACNS/ILAE), run ICA/DSP analysis, and stream live from PiEEG hardware — a Tauri app with HIPAA Safe Harbor de-id and auto-updates.
 
 REACT EEG, LLC - 2026
 
