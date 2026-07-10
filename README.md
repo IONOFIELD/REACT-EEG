@@ -4,7 +4,7 @@ Rapid Electroencephalographic Audit of Cortical Trends
 
 Desktop EEG review, de-identification, and live acquisition. Import EDF, annotate (ACNS/ILAE), run ICA/DSP analysis, and stream live from PiEEG hardware — a Tauri app with HIPAA Safe Harbor de-id and auto-updates.
 
-REACT EEG, by Jayson Leach - 2026
+started Oct 2024. Hello, future Jayson.
 
 ---
 
