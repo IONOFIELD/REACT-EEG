@@ -9,7 +9,10 @@
 //   job "bands": args { channels: Float32Array[], sr }              → BandPowers[] (one per channel)
 //   job "stft":  args { windows: Float32Array[], crops:{lead,len}[], sampleRate, hpf, lpf, notch }
 //                       → { powerMatrix, nFrames, nFreqs, ... }  (region STFT, filtered + cropped)
+//   job "qeeg":  args { waveformData: number[][], channels: string[], sampleRate }
+//                       → full qEEG analysis object (band power, ratios, flags, eye-sync, slope)
 import { computeBands, computeSTFT, applyHighPass, applyLowPass, applyNotch } from "./dsp.js";
+import { computeQeegAnalysis } from "./qeeg.js";
 
 // Filter + crop one raw window exactly as the SpectrogramPanel did inline (kept identical so the
 // spectrogram matches what Review is filtering).
@@ -32,6 +35,8 @@ self.onmessage = (e) => {
       const { windows, crops, sampleRate, hpf, lpf, notch } = args;
       const sigs = windows.map((w, i) => filterCrop(w, crops && crops[i], sampleRate, hpf, lpf, notch));
       result = computeSTFT(sigs, sampleRate);
+    } else if (job === "qeeg") {
+      result = computeQeegAnalysis(args.waveformData, args.channels, args.sampleRate);
     } else {
       throw new Error("unknown DSP job: " + job);
     }

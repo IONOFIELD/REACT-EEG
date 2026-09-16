@@ -6,6 +6,7 @@
 // falls back to running the SAME kernels synchronously on the main thread — identical output.
 import { useState, useEffect, useRef } from "react";
 import { computeBands, computeSTFT, applyHighPass, applyLowPass, applyNotch } from "./dsp.js";
+import { computeQeegAnalysis } from "./qeeg.js";
 
 let _worker = null;        // null = not tried yet; false = unavailable → use sync; Worker = ready
 let _nextId = 1;
@@ -43,6 +44,7 @@ function runSync(job, args) {
     });
     return computeSTFT(sigs, sampleRate);
   }
+  if (job === "qeeg") return computeQeegAnalysis(args.waveformData, args.channels, args.sampleRate);
   throw new Error("unknown DSP job: " + job);
 }
 
