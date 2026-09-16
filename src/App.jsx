@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, useReducer, createContext, useContext } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, useReducer, useDeferredValue, createContext, useContext } from "react";
 import JSZip from "jszip";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";
 import { buildAnnotationSidecar } from "./sidecar.js";
@@ -17,8 +17,11 @@ import { signalStats, channelHasSignal, edfHasAnySignal } from "./edf-signals.js
 import {
   butterworthCoeffs, applyBiquadCascade, applyButterworthFilter,
   applyHighPass, applyLowPass, applyNotch, applyWaveletDenoise, computeBands,
-  interpolateArtifacts, createStreamingFilter,
+  interpolateArtifacts, createStreamingFilter, dftTwiddles,
 } from "./dsp.js";
+// Heavy Review-panel DSP (topo band power, region STFT) runs off the main thread via a worker so
+// scrolling/rendering stay smooth while a panel is open. Falls back to synchronous if no Worker.
+import { useDspJob } from "./dsp-worker-client.js";
 // De-identification (HIPAA Safe Harbor): subject hashing, filename generation, and the
 // on-store EDF-header scrub. Pure + unit-tested in test/deid.test.js.
 import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, scanLibraryForPHI, setHashSalt } from "./deid.js";
@@ -4057,7 +4060,10 @@ function fmtTopo(v) {
   return v.toFixed(2);
 }
 
-function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
+function TopographicPanel({ waveformData: _liveWaveform, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
+  // PERF: defer the epoch data so the (worker-offloaded) band-power recompute doesn't stutter review
+  // while scrolling — React updates the map a beat after the scroll settles.
+  const waveformData = useDeferredValue(_liveWaveform);
   const [displayMode, setDisplayMode] = useState("voltage");
   const [scaleMode, setScaleMode] = useState("relative"); // relative (%) | absolute (µV²)
   const [hoverElec, setHoverElec] = useState(null);
@@ -4070,27 +4076,53 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
     ? "RMS amplitude"
     : `${displayMode.charAt(0).toUpperCase() + displayMode.slice(1)} ${isAbsolute ? "absolute power" : "relative power"}`;
 
-  const electrodeValues = useMemo(() => {
-    if (!waveformData || !channels) return {};
-    const vals = {};
+  // Scalp-electrode channels present in this (deferred) epoch — cheap to build; drives both the map
+  // and the worker band-power job below.
+  const scalpChans = useMemo(() => {
+    if (!waveformData || !channels) return [];
+    const out = [];
     channels.forEach((ch, i) => {
       const elec = getElectrodeFromChannel(ch);
       if (!elec || !ELECTRODE_2D[elec] || ch === "EKG") return;
       const data = waveformData[i];
       if (!data || data.length === 0) return;
-      if (isVoltageMode) {
+      out.push({ elec, data });
+    });
+    return out;
+  }, [waveformData, channels]);
+
+  // Band power per scalp electrode — computed ONCE, OFF the main thread (worker), reused by both the
+  // power map and the ratio stats. Identical numbers to the old synchronous computeBands. Runs in all
+  // modes because the θ/β·slow/fast·α/δ stats are band-based even when the map shows RMS voltage.
+  const { result: bandsList } = useDspJob(
+    "bands",
+    () => scalpChans.length ? { channels: scalpChans.map((s) => s.data), sr: sampleRate } : null,
+    [scalpChans, sampleRate]
+  );
+  const bandsByElec = useMemo(() => {
+    const m = {};
+    if (bandsList) scalpChans.forEach((s, i) => { if (bandsList[i]) m[s.elec] = bandsList[i]; });
+    return m;
+  }, [bandsList, scalpChans]);
+
+  const electrodeValues = useMemo(() => {
+    const vals = {};
+    if (isVoltageMode) {
+      // RMS is trivial — keep it on the main thread so the voltage map is instant.
+      scalpChans.forEach(({ elec, data }) => {
         let sum = 0;
         for (let j = 0; j < data.length; j++) sum += data[j] * data[j];
         vals[elec] = Math.sqrt(sum / data.length);
-      } else {
-        const bands = computeBands(data, sampleRate);
+      });
+    } else {
+      Object.entries(bandsByElec).forEach(([elec, bands]) => {
         const total = bands.total || 1;
         const raw = bands[displayMode] || 0;
         vals[elec] = isAbsolute ? raw : (raw / total) * 100;
-      }
-    });
+      });
+    }
     return vals;
-  }, [waveformData, channels, sampleRate, displayMode, isVoltageMode, isAbsolute]);
+  }, [scalpChans, bandsByElec, isVoltageMode, isAbsolute, displayMode]);
 
   // Global qEEG ratios + L/R asymmetry summary, independent of the selected map metric.
   const stats = useMemo(() => {
@@ -4108,22 +4140,14 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
     });
     const mL = nL ? sumL / nL : 0, mR = nR ? sumR / nR : 0;
     const asym = (mL + mR) !== 0 ? (mL - mR) / (mL + mR) : null;
-    // θ/β and slow/fast from band power summed across all scalp electrodes
+    // θ/β, slow/fast and α/δ from the SAME worker band powers (no second DFT).
     let sd = 0, st = 0, sa = 0, sb = 0;
-    if (waveformData && channels) {
-      channels.forEach((ch, i) => {
-        const elec = getElectrodeFromChannel(ch);
-        if (!elec || !ELECTRODE_2D[elec] || ch === "EKG") return;
-        const data = waveformData[i]; if (!data || data.length === 0) return;
-        const bnd = computeBands(data, sampleRate);
-        sd += bnd.delta; st += bnd.theta; sa += bnd.alpha; sb += bnd.beta;
-      });
-    }
+    Object.values(bandsByElec).forEach((b) => { sd += b.delta; st += b.theta; sa += b.alpha; sb += b.beta; });
     const thetaBeta = sb > 0 ? st / sb : null;
     const slowFast = (sa + sb) > 0 ? (sd + st) / (sa + sb) : null;
     const alphaDelta = sd > 0 ? sa / sd : null;   // alpha ÷ delta — descriptive state/slowing index
     return { min, max, mean, asym, thetaBeta, slowFast, alphaDelta };
-  }, [electrodeValues, waveformData, channels, sampleRate]);
+  }, [electrodeValues, bandsByElec]);
 
   // Map canvas-pixel coordinates to the nearest electrode (for hover readout).
   const pickElectrodeAt = (mx, my) => {
@@ -4355,7 +4379,12 @@ function TopographicPanel({ waveformData, channels, sampleRate, epochSec, epochS
 // ══════════════════════════════════════════════════════════════
 // QUANTITATIVE EEG ANALYSIS PANEL — floating overlay
 // ══════════════════════════════════════════════════════════════
-function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
+function QuantAnalysisPanel({ waveformData: _liveWaveform, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
+  // PERF: run the heavy per-epoch qEEG analysis on a DEFERRED copy of the epoch data. While you
+  // scroll, React keeps the waveform review responsive and only recomputes this panel once the
+  // scrolling settles — so an open qEEG panel no longer stutters review. (The DFT itself is also now
+  // twiddle-table based, ~50-100× faster than the old per-sample Math.cos/sin.)
+  const waveformData = useDeferredValue(_liveWaveform);
   const [activeView, setActiveView] = useState("bands");
 
   // Compute spectral power per channel using simple FFT approximation
@@ -4374,6 +4403,7 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       winEnergy += w * w;
     }
     const winNorm = winEnergy / N; // window energy correction factor
+    const { cos, sin } = dftTwiddles(N); // precomputed twiddles — identical math, no per-sample trig
 
     const bandRanges = { delta: [0.5, 4], theta: [4, 8], alpha: [8, 13], beta: [13, 30], gamma: [30, 50] };
     const powers = {};
@@ -4385,10 +4415,10 @@ function QuantAnalysisPanel({ waveformData, channels, sampleRate, epochSec, epoc
       const kHigh = Math.min(Math.floor(N / 2), Math.round(fHigh / freqRes));
       for (let k = kLow; k <= kHigh; k++) {
         let re = 0, im = 0;
+        const base = k * N;
         for (let n = 0; n < N; n++) {
-          const angle = (2 * Math.PI * k * n) / N;
-          re += windowed[n] * Math.cos(angle);
-          im -= windowed[n] * Math.sin(angle);
+          re += windowed[n] * cos[base + n];
+          im -= windowed[n] * sin[base + n];
         }
         bandPow += (re * re + im * im) / (N * N * winNorm);
       }
@@ -5011,71 +5041,25 @@ function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, on
   // STFT over a SPECTRO_SEC window, averaged across the region's electrodes (linear power → dB).
   // Each electrode is windowed (with guard padding) and filtered with the current LFF/HFF/notch,
   // then cropped — so the spectrogram matches what you're filtering in Review.
-  const stftData = useMemo(() => {
+  const dEpochStart = useDeferredValue(epochStart);
+  // PERF: slice the RAW region windows here (cheap) on a DEFERRED epoch; the heavy per-electrode
+  // filter + STFT then runs OFF the main thread in the DSP worker (byte-identical output). So an open
+  // spectrogram no longer blocks review while you scroll.
+  const stftInput = useMemo(() => {
     if (!edfData?.channelData) return null;
     const idxs = scopeIndices(scope);
     if (!idxs.length) return null;
-    // Build the filtered window for each electrode in the region.
-    const sigs = [];
+    const windows = [], crops = [];
     for (const idx of idxs) {
-      const w = getEDFEpochWindow(edfData, idx, epochStart, SPECTRO_SEC, sampleRate, FILTER_GUARD_SEC);
+      const w = getEDFEpochWindow(edfData, idx, dEpochStart, SPECTRO_SEC, sampleRate, FILTER_GUARD_SEC);
       if (!w) continue;
-      let ext = w.data;
-      if (hpf > 0) ext = applyHighPass(ext, hpf, sampleRate);
-      if (lpf > 0) ext = applyLowPass(ext, lpf, sampleRate);
-      if (notch > 0) ext = applyNotch(ext, notch, sampleRate);
-      sigs.push((w.lead > 0 || w.len < ext.length) ? ext.slice(w.lead, w.lead + w.len) : ext);
+      windows.push(w.data);
+      crops.push({ lead: w.lead, len: w.len });
     }
-    if (!sigs.length) return null;
-    const N = sigs[0].length;
-    const winSize = Math.min(256, N);
-    const hop = Math.floor(winSize / 2);
-    const nFrames = Math.max(1, Math.floor((N - winSize) / hop) + 1);
-
-    const hann = new Float32Array(winSize);
-    for (let i = 0; i < winSize; i++) hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (winSize - 1)));
-
-    const freqRes = sampleRate / winSize;
-    const maxFreqBin = Math.min(Math.ceil(50 / freqRes), Math.floor(winSize / 2));
-    const minFreqBin = Math.max(1, Math.floor(0.5 / freqRes));
-    const nFreqs = maxFreqBin - minFreqBin + 1;
-
-    const sum = new Array(nFrames);
-    for (let f = 0; f < nFrames; f++) sum[f] = new Float32Array(nFreqs);
-    for (const data of sigs) {
-      for (let f = 0; f < nFrames; f++) {
-        const offset = f * hop;
-        const frame = new Float32Array(winSize);
-        for (let i = 0; i < winSize; i++) frame[i] = (data[offset + i] || 0) * hann[i];
-        const row = sum[f];
-        for (let k = minFreqBin; k <= maxFreqBin; k++) {
-          let re = 0, im = 0;
-          for (let n = 0; n < winSize; n++) {
-            const angle = -2 * Math.PI * k * n / winSize;
-            re += frame[n] * Math.cos(angle);
-            im += frame[n] * Math.sin(angle);
-          }
-          row[k - minFreqBin] += (re * re + im * im) / winSize; // linear power
-        }
-      }
-    }
-
-    const inv = 1 / sigs.length;
-    const powerMatrix = new Array(nFrames);
-    let globalMax = -Infinity, globalMin = Infinity;
-    for (let f = 0; f < nFrames; f++) {
-      const power = new Float32Array(nFreqs);
-      for (let b = 0; b < nFreqs; b++) {
-        const p = Math.log10(sum[f][b] * inv + 1e-10);
-        power[b] = p;
-        if (p > globalMax) globalMax = p;
-        if (p < globalMin) globalMin = p;
-      }
-      powerMatrix[f] = power;
-    }
-
-    return { powerMatrix, nFrames, nFreqs, minFreqBin, maxFreqBin, freqRes, globalMin, globalMax, hop, nChannels: sigs.length, winSec: N / sampleRate };
-  }, [edfData, scope, epochStart, hpf, lpf, notch, sampleRate]);
+    return windows.length ? { windows, crops, sampleRate, hpf, lpf, notch } : null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [edfData, scope, dEpochStart, hpf, lpf, notch, sampleRate]);
+  const { result: stftData } = useDspJob("stft", () => stftInput, [stftInput]);
 
   // Canvas rendering
   useEffect(() => {

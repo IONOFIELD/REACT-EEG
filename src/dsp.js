@@ -309,12 +309,40 @@ export function applyWaveletDenoise(data, levels = 4) {
   };
 }
 
+// ── DFT twiddle-factor tables (shared by computeBands + computeSTFT) ──
+// cos[k*N+n] = cos(2πkn/N), sin[k*N+n] = sin(2πkn/N), for k in [0, N/2], n in [0, N).
+// Built ONCE per distinct N and cached. The band/STFT DFTs then read the precomputed factor
+// instead of calling Math.cos/Math.sin per sample — the arithmetic is IDENTICAL (same angle),
+// just ~50-100× faster. Float64 (not Float32) so the stored factor equals Math.cos(angle) to the
+// bit, keeping the output byte-for-byte unchanged from the old inline-trig version.
+const _twiddleCache = new Map();
+export function dftTwiddles(N) {
+  let t = _twiddleCache.get(N);
+  if (t) return t;
+  const half = Math.floor(N / 2);
+  const cos = new Float64Array((half + 1) * N);
+  const sin = new Float64Array((half + 1) * N);
+  for (let k = 0; k <= half; k++) {
+    const kb = k * N;
+    for (let n = 0; n < N; n++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      cos[kb + n] = Math.cos(angle);
+      sin[kb + n] = Math.sin(angle);
+    }
+  }
+  t = { cos, sin, N };
+  _twiddleCache.set(N, t);
+  return t;
+}
+
 // ── Per-band spectral power via direct DFT (Δ Θ α β γ + total) ──
+// Output is identical to the previous inline-trig DFT; only the cos/sin are now table lookups.
 export function computeBands(data, sr) {
   if (!data || data.length < 64) return { delta: 0, theta: 0, alpha: 0, beta: 0, gamma: 0, total: 0 };
   const N = Math.min(512, data.length);
   const fR = sr / N;
   const bands = { delta: [0.5, 4], theta: [4, 8], alpha: [8, 13], beta: [13, 30], gamma: [30, 50] };
+  const { cos, sin } = dftTwiddles(N);
   const powers = {};
   let total = 0;
   Object.entries(bands).forEach(([name, [fL, fH]]) => {
@@ -323,10 +351,10 @@ export function computeBands(data, sr) {
     const kH = Math.min(Math.floor(N / 2), Math.round(fH / fR));
     for (let k = kL; k <= kH; k++) {
       let re = 0, im = 0;
+      const base = k * N;
       for (let n = 0; n < N; n++) {
-        const angle = (2 * Math.PI * k * n) / N;
-        re += data[n] * Math.cos(angle);
-        im -= data[n] * Math.sin(angle);
+        re += data[n] * cos[base + n];
+        im -= data[n] * sin[base + n];
       }
       bp += (re * re + im * im) / (N * N);
     }
@@ -335,6 +363,62 @@ export function computeBands(data, sr) {
   });
   powers.total = total;
   return powers;
+}
+
+// ── Short-time Fourier transform for the spectrogram panel ──
+// `sigs` = the already-filtered, cropped region signals (one Float32Array per electrode); their
+// linear power is averaged. Output matches the previous inline SpectrogramPanel STFT byte-for-byte —
+// only the per-sample Math.cos/sin are now table lookups. Pure + worker-safe (no DOM, no closures).
+export function computeSTFT(sigs, sampleRate) {
+  if (!sigs || !sigs.length || !sigs[0] || !sigs[0].length) return null;
+  const N = sigs[0].length;
+  const winSize = Math.min(256, N);
+  const hop = Math.floor(winSize / 2);
+  const nFrames = Math.max(1, Math.floor((N - winSize) / hop) + 1);
+
+  const hann = new Float32Array(winSize);
+  for (let i = 0; i < winSize; i++) hann[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (winSize - 1)));
+
+  const freqRes = sampleRate / winSize;
+  const maxFreqBin = Math.min(Math.ceil(50 / freqRes), Math.floor(winSize / 2));
+  const minFreqBin = Math.max(1, Math.floor(0.5 / freqRes));
+  const nFreqs = maxFreqBin - minFreqBin + 1;
+  const { cos, sin } = dftTwiddles(winSize);
+
+  const sum = new Array(nFrames);
+  for (let f = 0; f < nFrames; f++) sum[f] = new Float32Array(nFreqs);
+  const frame = new Float32Array(winSize);
+  for (const data of sigs) {
+    for (let f = 0; f < nFrames; f++) {
+      const offset = f * hop;
+      for (let i = 0; i < winSize; i++) frame[i] = (data[offset + i] || 0) * hann[i];
+      const row = sum[f];
+      for (let k = minFreqBin; k <= maxFreqBin; k++) {
+        let re = 0, im = 0;
+        const base = k * winSize;
+        for (let n = 0; n < winSize; n++) {
+          re += frame[n] * cos[base + n];
+          im -= frame[n] * sin[base + n];
+        }
+        row[k - minFreqBin] += (re * re + im * im) / winSize; // linear power
+      }
+    }
+  }
+
+  const inv = 1 / sigs.length;
+  const powerMatrix = new Array(nFrames);
+  let globalMax = -Infinity, globalMin = Infinity;
+  for (let f = 0; f < nFrames; f++) {
+    const power = new Float32Array(nFreqs);
+    for (let b = 0; b < nFreqs; b++) {
+      const p = Math.log10(sum[f][b] * inv + 1e-10);
+      power[b] = p;
+      if (p > globalMax) globalMax = p;
+      if (p < globalMin) globalMin = p;
+    }
+    powerMatrix[f] = power;
+  }
+  return { powerMatrix, nFrames, nFreqs, minFreqBin, maxFreqBin, freqRes, globalMin, globalMax, hop, nChannels: sigs.length, winSec: N / sampleRate };
 }
 
 // Replace artifact-flagged samples with boundary-respecting LINEAR INTERPOLATION between the
