@@ -313,7 +313,7 @@ export function applyWaveletDenoise(data, levels = 4) {
 // cos[k*N+n] = cos(2πkn/N), sin[k*N+n] = sin(2πkn/N), for k in [0, N/2], n in [0, N).
 // Built ONCE per distinct N and cached. The band/STFT DFTs then read the precomputed factor
 // instead of calling Math.cos/Math.sin per sample — the arithmetic is IDENTICAL (same angle),
-// just ~50-100× faster. Float64 (not Float32) so the stored factor equals Math.cos(angle) to the
+// just faster — a measured ~9× on 20-channel computeBands. Float64 (not Float32) so the stored factor equals Math.cos(angle) to the
 // bit, keeping the output byte-for-byte unchanged from the old inline-trig version.
 const _twiddleCache = new Map();
 export function dftTwiddles(N) {
