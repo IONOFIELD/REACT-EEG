@@ -88,6 +88,12 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v20.1.2", items: [
+    "Faster analysis panels — the topographic map, qEEG and spectrogram now run their heavy DSP on a background Web Worker instead of the main thread, so a panel opens quickly and, crucially, scrolling through the EEG while a panel is open no longer stutters",
+    "Rewrote the band-power / DFT kernels to use a precomputed twiddle table instead of per-sample trig — same math, just faster: every computed value is unchanged (the DSP golden tests still pass and the analysis pipeline version stays put), so no reported number moves",
+    "The qEEG panel now runs its entire pipeline — artifact detection, spectral line-noise removal, band power, WPLI eye-sync and IRASA aperiodic slope — off the main thread, with a transparent synchronous fallback where Web Workers aren't available",
+    "The native desktop app carries the same speed-ups (rebuild with `npm run build:desktop`)",
+  ]},
   { version: "v20.1.1", items: [
     "Live trace now renders at a FIXED, true-µV sensitivity instead of auto-scaling — the amplitude no longer jitters as the signal varies, so it reads honestly for judging electrode quality; a new Sens −/+ control and header readout set the µV/div (matching Review)",
     "Live trace holds still — a peak, once drawn, keeps its exact position as it scrolls (the display baseline is captured once and frozen), fixing the whole-waveform vertical sway",
@@ -4125,7 +4131,7 @@ function QuantAnalysisPanel({ waveformData: _liveWaveform, channels, sampleRate,
   // PERF: run the heavy per-epoch qEEG analysis on a DEFERRED copy of the epoch data. While you
   // scroll, React keeps the waveform review responsive and only recomputes this panel once the
   // scrolling settles — so an open qEEG panel no longer stutters review. (The DFT itself is also now
-  // twiddle-table based, ~50-100× faster than the old per-sample Math.cos/sin.)
+  // twiddle-table based — a measured ~9× vs the old per-sample Math.cos/sin.)
   const waveformData = useDeferredValue(_liveWaveform);
   const [activeView, setActiveView] = useState("bands");
 
