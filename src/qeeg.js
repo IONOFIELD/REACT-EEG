@@ -6,7 +6,7 @@
 // so the SAME code can run on the DSP web worker (dsp-worker.js, off the main thread) and, as
 // a fallback, synchronously — the output is identical either way. computeWPLI /
 // computeCrossCorrelation are re-imported by App.jsx for the EOG-metrics panel.
-import { dftTwiddles, interpolateArtifacts } from "./dsp.js";
+import { dftTwiddles, dftTwiddlesInv, interpolateArtifacts } from "./dsp.js";
 
 // Cross-correlation (Pearson coefficient) for eye movement synchronicity analysis
 export function computeCrossCorrelation(a, b) {
@@ -110,19 +110,20 @@ function detectArtifacts(data, sr, windowMs = 250, zThreshold = 4.0) {
 // Spectral interpolation for line noise removal (60 Hz default)
 // Replaces magnitude at lineFreq ± bandwidth with average of flanking bins, preserves phase
 // Returns cleaned Float32Array — no spectral distortion unlike IIR notch
-function removeLineNoiseSpectral(data, sr, lineFreq = 60, bandwidth = 2) {
+export function removeLineNoiseSpectral(data, sr, lineFreq = 60, bandwidth = 2) {
   if (!data || data.length < 16 || sr < lineFreq * 2) return data;
   const N = data.length;
   const freqRes = sr / N;
 
-  // Full DFT
+  // Full DFT — twiddle-table lookups instead of per-sample trig (byte-identical: same angle values).
+  const { cos: fCos, sin: fSin } = dftTwiddles(N); // forward needs only k in [0, N/2] (covered)
   const reArr = new Float32Array(N), imArr = new Float32Array(N);
   for (let k = 0; k <= Math.floor(N / 2); k++) {
     let re = 0, im = 0;
+    const base = k * N;
     for (let n = 0; n < N; n++) {
-      const angle = (2 * Math.PI * k * n) / N;
-      re += data[n] * Math.cos(angle);
-      im -= data[n] * Math.sin(angle);
+      re += data[n] * fCos[base + n];
+      im -= data[n] * fSin[base + n];
     }
     reArr[k] = re; imArr[k] = im;
     // Mirror for negative frequencies
@@ -165,24 +166,50 @@ function removeLineNoiseSpectral(data, sr, lineFreq = 60, bandwidth = 2) {
     }
   }
 
-  // Inverse DFT
+  // Inverse DFT — transposed full-range twiddle table (sequential reads), byte-identical.
+  const { cos: iCos, sin: iSin } = dftTwiddlesInv(N);
   const cleaned = new Float32Array(N);
   for (let n = 0; n < N; n++) {
     let sum = 0;
+    const nb = n * N;
     for (let k = 0; k < N; k++) {
-      const angle = (2 * Math.PI * k * n) / N;
-      sum += reArr[k] * Math.cos(angle) + imArr[k] * Math.sin(angle);
+      sum += reArr[k] * iCos[nb + k] + imArr[k] * iSin[nb + k];
     }
     cleaned[n] = sum / N;
   }
   return cleaned;
 }
 
+// Hanning-windowed power spectrum (used by IRASA). Module-level + exported so the golden test can
+// lock its EXACT output. Twiddle-table DFT with the Hanning window hoisted out of the k-loop (it
+// depends only on n) — byte-identical to the original per-(k,n) inline trig. NOTE: `win` MUST stay
+// Float64 — a Float32Array would round every window coefficient to single precision before the
+// multiply and perturb the spectrum (~1e-8), which the 2-decimal slope would hide.
+export function hanningPowerSpectrum(sig) {
+  const M = sig.length;
+  const half = Math.floor(M / 2);
+  const spec = new Float32Array(half + 1);
+  const { cos, sin } = dftTwiddles(M);
+  const win = new Float64Array(M);
+  for (let n = 0; n < M; n++) win[n] = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (M - 1)));
+  for (let k = 0; k <= half; k++) {
+    let re = 0, im = 0;
+    const base = k * M;
+    for (let n = 0; n < M; n++) {
+      const sw = sig[n] * win[n];
+      re += sw * cos[base + n];
+      im -= sw * sin[base + n];
+    }
+    spec[k] = (re * re + im * im) / (M * M);
+  }
+  return spec;
+}
+
 // IRASA — Irregular-Resampling Auto-Spectral Analysis (Wen & Liu, 2016)
 // Separates aperiodic (1/f) component from oscillatory peaks by resampling at
 // irrational ratios. Returns the aperiodic spectral slope (log-log fit, 1-40 Hz).
 // Steeper slope (more negative) indicates more pathological slowing.
-function computeAperiodicSlope(data, sr) {
+export function computeAperiodicSlope(data, sr) {
   if (!data || data.length < 64) return null;
   const N = data.length;
 
@@ -200,23 +227,6 @@ function computeAperiodicSlope(data, sr) {
     return out;
   };
 
-  // Power spectrum via DFT (Hanning windowed)
-  const powerSpectrum = (sig) => {
-    const M = sig.length;
-    const half = Math.floor(M / 2);
-    const spec = new Float32Array(half + 1);
-    for (let k = 0; k <= half; k++) {
-      let re = 0, im = 0;
-      for (let n = 0; n < M; n++) {
-        const w = 0.5 * (1 - Math.cos((2 * Math.PI * n) / (M - 1)));
-        const angle = (2 * Math.PI * k * n) / M;
-        re += sig[n] * w * Math.cos(angle);
-        im -= sig[n] * w * Math.sin(angle);
-      }
-      spec[k] = (re * re + im * im) / (M * M);
-    }
-    return spec;
-  };
 
   const ratios = [1.1, 1.3, 1.5, 1.7, 1.9];
   // For each ratio, compute geometric mean of up/down resampled spectra
@@ -231,8 +241,8 @@ function computeAperiodicSlope(data, sr) {
   for (const h of ratios) {
     const up = resample(data, h);
     const down = resample(data, 1 / h);
-    const specUp = powerSpectrum(up);
-    const specDown = powerSpectrum(down);
+    const specUp = hanningPowerSpectrum(up);
+    const specDown = hanningPowerSpectrum(down);
 
     // Map both spectra to common frequency grid (original sr, minHalf bins)
     for (let k = 0; k <= minHalf; k++) {

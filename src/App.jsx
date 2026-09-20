@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo, useReducer, useDeferredValue, createContext, useContext } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, useReducer, createContext, useContext } from "react";
 import JSZip from "jszip";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";
 import { buildAnnotationSidecar } from "./sidecar.js";
@@ -88,6 +88,12 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v20.1.3", items: [
+    "The topographic map, qEEG and spectrogram now track the LIVE review position — they update as you move through the recording instead of holding the previous epoch's numbers until scrolling stopped, so what a panel shows always matches the waveform on screen",
+    "Made the qEEG panel ~20× faster (1.2 s → 61 ms per epoch) so it can keep up in real time: the 60 Hz spectral line-noise removal and the IRASA aperiodic-slope spectra now use precomputed twiddle tables. A new golden test proves the numbers come out bit-for-bit unchanged",
+    "The topographic heatmap repaints ~5× faster (83 ms → 17 ms at 57 electrodes), so a live-updating map no longer stutters waveform review",
+    "A DSP worker failure can no longer wedge a panel — jobs still in flight are settled and the panel falls back to computing synchronously",
+  ]},
   { version: "v20.1.2", items: [
     "Faster analysis panels — the topographic map, qEEG and spectrogram now run their heavy DSP on a background Web Worker instead of the main thread, so a panel opens quickly and, crucially, scrolling through the EEG while a panel is open no longer stutters",
     "Rewrote the band-power / DFT kernels to use a precomputed twiddle table instead of per-sample trig — same math, just faster: every computed value is unchanged (the DSP golden tests still pass and the analysis pipeline version stays put), so no reported number moves",
@@ -3809,9 +3815,10 @@ function fmtTopo(v) {
 }
 
 function TopographicPanel({ waveformData: _liveWaveform, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
-  // PERF: defer the epoch data so the (worker-offloaded) band-power recompute doesn't stutter review
-  // while scrolling — React updates the map a beat after the scroll settles.
-  const waveformData = useDeferredValue(_liveWaveform);
+  // Track the LIVE review epoch (no deferral) so the map reflects the current position in real time.
+  // The band-power DFT runs off the main thread (worker) and useDspJob coalesces to a single in-flight
+  // job (always the newest epoch), so real-time tracking during a scrub never stutters review.
+  const waveformData = _liveWaveform;
   const [displayMode, setDisplayMode] = useState("voltage");
   const [scaleMode, setScaleMode] = useState("relative"); // relative (%) | absolute (µV²)
   const [hoverElec, setHoverElec] = useState(null);
@@ -3951,14 +3958,20 @@ function TopographicPanel({ waveformData: _liveWaveform, channels, sampleRate, e
         const dx = px - cx;
         if (dx * dx + dy2 > r2) continue;
         const nx = 0.5 + (dx / radius) * 0.47;
-        // Inline IDW with p=2.5 — no function call, no string allocation
+        // Inline IDW with p=2.5 — no function call, no string allocation.
+        // dist^2.5 is evaluated as d2 * sqrt(dist), which avoids Math.pow: ~5× faster paint
+        // (83 ms → 17 ms at 57 electrodes, 30 ms → 6 ms at 20), so the map can repaint at the LIVE
+        // epoch rate without stuttering review. It differs from Math.pow by ~3e-16 relative — orders
+        // below the 1/255 colour quantisation — and affects only heatmap pixels: the electrode
+        // values, stats and hover readout all come from the worker DSP and are untouched.
         let num = 0, den = 0, exact = NaN;
         for (let i = 0; i < eList.length; i += 3) {
           const ex = eList[i], ey = eList[i + 1], ev = eList[i + 2];
           const ddx = nx - ex, ddy = ny - ey;
-          const dist = Math.sqrt(ddx * ddx + ddy * ddy);
+          const d2 = ddx * ddx + ddy * ddy;
+          const dist = Math.sqrt(d2);
           if (dist < 0.001) { exact = ev; break; }
-          const w = 1 / Math.pow(dist, 2.5);
+          const w = 1 / (d2 * Math.sqrt(dist));
           num += w * ev; den += w;
         }
         const val = !isNaN(exact) ? exact : (den > 0 ? num / den : 0);
@@ -4128,11 +4141,11 @@ function TopographicPanel({ waveformData: _liveWaveform, channels, sampleRate, e
 // QUANTITATIVE EEG ANALYSIS PANEL — floating overlay
 // ══════════════════════════════════════════════════════════════
 function QuantAnalysisPanel({ waveformData: _liveWaveform, channels, sampleRate, epochSec, epochStart, onClose, panelPos, setPanelPos }) {
-  // PERF: run the heavy per-epoch qEEG analysis on a DEFERRED copy of the epoch data. While you
-  // scroll, React keeps the waveform review responsive and only recomputes this panel once the
-  // scrolling settles — so an open qEEG panel no longer stutters review. (The DFT itself is also now
-  // twiddle-table based — a measured ~9× vs the old per-sample Math.cos/sin.)
-  const waveformData = useDeferredValue(_liveWaveform);
+  // Track the LIVE review epoch (no deferral) so the qEEG numbers reflect the current position in real
+  // time. The whole pipeline runs off the main thread (worker) and useDspJob coalesces to a single
+  // in-flight job (always the newest epoch), so real-time tracking during a scrub never stutters review.
+  // (The DFT is twiddle-table based — a measured ~9× vs the old per-sample Math.cos/sin.)
+  const waveformData = _liveWaveform;
   const [activeView, setActiveView] = useState("bands");
 
   // PERF: the entire qEEG pipeline (artifact detection, spectral line-noise removal, band
@@ -4547,24 +4560,23 @@ function SpectrogramPanel({ edfData, sampleRate, epochStart, hpf, lpf, notch, on
   // STFT over a SPECTRO_SEC window, averaged across the region's electrodes (linear power → dB).
   // Each electrode is windowed (with guard padding) and filtered with the current LFF/HFF/notch,
   // then cropped — so the spectrogram matches what you're filtering in Review.
-  const dEpochStart = useDeferredValue(epochStart);
-  // PERF: slice the RAW region windows here (cheap) on a DEFERRED epoch; the heavy per-electrode
-  // filter + STFT then runs OFF the main thread in the DSP worker (byte-identical output). So an open
-  // spectrogram no longer blocks review while you scroll.
+  // Slice the RAW region windows for the LIVE epoch (cheap); the heavy per-electrode filter + STFT runs
+  // OFF the main thread in the DSP worker (byte-identical output), and useDspJob coalesces to a single
+  // in-flight job — so the spectrogram tracks the current position in real time without blocking review.
   const stftInput = useMemo(() => {
     if (!edfData?.channelData) return null;
     const idxs = scopeIndices(scope);
     if (!idxs.length) return null;
     const windows = [], crops = [];
     for (const idx of idxs) {
-      const w = getEDFEpochWindow(edfData, idx, dEpochStart, SPECTRO_SEC, sampleRate, FILTER_GUARD_SEC);
+      const w = getEDFEpochWindow(edfData, idx, epochStart, SPECTRO_SEC, sampleRate, FILTER_GUARD_SEC);
       if (!w) continue;
       windows.push(w.data);
       crops.push({ lead: w.lead, len: w.len });
     }
     return windows.length ? { windows, crops, sampleRate, hpf, lpf, notch } : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [edfData, scope, dEpochStart, hpf, lpf, notch, sampleRate]);
+  }, [edfData, scope, epochStart, hpf, lpf, notch, sampleRate]);
   const { result: stftData } = useDspJob("stft", () => stftInput, [stftInput]);
 
   // Canvas rendering

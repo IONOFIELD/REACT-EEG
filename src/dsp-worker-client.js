@@ -23,7 +23,15 @@ function getWorker() {
       _pending.delete(id);
       ok ? p.resolve(result) : p.reject(new Error(error));
     };
-    w.onerror = () => { _worker = false; };  // stop trusting the worker; runDsp falls back to sync
+    w.onerror = () => {
+      // Stop trusting the worker — runDsp falls back to sync from here on. Crucially, SETTLE everything
+      // already in flight: useDspJob runs one job at a time, so a promise that never settles would wedge
+      // that hook forever (pending:true, no further dispatch) and leak its _pending entry.
+      _worker = false;
+      const stranded = [..._pending.values()];
+      _pending.clear();
+      stranded.forEach((p) => p.reject(new Error("DSP worker failed; falling back to synchronous DSP")));
+    };
     _worker = w;
   } catch { _worker = false; }
   return _worker;
@@ -61,23 +69,48 @@ export function runDsp(job, args) {
   });
 }
 
-// React hook: (re)run `job` whenever `deps` change; returns { result, pending }. Stale responses are
-// dropped (last-request-wins) so fast scrolling can never leave an out-of-date panel on screen.
-// `buildArgs()` returns the job args, or null to skip and clear the result.
+// React hook: (re)run `job` whenever `deps` change; returns { result, pending }.
+//
+// Real-time scheduling: at most ONE worker job runs per hook at a time, and while it runs the newest
+// args are remembered and dispatched the instant it finishes (single-in-flight, trailing-latest). So
+// when a panel tracks the LIVE review position (no useDeferredValue), fast scrubbing can't flood the
+// worker queue with stale jobs that would make the display lag further behind — the worker always
+// computes the most RECENT epoch and skips the intermediate ones, so the panel updates as fast as the
+// worker can go. The previous result stays on screen while the next computes, so it never flashes
+// empty. `buildArgs()` returns the job args, or null to skip and clear the result.
 export function useDspJob(job, buildArgs, deps) {
   const [state, setState] = useState({ result: null, pending: false });
-  const reqRef = useRef(0);
-  useEffect(() => {
-    const args = buildArgs();
-    if (!args) { reqRef.current++; setState({ result: null, pending: false }); return; }
+  const reqRef = useRef(0);            // monotonic id — only the newest job's result is shown
+  const inFlightRef = useRef(false);   // is a worker job currently running for this hook?
+  const latestRef = useRef(undefined); // newest args awaiting a free slot (undefined = nothing queued)
+  const jobRef = useRef(job); jobRef.current = job;
+
+  // Run the newest queued args; when it settles, immediately run whatever is newest THEN (or go idle).
+  const pumpRef = useRef(null);
+  pumpRef.current = () => {
+    const args = latestRef.current;
+    if (args === undefined) { inFlightRef.current = false; return; }
+    latestRef.current = undefined;
+    inFlightRef.current = true;
     const myReq = ++reqRef.current;
     setState((s) => ({ result: s.result, pending: true }));
-    let cancelled = false;
-    runDsp(job, args).then((result) => {
-      if (cancelled || myReq !== reqRef.current) return;
-      setState({ result, pending: false });
-    }).catch(() => { if (!cancelled && myReq === reqRef.current) setState((s) => ({ result: s.result, pending: false })); });
-    return () => { cancelled = true; };
+    runDsp(jobRef.current, args)
+      .then((result) => { if (myReq === reqRef.current) setState({ result, pending: false }); })
+      .catch(() => { if (myReq === reqRef.current) setState((s) => ({ result: s.result, pending: false })); })
+      .finally(() => { pumpRef.current(); }); // trailing: pick up the latest args that arrived meanwhile
+  };
+
+  useEffect(() => {
+    const args = buildArgs();
+    if (!args) {                         // clear: invalidate any in-flight result and show nothing
+      reqRef.current++;
+      latestRef.current = undefined;
+      setState({ result: null, pending: false });
+      return;
+    }
+    latestRef.current = args;            // record the newest desired input
+    if (!inFlightRef.current) pumpRef.current(); // idle -> start now; busy -> picked up on finish
   }, deps); // eslint-disable-line react-hooks/exhaustive-deps
+
   return state;
 }

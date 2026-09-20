@@ -335,6 +335,30 @@ export function dftTwiddles(N) {
   return t;
 }
 
+// Transposed FULL-range twiddle table for INVERSE DFTs that sum over every k in [0, N).
+// Layout cos[n*N + k] = Math.cos(2πkn/N) (k innermost → sequential, cache-friendly reads), computed
+// with the SAME angle expression as the inline trig it replaces, so the reconstruction is byte-for-
+// byte identical. Cached per N (an N×N Float64 pair, built once). dftTwiddles only covers k in
+// [0, N/2] — enough for a forward DFT but not an inverse.
+const _twiddleInvCache = new Map();
+export function dftTwiddlesInv(N) {
+  let t = _twiddleInvCache.get(N);
+  if (t) return t;
+  const cos = new Float64Array(N * N);
+  const sin = new Float64Array(N * N);
+  for (let n = 0; n < N; n++) {
+    const nb = n * N;
+    for (let k = 0; k < N; k++) {
+      const angle = (2 * Math.PI * k * n) / N;
+      cos[nb + k] = Math.cos(angle);
+      sin[nb + k] = Math.sin(angle);
+    }
+  }
+  t = { cos, sin, N };
+  _twiddleInvCache.set(N, t);
+  return t;
+}
+
 // ── Per-band spectral power via direct DFT (Δ Θ α β γ + total) ──
 // Output is identical to the previous inline-trig DFT; only the cos/sin are now table lookups.
 export function computeBands(data, sr) {
