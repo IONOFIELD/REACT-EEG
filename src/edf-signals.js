@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Jayson Leach
 // Pure signal-presence helpers for EDF channels.
 //
 // A channel "has data" only if it actually VARIES — measured as mean-removed standard

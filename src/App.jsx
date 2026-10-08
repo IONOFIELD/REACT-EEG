@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Jayson Leach
 import { useState, useEffect, useRef, useCallback, useMemo, useReducer, createContext, useContext } from "react";
 import JSZip from "jszip";
 import { APP_VERSION, PIPELINE_VERSION, SCHEMA_VERSION } from "./version.js";

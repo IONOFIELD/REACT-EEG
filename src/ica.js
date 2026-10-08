@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Jayson Leach
 import { PIPELINE_VERSION } from "./version.js";
 
 // ── ICA (FastICA + PCA whitening) — artifact-component identification & removal ──
