@@ -22,8 +22,11 @@ const EDF_RESERVED_LEN = 44;
  * @param {string} [a.patientId]
  * @param {string} [a.recordingId]
  * @param {string} [a.versionStamp]  free-text provenance for the reserved header field (≤44 chars kept)
+ * @param {Date|number} [a.startTime]  when the RECORDING began (Date or epoch ms); stamped into the
+ *        EDF start date/time (offsets 168/176). Defaults to now — used only when a caller omits it,
+ *        which keeps the previous behaviour for callers (and tests) that don't pass a start time.
  */
-export function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSec = 1, patientId = "", recordingId = "", versionStamp = "" }) {
+export function buildEDFFile({ channelLabels, channelData, sampleRate, recordDurationSec = 1, patientId = "", recordingId = "", versionStamp = "", startTime = null }) {
   const ns = channelLabels.length;
   const totalSamples = channelData[0].length;
   const samplesPerRecord = sampleRate * recordDurationSec;
@@ -43,9 +46,13 @@ export function buildEDFFile({ channelLabels, channelData, sampleRate, recordDur
   writeStr(0, 8, "0       ");
   writeStr(8, 80, patientId);
   writeStr(88, 80, recordingId);
-  const now = new Date();
-  writeStr(168, 8, `${String(now.getDate()).padStart(2,"0")}.${String(now.getMonth()+1).padStart(2,"0")}.${String(now.getFullYear()%100).padStart(2,"0")}`);
-  writeStr(176, 8, `${String(now.getHours()).padStart(2,"0")}.${String(now.getMinutes()).padStart(2,"0")}.${String(now.getSeconds()).padStart(2,"0")}`);
+  // EDF start date/time = when the recording began (offsets 168/176). Default to now only when the
+  // caller omits startTime, so existing callers/tests are unaffected; a Date or epoch-ms is accepted.
+  const start = startTime instanceof Date ? startTime
+    : (typeof startTime === "number" && Number.isFinite(startTime)) ? new Date(startTime)
+    : new Date();
+  writeStr(168, 8, `${String(start.getDate()).padStart(2,"0")}.${String(start.getMonth()+1).padStart(2,"0")}.${String(start.getFullYear()%100).padStart(2,"0")}`);
+  writeStr(176, 8, `${String(start.getHours()).padStart(2,"0")}.${String(start.getMinutes()).padStart(2,"0")}.${String(start.getSeconds()).padStart(2,"0")}`);
   writeStr(184, 8, String(headerBytes));
   writeStr(EDF_RESERVED_OFFSET, EDF_RESERVED_LEN, versionStamp); // provenance (survives de-id scrub)
   writeStr(236, 8, String(numRecords));

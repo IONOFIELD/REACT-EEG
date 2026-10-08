@@ -120,10 +120,10 @@ describe("scrubEdfHeader (the legal core — no PHI survives into stored/exporte
     expect(recording).not.toContain("2002");
   });
 
-  it("generalizes start date to year-only and zeroes the start time", () => {
+  it("generalizes start date to year-only but PRESERVES the start time (time-of-day is not PHI)", () => {
     const out = scrubEdfHeader(original(), { hash: "A9024A", year: "2026" });
-    expect(ascii(out, 168, 8)).toBe("01.01.26");
-    expect(ascii(out, 176, 8)).toBe("00.00.00");
+    expect(ascii(out, 168, 8)).toBe("01.01.26");   // date collapsed to year
+    expect(ascii(out, 176, 8)).toBe("13.45.10");   // clock time kept intact (was zeroed before)
   });
 
   it("leaves the signal-header region (offset 256+) byte-for-byte intact", () => {
