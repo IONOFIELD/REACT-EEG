@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Jayson Leach
 // ── App identity / versioning — THE versioning scheme (single source of truth) ──
 //
 // REACT EEG stamps three independent version namespaces. They answer different
