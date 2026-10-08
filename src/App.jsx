@@ -90,6 +90,12 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v20.1.4", items: [
+    "Recordings now carry their real start time — the EDF header's start date/time is the moment you pressed Record, not the moment the file was saved, so the time axis lines up with when the EEG was actually acquired",
+    "Saved recordings keep their time of day — de-identification still reduces the date to the year only (HIPAA Safe Harbor), but no longer resets the clock time to 00:00:00, since time of day is not a Safe Harbor identifier",
+    "REACT EEG is now licensed under the GNU AGPL v3 or later (see LICENSE)",
+    "Added clinical acquisition notes on filter phase and EDF time axes (docs/clinical-acquisition-notes.md)",
+  ]},
   { version: "v20.1.3", items: [
     "The topographic map, qEEG and spectrogram now track the LIVE review position — they update as you move through the recording instead of holding the previous epoch's numbers until scrolling stopped, so what a panel shows always matches the waveform on screen",
     "Made the qEEG panel ~20× faster (1.2 s → 61 ms per epoch) so it can keep up in real time: the 60 Hz spectral line-noise removal and the IRASA aperiodic-slope spectra now use precomputed twiddle tables. A new golden test proves the numbers come out bit-for-bit unchanged",

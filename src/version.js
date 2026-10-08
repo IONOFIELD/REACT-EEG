@@ -40,6 +40,6 @@
 //   3. package-lock.json — BOTH the top-level "version" AND packages[""].version
 //   4. Prepend { version, items } to CHANGELOG in App.jsx (top entry renders as "· current")
 // test/versioning.test.js fails if 1/2/3/4 drift apart.
-export const APP_VERSION = "v20.1.3";
+export const APP_VERSION = "v20.1.4";
 export const PIPELINE_VERSION = "react-pipeline-1.0.0";
 export const SCHEMA_VERSION = "v16.0";
