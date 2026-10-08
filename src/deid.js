@@ -155,7 +155,9 @@ export function parseHashYearFromFilename(filename) {
 //   offset   8 (80 bytes): local patient identification   → "<hash> X X X"  (no name/MRN/DOB)
 //   offset  88 (80 bytes): local recording identification → "Startdate X X X X" (no date/tech/site)
 //   offset 168 ( 8 bytes): start date dd.mm.yy            → "01.01.yy" (year only, Safe Harbor)
-//   offset 176 ( 8 bytes): start time hh.mm.ss            → "00.00.00"
+//   offset 176 ( 8 bytes): start time hh.mm.ss            → PRESERVED (left intact). Time-of-day is
+//        not one of the 18 Safe Harbor identifiers, and the start DATE above is already generalized
+//        to the year — so the clock time is kept to anchor the recording's time axis correctly.
 // Signal headers (offset 256+) and all sample data are left byte-for-byte intact, so
 // the scrubbed file still parses and renders identically.
 export function scrubEdfHeader(arrayBuffer, { hash = "", year = null } = {}) {
@@ -173,7 +175,8 @@ export function scrubEdfHeader(arrayBuffer, { hash = "", year = null } = {}) {
   if (year != null && /^\d{4}$/.test(String(year))) {
     writeField(168, 8, `01.01.${String(year).slice(-2)}`); // keep year, drop month/day
   }
-  writeField(176, 8, "00.00.00");              // drop the precise start time
+  // Start time (offset 176) is intentionally NOT scrubbed: time-of-day is not a Safe Harbor
+  // identifier, and the date above is already year-only — so the recording's clock time is kept.
   return copy;
 }
 

@@ -10039,6 +10039,7 @@ function AcquireTab() {
   const liveRxRef = useRef(0);       // total real sample-frames received this session (rx-rate readout)
   const liveDroppedRef = useRef(0);  // total dropped samples this session
   const recordingRef = useRef(false);
+  const recordingStartRef = useRef(null); // Date the current recording began (anchors the EDF start time)
   const userClosingRef = useRef(false);   // true while the user is intentionally disconnecting
   const pieegMockRef = useRef(false);     // true after refusing a mock/synthetic stream (blocks reconnect)
   const reconnectTimerRef = useRef(null); // pending pieeg-server auto-reconnect timer
@@ -10362,6 +10363,7 @@ function AcquireTab() {
     // Reset the live capture buffer so this recording starts clean.
     if (liveBufRef.current) liveBufRef.current.data = liveBufRef.current.labels.map(() => []);
     recordingRef.current = true;
+    recordingStartRef.current = new Date(); // anchor the EDF start time to when capture actually began
     setIsRecording(true); setIsPaused(false); setElapsedSec(0); eeg.setCurrentEpoch(0);
   };
   const stopRecording = () => {
@@ -10400,6 +10402,9 @@ function AcquireTab() {
       patientId: hashSubjectId(subjectId),
       recordingId: `REACT-${studyType}`,
       versionStamp: `REACT ${PIPELINE_VERSION} ${SCHEMA_VERSION}`,
+      // Anchor the EDF start date/time to when recording began (not when this file is written).
+      // Fallback to the capture-start derived from elapsed time if the ref was somehow not set.
+      startTime: recordingStartRef.current || new Date(Date.now() - actualDurationSec * 1000),
     });
     const parsed = parseEDFFile(edfBuffer);
 

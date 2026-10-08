@@ -118,6 +118,35 @@ describe("buildEDFFile round-trip (real seed channels)", () => {
   });
 });
 
+describe("buildEDFFile start time (offsets 168/176)", () => {
+  const asc = (buf, off, len) => new TextDecoder("ascii").decode(new Uint8Array(buf, off, len));
+  const SR = 100;
+  const oneSec = [Float32Array.from({ length: SR }, (_, i) => Math.sin(i / 5))]; // 1 s, one channel
+
+  it("stamps the EDF start date/time from an explicit startTime, not the write moment", () => {
+    const start = new Date(2026, 2, 15, 13, 45, 10); // 15 Mar 2026 13:45:10 (JS month is 0-based)
+    const buf = buildEDFFile({ channelLabels: ["C3"], channelData: oneSec, sampleRate: SR, startTime: start });
+    expect(asc(buf, 168, 8)).toBe("15.03.26");
+    expect(asc(buf, 176, 8)).toBe("13.45.10");
+  });
+
+  it("accepts epoch milliseconds as well as a Date", () => {
+    const start = new Date(2025, 0, 2, 9, 5, 7);
+    const buf = buildEDFFile({ channelLabels: ["C3"], channelData: oneSec, sampleRate: SR, startTime: start.getTime() });
+    expect(asc(buf, 168, 8)).toBe("02.01.25");
+    expect(asc(buf, 176, 8)).toBe("09.05.07");
+  });
+
+  it("defaults to the current date when startTime is omitted (unchanged behaviour)", () => {
+    const buf = buildEDFFile({ channelLabels: ["C3"], channelData: oneSec, sampleRate: SR });
+    const now = new Date();
+    const dd = String(now.getDate()).padStart(2, "0");
+    const mm = String(now.getMonth() + 1).padStart(2, "0");
+    const yy = String(now.getFullYear() % 100).padStart(2, "0");
+    expect(asc(buf, 168, 8)).toBe(`${dd}.${mm}.${yy}`);
+  });
+});
+
 describe("parseEDFWindow — windowed decode (real seed)", () => {
   it("parseEDFHeader reports structure without decoding signals", () => {
     const h = parseEDFHeader(seed);
