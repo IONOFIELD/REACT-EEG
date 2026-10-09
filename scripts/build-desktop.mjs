@@ -2,7 +2,7 @@
 //
 // Beyond a plain `tauri build`, this handles two things:
 //   1. Keeps the SECRET demo token out of the bundle. The desktop app reads the token at RUNTIME
-//      from <Documents>/REACT EEG/demo_token (the `load_demo_token` Rust command), so it must never
+//      from <Documents>/REACT-EEG/demo_token (the `load_demo_token` Rust command), so it must never
 //      be compiled in. `vite build --mode tauri` would otherwise copy public/pieeg-demo-token into
 //      dist-tauri, so we move it aside for the build and restore it afterward.
 //   2. Disables updater-artifact signing — a local build has no signing key.

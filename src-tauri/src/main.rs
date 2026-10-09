@@ -264,6 +264,28 @@ fn open_in_file_manager(path: &PathBuf) -> Result<(), String> {
     result.map(|_| ()).map_err(|e| format!("open {:?}: {e}", path))
 }
 
+/// Open a web page in the user's default browser (the Dataset Browser's official-access links —
+/// the webview itself can't navigate away). Only plain `https://` URLs are accepted: no other
+/// schemes, whitespace, quotes or control characters. The URL is passed as a single argument with
+/// no shell involved, so it can't be turned into a command.
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let ok = url.starts_with("https://")
+        && url.len() <= 2048
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '<' | '>' | '`'));
+    if !ok {
+        return Err("only plain https:// links can be opened".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32").args(["url.dll,FileProtocolHandler", &url]).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    result.map(|_| ()).map_err(|e| format!("open url: {e}"))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -287,6 +309,7 @@ fn main() {
             load_edf,
             list_edfs,
             open_data_directory,
+            open_external_url,
             show_in_explorer,
             delete_record_files,
         ])

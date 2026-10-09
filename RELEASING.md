@@ -35,7 +35,7 @@ makes that one command: **push a version tag → CI builds, signs, and publishes
    ```
 
 3. CI builds the Windows installer, signs it, and publishes a **GitHub Release** `v19.1.0`
-   containing `REACT EEG_19.1.0_x64-setup.exe`, its `.sig`, and `latest.json`.
+   containing `REACT EEG_21.3.0_x64-setup.exe`, its `.sig`, and `latest.json`.
 
 ## How the update reaches users
 

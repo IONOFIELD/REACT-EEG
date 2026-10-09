@@ -35,7 +35,7 @@ The token is a **secret**. Put it in a gitignored file the app reads at runtime 
 committed, never baked into the build, never placed in the URL, and never logged.
 
 1. Get the token from the Pi (`config/demo_token`) over a **private channel** (same `scp`, USB).
-2. Create the file **`public/pieeg-demo-token`** in this REACT-EEG folder and paste the token as its
+2. Create the file **`public/pieeg-demo-token`** in this repo folder and paste the token as its
    only contents (no quotes, no newline needed). `.gitignore` already excludes it.
 
 ### 3. (Ethernet demo only) set the wired IP

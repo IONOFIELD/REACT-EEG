@@ -60,6 +60,7 @@ Subject IDs follow a guided format like FB-001, SC-042, or OT-003. The app inclu
 - Each montage has system-specific channel derivations
 - Trace count changes when switching between 10-20, HD-40, and 10-10
 - **Custom Montage Builder** — build a bipolar montage from any two leads (A − B), regardless of standard pairings. Saved montages persist in the browser and are reusable across recordings; they appear at the bottom of the montage dropdown with a Build/Edit button beside it.
+- **Automatic montage selection** — each recording's structure is detected from its channel labels when it opens. Referential files (`Fp1`, `Fc3.`, `EEG Fp1-Ref`, `Fp1-LE`, `Fp1-A1`) open in the classic double banana when the full 10-20 set is present, otherwise in the adaptive banana; files that already store derivations (`FP1-F7`, `Fpz-Cz`) open As Recorded. Referenced labels are matched to their electrode, so montages populate regardless of how the file names its reference.
 
 ### Filters (Real DSP)
 - LFF (High-Pass): Off, 0.1, 0.3, 0.5, 1, 1.6, 5, 10 Hz
@@ -117,6 +118,14 @@ Subject IDs follow a guided format like FB-001, SC-042, or OT-003. The app inclu
 - Dropdown lists all records in the library
 - Switch files without returning to Library
 
+## Dataset Browser
+Search the [neoxai](https://github.com/neowalter/neoxai) catalog of open EEG/BCI datasets (CC-BY-4.0, curated by neowalter) without leaving REACT EEG. Open it from **Library → Datasets**.
+- Open-access EDF datasets on hosts that allow in-app downloads (currently Zenodo, e.g. the Helsinki neonatal EEG set) load into Review one file at a time, only when you ask.
+- For hosts that block in-app downloads (such as PhysioNet), download an `.edf` from the official page, then use **Open downloaded file**.
+- Datasets that require registration, a data use agreement or an application link to their official access page only.
+
+Files come straight from each dataset's official host and go through the normal de-identifying import. Nothing is cached, mirrored or uploaded, and each recording keeps the dataset's license and citation. Works offline from a bundled catalog snapshot.
+
 ## Signal Generation
 
 Waveforms are currently algorithmically generated with realistic characteristics:
@@ -161,7 +170,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173/react-eeg/ in your browser.
+Open http://localhost:5173/REACT-EEG/ in your browser.
 
 ### Testing
 

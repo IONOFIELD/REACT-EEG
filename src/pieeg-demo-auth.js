@@ -46,7 +46,7 @@ export function demoTokenUrl(base = "/") {
 
 // Load the token at runtime. Returns the trimmed token, or "" if unavailable (the caller then
 // surfaces a clear "no token configured" message rather than connecting blind). Never logged here.
-//   • Desktop (Tauri): read it from an EXTERNAL file (<Documents>/REACT EEG/demo_token) via the
+//   • Desktop (Tauri): read it from an EXTERNAL file (<Documents>/REACT-EEG/demo_token) via the
 //     Rust `load_demo_token` command, so the secret is never baked into the .exe bundle.
 //   • Browser (dev / preview): fetch the gitignored file served from public/.
 export async function loadDemoToken(base = "/") {

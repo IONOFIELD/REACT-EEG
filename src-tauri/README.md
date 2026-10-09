@@ -3,14 +3,14 @@
 Wraps the existing web app as a native Windows/macOS/Linux desktop application. The
 frontend is unchanged; the Rust backend in `src/main.rs` implements exactly the command
 surface the app's `tauriBridge` (`../src/App.jsx`) calls, persisting to plain files under
-`Documents/REACT EEG/` instead of the browser's IndexedDB.
+`Documents/REACT-EEG/` instead of the browser's IndexedDB.
 
 ## Status
 
 **Working.** Compiles and runs as a native desktop app; the production build produces a
 standalone `react-eeg.exe` (embeds the frontend) plus an NSIS installer
 (`REACT EEG_<version>_x64-setup.exe`). Verified end-to-end: launched standalone with no dev
-server, it renders the app and writes the library to `Documents/REACT EEG/`.
+server, it renders the app and writes the library to `Documents/REACT-EEG/`.
 
 > **Build with the Tauri CLI, not plain `cargo build`.** `cargo build [--release]` produces a
 > **dev-mode** binary that loads the frontend from `devUrl` (`localhost:5173`) — run alone it
@@ -60,7 +60,7 @@ runs `npm run build:tauri`, so `node`/`npm` must be on PATH.
 
 ## Data location
 
-`Documents/REACT EEG/` — `library.json`, `config.json`, `baselines.json`,
+`Documents/REACT-EEG/` — `library.json`, `config.json`, `baselines.json`,
 `collections.json`, `notes/<file>.txt`, `annotations/<file>.json`.
 
 **Known follow-up:** raw EDF blobs are still stored by the frontend in the WebView's

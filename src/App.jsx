@@ -30,6 +30,10 @@ import { computeQeegAnalysis, computeWPLI, computeCrossCorrelation } from "./qee
 import { hashSubjectId, generateFilename, parseEdfPatientField, scrubEdfHeaderForFilename, generalizeDateToYear, capAge, scanTextForPHI, scanLibraryForPHI, setHashSalt } from "./deid.js";
 import { httpBaseFromWs, recordingsUrl, downloadUrl, parseRecordings } from "./pieeg-recordings.js";
 import { authMessage, shouldAuthenticate, loadDemoToken } from "./pieeg-demo-auth.js";
+// Dataset Browser (neoxai catalog) — isolated panel; hands a File to IngestForm via onImport.
+import DatasetBrowser from "./DatasetBrowser.jsx";
+// Recording-structure detection (referential vs pre-montaged) — pure, unit-tested.
+import { classifyStructure, recommendMontage, electrodeMatchKey } from "./eeg-structure.js";
 
 // Per-deployment subject-hash salt (HIPAA Safe Harbor / G7): set at BUILD time via the
 // VITE_HASH_SALT env var so different sites don't produce linkable subject hashes. Applied once
@@ -90,6 +94,23 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v21.3.1", items: [
+    "Maintenance release — patch notes tidied; no functional changes",
+  ]},
+  { version: "v21.2.0", items: [
+    "Automatic montage selection — each recording's structure is detected from its channel labels when it opens: referential files open in the classic double banana (full 10-20 set) or the adaptive banana (high-density, sparse or modern T7/P7 naming); files that already store derivations (e.g. CHB-MIT, Sleep-EDF) open As Recorded",
+    "Montages now populate for files that name their reference in the label (\"EEG Fp1-Ref\", \"Fp1-LE\", \"Fp1-A1\") — previously such files showed almost no channels in the bipolar montages (e.g. the Helsinki neonatal set showed 1 of 23; it now opens with the full double banana)",
+    "Files that already matched keep matching exactly as before — the new reference-aware lookup is only a fallback",
+  ]},
+  { version: "v21.1.0", items: [
+    "New Dataset Browser (Library → Datasets) — search the neoxai catalog of open EEG/BCI datasets (curated by neowalter, CC-BY-4.0) with filters for access tier and format; each dataset shows its license, citation and official access page",
+    "Open-access EDF files on hosts that allow it (currently Zenodo, e.g. the Helsinki neonatal EEG set) download on demand, one file at a time, straight into the normal de-identifying import — with the Subject ID and the dataset's credit pre-filled",
+    "PhysioNet datasets link to PhysioNet (it blocks in-app downloads): download an .edf there, then use Open downloaded file. Registration / DUA datasets get their official link only — never downloaded, cached or mirrored",
+    "Imported dataset recordings keep their provenance (public-dataset, license, citation, source link); the browser works offline from a bundled catalog snapshot",
+  ]},
+  { version: "v21.0.0", items: [
+    "The splash screen and installer now credit Jayson Leach, R. EEG T. as publisher",
+  ]},
   { version: "v20.1.4", items: [
     "Recordings now carry their real start time — the EDF header's start date/time is the moment you pressed Record, not the moment the file was saved, so the time axis lines up with when the EEG was actually acquired",
     "Saved recordings keep their time of day — de-identification still reduces the date to the year only (HIPAA Safe Harbor), but no longer resets the clock time to 00:00:00, since time of day is not a Safe Harbor identifier",
@@ -551,7 +572,7 @@ async function saveEdfToDB(filename, arrayBuffer) {
     // bytes (patient-package .zip, .reegb bundle) is PHI-free by construction. Returns a
     // copy; the caller's in-memory buffer is untouched. See src/deid.js + test/deid.test.js.
     const scrubbed = scrubEdfHeaderForFilename(arrayBuffer, filename);
-    // Desktop (Tauri): write the scrubbed bytes to Documents/REACT EEG/edf/ as a real file.
+    // Desktop (Tauri): write the scrubbed bytes to Documents/REACT-EEG/edf/ as a real file.
     if (typeof window !== "undefined" && window.__TAURI__) {
       await window.__TAURI__.invoke("save_edf", { filename, edfBase64: arrayBufferToBase64(scrubbed) });
       return;
@@ -598,7 +619,7 @@ function base64ToArrayBuffer(b64) {
 
 async function loadAllEdfsFromDB() {
   try {
-    // Desktop (Tauri): read the EDF files from Documents/REACT EEG/edf/.
+    // Desktop (Tauri): read the EDF files from Documents/REACT-EEG/edf/.
     if (typeof window !== "undefined" && window.__TAURI__) {
       const results = {};
       const names = JSON.parse((await window.__TAURI__.invoke("list_edfs")) || "[]");
@@ -2411,7 +2432,7 @@ const tauriBridge = {
     if (window.__TAURI__) {
       return window.__TAURI__.invoke("show_in_explorer", { studyType, filename });
     }
-    notify(`File location: Documents/REACT EEG/data/${studyType}/${filename}\n(Run as desktop app to open in Explorer)`, "info");
+    notify(`File location: Documents/REACT-EEG/data/${studyType}/${filename}\n(Run as desktop app to open in Explorer)`, "info");
   },
   async deleteFiles(studyType, filename) {
     if (window.__TAURI__) {
@@ -2483,7 +2504,7 @@ const tauriBridge = {
     if (window.__TAURI__) {
       return window.__TAURI__.invoke("open_data_directory");
     }
-    notify("Documents/REACT EEG/\n(Run as desktop app to open folder)", "info");
+    notify("Documents/REACT-EEG/\n(Run as desktop app to open folder)", "info");
   },
 };
 
@@ -3368,12 +3389,14 @@ function detectEdfSystem(edfData) {
   if (n <= 40) return "hd-40";
   return "10-10";
 }
+// How the file's scalp channels were recorded (referential / pre-montaged derivations / unknown).
+// "EEG Fp1-Ref" counts as referential — the old electrode-dash-letters test mistook it for a derivation.
+function edfStructure(edfData) {
+  return classifyStructure(edfData?.channelLabels || [], canonicalElectrode);
+}
 // Does the file ship derivations in its labels (a pre-montaged EDF, e.g. "Fp1-F3")?
 function edfHasDerivedLabels(edfData) {
-  return (edfData?.channelLabels || []).some(l => {
-    const c = cleanEdfLabel(l);
-    return /^[A-Za-z]+\d*-[A-Za-z]+\d*$/.test(c); // electrode-electrode, e.g. Fp1-F3
-  });
+  return edfStructure(edfData).kind === "derived";
 }
 
 // Per-signal analysis of a parsed EDF. Maps each signal to an electrode + type and measures
@@ -5821,7 +5844,10 @@ function useEEGState(totalDuration = 600, edfData = null) {
     autoMontageRef.current = edfData;
     const sys = detectEdfSystem(edfData) || "10-20";
     setEegSystem(sys);
-    setMontage(sys === "10-20" ? "bipolar-longitudinal" : MONTAGE_ADAPTIVE);
+    // Detect the recording's structure and open it in a montage that displays it: referential
+    // 10-20 → classic banana; high-density / sparse / modern-named → adaptive banana; a file that
+    // already stores derivations (or has no recognisable scalp leads) → as recorded.
+    setMontage(recommendMontage(edfStructure(edfData)));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [edfData]);
 
@@ -5846,6 +5872,15 @@ function useEEGState(totalDuration = 600, edfData = null) {
   // Normalize EDF label for matching (shared across hook)
   const normEdf = (l) => { const u = l.toUpperCase().trim(); if (/^(ECG|EKG)$/i.test(u)) return u.replace(/[\s\-\.]/g,""); return u.replace(/^(EEG|ECG|EOG|EMG)\s+/,"").replace(/[\s\-\.]/g,""); };
   const normCh  = (l) => l.toUpperCase().replace(/[\s\-\.]/g,"");
+  // Electrode lookup for montage derivations: the exact label match comes first (unchanged
+  // behaviour); only if nothing matches is a referential label accepted with its reference suffix
+  // stripped ("EEG Fp1-Ref", "Fp1-LE", "Fp1-A1" → FP1). See ./eeg-structure.js.
+  const edfElectrodeKeys = useMemo(() => (edfData?.channelLabels || []).map(electrodeMatchKey), [edfData]);
+  const findElectrodeIdx = (name) => {
+    const k = normCh(name);
+    const exact = edfData.channelLabels.findIndex(l => normEdf(l) === k);
+    return exact >= 0 ? exact : edfElectrodeKeys.indexOf(k);
+  };
 
   // Compute which montage channels have real EDF coverage
   const channelsWithData = useMemo(() => {
@@ -5874,13 +5909,13 @@ function useEEGState(totalDuration = 600, edfData = null) {
         const parts = ch.split("-");
         const ref = parts[parts.length - 1];
         if (ref === "Avg" || ref === "Cz") {
-          if (normed.some(n => n === normCh(parts[0]))) covered.add(ch);
+          if (findElectrodeIdx(parts[0]) >= 0) covered.add(ch);
         } else if (parts.length === 2) {
-          if (normed.some(n => n === normCh(parts[0])) && normed.some(n => n === normCh(parts[1]))) covered.add(ch);
-          else if (normed.some(n => n === normCh(parts[0]))) covered.add(ch); // partial — show with ref subtracted
+          if (findElectrodeIdx(parts[0]) >= 0 && findElectrodeIdx(parts[1]) >= 0) covered.add(ch);
+          else if (findElectrodeIdx(parts[0]) >= 0) covered.add(ch); // partial — show with ref subtracted
         }
       } else {
-        if (normed.some(n => n === normCh(ch))) covered.add(ch);
+        if (findElectrodeIdx(ch) >= 0) covered.add(ch);
       }
     });
     return covered;
@@ -5988,13 +6023,15 @@ function useEEGState(totalDuration = 600, edfData = null) {
       const isSingleLabel = montage === MONTAGE_AS_RECORDED || isEyeLead || isEKG || !ch.includes("-");
       if (isSingleLabel) {
         const searchLabel = isEKG ? "ECG" : ch;
-        const edfIdx = edfData.channelLabels.findIndex(l => {
+        let edfIdx = edfData.channelLabels.findIndex(l => {
           const n = normEdf(l);
           if (n === normCh(searchLabel) || n === normCh(ch)) return true;
           if (isEKG && (n === "ECG" || n === "EKG")) return true;
           if (isEyeLead && EYE_LEAD_ALIASES[n] === ch) return true;
           return false;
         });
+        // A bare electrode in a preset montage may be stored with a reference suffix ("Fz-Ref").
+        if (edfIdx < 0 && montage !== MONTAGE_AS_RECORDED && !isEKG && !isEyeLead) edfIdx = edfElectrodeKeys.indexOf(normCh(ch));
         if (edfIdx >= 0) {
           sig = fullEl(edfIdx);
           // ECG often stored in mV → scale to µV for display (same heuristic as before)
@@ -6008,13 +6045,13 @@ function useEEGState(totalDuration = 600, edfData = null) {
         const ref = parts[parts.length - 1];
         const isAvgRef = ref === "Avg";
         const isCzRef = ref === "Cz";
-        const idx1 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[0]));
+        const idx1 = findElectrodeIdx(parts[0]);
         if (isAvgRef) {
           if (idx1 >= 0) { const e = fullEl(idx1); sig = reRefAvg(e) || e; }
         } else if (isCzRef) {
           if (idx1 >= 0) sig = fullEl(idx1);
         } else if (parts.length === 2) {
-          const idx2 = edfData.channelLabels.findIndex(l => normEdf(l) === normCh(parts[1]));
+          const idx2 = findElectrodeIdx(parts[1]);
           if (idx1 >= 0 && idx2 >= 0) {
             const a = fullEl(idx1), b = fullEl(idx2);
             if (a && b) { sig = new Float32Array(a.length); for (let i = 0; i < a.length; i++) sig[i] = a[i] - (i < b.length ? b[i] : 0); }
@@ -6717,6 +6754,9 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
   const [filterStatus, setFilterStatus] = useState("ALL");
   const [viewMode, setViewMode] = useState("table");
   const [showImport, setShowImport] = useState(false);
+  const [showDatasets, setShowDatasets] = useState(false);
+  const [datasetImport, setDatasetImport] = useState(null); // { file, source } handed over by the Dataset Browser
+  const closeImport = () => { setShowImport(false); setDatasetImport(null); };
   const [showExport, setShowExport] = useState(false);
   const [selectedRecord, setSelectedRecord] = useState(null);
   const [sortField, setSortField] = useState("date");
@@ -7022,6 +7062,10 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
         <span style={{flex:1}}/>
 
         {/* Right group: act */}
+        <button data-tut="Datasets: Search the neoxai catalog of open EEG/BCI datasets. Open-access EDF recordings load straight into your library (through the normal de-identifying import); everything else links to its official access page." onClick={()=>setShowDatasets(true)} style={{
+          padding:"7px 16px",background:"#161616",border:"1px solid #4a9bab50",borderRadius:0,
+          color:"#7ec8d9",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6,letterSpacing:"0.05em"
+        }}>{I.Search(13)} DATASETS</button>
         <button data-tut="Import: Bring in a single EDF/EDF+ recording. De-identifies the file, detects channels/rate/duration, and adds it to the library." onClick={()=>setShowImport(true)} style={{
           padding:"7px 16px",background:"#1a4a54",border:"1px solid #4a9bab50",borderRadius:0,
           color:"#7ec8d9",cursor:"pointer",fontSize:11,fontWeight:700,display:"flex",alignItems:"center",gap:6,letterSpacing:"0.05em"
@@ -7315,10 +7359,15 @@ function LibraryTab({ onOpenTimeline, selectedCollectionId, setSelectedCollectio
       </div>
 
       {/* Import Modal */}
+      {showDatasets && (
+        <DatasetBrowser onClose={()=>setShowDatasets(false)}
+          onImport={(file, source)=>{ setDatasetImport({ file, source }); setShowDatasets(false); setShowImport(true); }}/>
+      )}
+
       {showImport && (
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={()=>setShowImport(false)}>
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.7)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000}} onClick={closeImport}>
           <div ref={importDialogRef} role="dialog" aria-modal="true" aria-label="Import recording" onClick={e=>e.stopPropagation()} style={{background:"#111",border:"1px solid #2a2a2a",borderRadius:0,padding:28,width:780,maxWidth:"calc(100vw - 48px)",maxHeight:"85vh",overflow:"auto"}}>
-            <IngestForm onClose={()=>setShowImport(false)} onIngest={handleIngest} setEdfFileStore={setEdfFileStore} setAnnotationsMap={setAnnotationsMap} setClinicalNotesMap={setClinicalNotesMap} setBaselineMap={setBaselineMap}/>
+            <IngestForm onClose={closeImport} onIngest={handleIngest} initialFile={datasetImport?.file} initialSource={datasetImport?.source} setEdfFileStore={setEdfFileStore} setAnnotationsMap={setAnnotationsMap} setClinicalNotesMap={setClinicalNotesMap} setBaselineMap={setBaselineMap}/>
           </div>
         </div>
       )}
@@ -7823,7 +7872,10 @@ function validateEDFImport(parsed, form) {
   return { errors, warnings, passed };
 }
 
-function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, setClinicalNotesMap, setBaselineMap }) {
+// initialFile / initialSource (both optional) come from the Dataset Browser: the form opens with the
+// file already chosen, and the record carries the public dataset's attribution. Without them the
+// form behaves exactly as a normal import.
+function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, setClinicalNotesMap, setBaselineMap, initialFile = null, initialSource = null }) {
   const [form, setForm] = useState({
     subjectId:"",studyType:"BL",date:new Date().toISOString().split("T")[0],
     channels:21,sampleRate:256,duration:30,montage:"10-20",notes:"",sex:"",age:"",
@@ -8013,6 +8065,19 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
 
   useEffect(() => { if (selectedFile) runValidation(); }, [selectedFile]);
 
+  // Dataset Browser handoff: select the downloaded file exactly as the file picker would, and
+  // pre-fill a suggested Subject ID plus a credit line (no URL — long digit runs trip the PHI scan).
+  useEffect(() => {
+    if (!initialFile) return;
+    handleFileSelect({ target: { files: [initialFile] } });
+    const a = initialSource?.attribution;
+    setForm(prev => ({
+      ...prev,
+      subjectId: initialSource?.suggestedSubjectId || prev.subjectId,
+      notes: a ? `Public dataset: ${a.dataset} (${a.license}). Cite: ${a.citation}` : prev.notes,
+    }));
+  }, [initialFile]);
+
   const handleSubmit = () => {
     if (!form.subjectId) return;
     // Block import if validation has blocking errors and user hasn't overridden
@@ -8027,7 +8092,8 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
       fileSize:fileSizeMB,sex:form.sex||"",age:form.age?capAge(parseInt(form.age)):null, // Safe Harbor: 90+ aggregate
       montage:form.montage,status:"pending",isTest:false,notes:form.notes,uploadedAt:new Date().toISOString(),
       sourceFile: selectedFile ? selectedFile.name : null,
-      sourceType: "import", nonClinical: false, // provenance: user-imported single EDF
+      sourceType: initialSource?.attribution ? "public-dataset" : "import", nonClinical: false, // provenance: user-imported EDF, or a public dataset via the Dataset Browser
+      ...(initialSource?.attribution ? { fileType: "real-public", sourceAttribution: initialSource.attribution } : {}),
       hasEdfData: !!selectedFile,
       pipelineVersion: PIPELINE_VERSION,
       schemaVersion: SCHEMA_VERSION,
@@ -8103,6 +8169,11 @@ function IngestForm({ onClose, onIngest, setEdfFileStore, setAnnotationsMap, set
       <h3 style={{margin:0,color:"#e0e0e0",fontSize:16,fontWeight:700}}>Import New Record</h3>
       <button onClick={onClose} style={{background:"none",border:"none",color:"#666",cursor:"pointer",padding:4}}>{I.X()}</button>
     </div>
+    {initialSource?.attribution && (
+      <div style={{marginBottom:16,padding:"10px 12px",border:"1px solid #4a9bab40",background:"#1a4a5420",fontSize:12,color:"#9fd3df",lineHeight:1.5}}>
+        From the Dataset Browser: <b>{initialSource.attribution.dataset}</b> · {initialSource.attribution.license}. The dataset's credit and source link stay attached to this recording. Check the suggested Subject ID, then import.
+      </div>
+    )}
 
     {/* File picker */}
     <div style={{marginBottom:20}}>
@@ -11371,7 +11442,7 @@ export default function ReactEEGApp() {
           animation: "splashFadeIn 0.7s ease 0.6s both",
           display:"flex",alignItems:"center",gap:12,
           fontFamily:"'IBM Plex Mono', monospace",
-        }}>REACT EEG, LLC &mdash; 2026 <span style={{color:"#4a9bab80",fontSize:10,fontWeight:600,letterSpacing:"0.1em"}}>{APP_VERSION}</span></div>
+        }}>Jayson Leach, R. EEG T. &mdash; 2026 <span style={{color:"#4a9bab80",fontSize:10,fontWeight:600,letterSpacing:"0.1em"}}>{APP_VERSION}</span></div>
       </div>
     );
   }
@@ -11423,7 +11494,7 @@ export default function ReactEEGApp() {
             </button>
             <div>
               <div style={{fontSize:18,fontWeight:700,letterSpacing:"0.04em",color:"#e0e0e0",fontFamily:"'Rajdhani', sans-serif",display:"flex",alignItems:"baseline",gap:8}}>
-                REACT <span style={{color:"#7ec8d9"}}>EEG</span>
+                <span>REACT <span style={{color:"#7ec8d9"}}>EEG</span></span>
                 <span style={{fontSize:9,fontWeight:600,color:"#4a9bab80",letterSpacing:"0.08em",fontFamily:"'IBM Plex Mono', monospace"}}>{APP_VERSION}</span>
               </div>
               <div style={{fontSize:9,color:"#555",letterSpacing:"0.12em",fontWeight:600,fontFamily:"'Rajdhani', sans-serif",textTransform:"uppercase"}}>BIOMETRIC DATA ACQUISITION & STORAGE</div>

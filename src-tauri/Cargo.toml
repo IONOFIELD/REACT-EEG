@@ -1,8 +1,8 @@
 [package]
 name = "react-eeg"
-version = "20.1.4"
+version = "21.3.1"
 description = "REACT EEG — desktop EEG analysis & storage"
-authors = ["REACT EEG, LLC"]
+authors = ["Jayson Leach, R. EEG T."]
 edition = "2021"
 rust-version = "1.77"
 
