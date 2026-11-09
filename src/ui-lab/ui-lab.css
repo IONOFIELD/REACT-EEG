@@ -1,0 +1,241 @@
+/* Scoped to the UI lab. Nothing here reaches the clinical app unless
+   body.ui-lab-root is set, and that class is removed when the lab unmounts. */
+
+body.ui-lab-root {
+  background: #111111;
+  color: #ffffff;
+}
+
+.ui-lab {
+  min-height: 100vh;
+  background: #111111;
+  color: #ffffff;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+.ui-lab button {
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-lab .lab-wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 28px 32px 64px;
+}
+
+.ui-lab .lab-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 24px;
+}
+
+.ui-lab .kicker {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.ui-lab .lab-sub {
+  margin-top: 6px;
+  color: #a3a3a3;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  max-width: 640px;
+  line-height: 1.45;
+}
+
+.ui-lab .back {
+  background: transparent;
+  border: none;
+  color: #a3a3a3;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.ui-lab .back:hover { color: #ffffff; }
+
+.ui-lab .warn {
+  margin-top: 18px;
+  color: #a3a3a3;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.ui-lab .sets {
+  display: flex;
+  gap: 22px;
+  margin-top: 28px;
+}
+
+.ui-lab .set {
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: #888888;
+  text-align: left;
+}
+
+.ui-lab .set.on { color: #3b82f6; }
+
+.ui-lab .set-name {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ui-lab .set-meta {
+  margin-top: 3px;
+  font-size: 12px;
+  color: #888888;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 400;
+}
+
+.ui-lab .set.on .set-meta { color: #a3a3a3; }
+
+.ui-lab .chart { margin-top: 36px; }
+
+.ui-lab .chart-head { margin-bottom: 8px; }
+
+.ui-lab .chart-title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.ui-lab .chart-sub {
+  margin-top: 4px;
+  color: #888888;
+  font-size: 12px;
+  letter-spacing: 0.01em;
+}
+
+.ui-lab .chart-stage {
+  position: relative;
+  width: 100%;
+  touch-action: none;
+  cursor: default;
+}
+
+.ui-lab .chart-field,
+.ui-lab .chart-over {
+  position: absolute;
+  left: 0;
+  top: 0;
+  display: block;
+}
+
+.ui-lab .chart-over { pointer-events: none; }
+
+.ui-lab .scrub-tip {
+  position: absolute;
+  pointer-events: none;
+  background: #111111;
+  padding: 2px 4px 3px;
+}
+
+.ui-lab .scrub-time {
+  color: #ffffff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.ui-lab .scrub-val,
+.ui-lab .scrub-extra {
+  color: #a3a3a3;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.ui-lab .bands {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.ui-lab .band {
+  background: transparent;
+  border: none;
+  color: #888888;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 6px 8px;
+}
+
+.ui-lab .band.on { color: #3b82f6; }
+
+.ui-lab .note {
+  margin-top: 10px;
+  color: #888888;
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 720px;
+}
+
+.ui-lab .row-actions {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.ui-lab .text-btn {
+  background: transparent;
+  border: none;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ui-lab .text-btn[disabled] { color: #404040; cursor: default; }
+
+.ui-lab .log {
+  margin-top: 8px;
+  color: #888888;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ui-lab .log div { font-variant-numeric: tabular-nums; }
+
+.ui-lab .bench {
+  margin-top: 28px;
+  color: #a3a3a3;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ui-lab .bench strong {
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.ui-lab .status {
+  margin-top: 48px;
+  color: #888888;
+  font-size: 13px;
+}
