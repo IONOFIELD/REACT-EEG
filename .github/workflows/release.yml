@@ -52,6 +52,24 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "REACT EEG ${{ github.ref_name }}"
-          releaseBody: "Automated desktop build. Download the `-setup.exe` to install; existing installs update themselves."
+          releaseBody: |
+            **Download (Windows 10/11, x64):**
+            - `REACT.EEG_*_x64-setup.exe` — installer (recommended). Adds Start-menu shortcuts; existing installs update themselves.
+            - `REACT.EEG_*_x64-portable.exe` — no install: save anywhere and double-click to run. Uses the same data folder (Documents\REACT EEG). Needs the Microsoft Edge WebView2 runtime, which Windows 10/11 already include.
+
+            "Source code (zip / tar.gz)" contains code only and cannot be launched.
           releaseDraft: false
           prerelease: false
+
+      # The installer is the main artifact; also attach the bare app executable so people can
+      # run REACT without installing (same signed build, frontend embedded).
+      - name: Attach portable executable
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ver = "${{ github.ref_name }}".TrimStart('v')
+          $out = "REACT.EEG_${ver}_x64-portable.exe"
+          Copy-Item "src-tauri/target/release/react-eeg.exe" $out
+          gh release upload "${{ github.ref_name }}" $out --clobber

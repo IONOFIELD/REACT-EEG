@@ -6,6 +6,16 @@ Desktop EEG review, de-identification, and live acquisition. Import EDF, annotat
 
 started R&D Oct 2024 - full build in may 2026. Hello, future Jayson.
 
+## Download
+
+Get the latest Windows build from **[Releases → Latest](https://github.com/IONOFIELD/REACT-EEG/releases/latest)**, under **Assets**:
+
+| File | Use |
+|---|---|
+| `REACT.EEG_<version>_x64-setup.exe` | **Installer (recommended).** Start-menu shortcut; updates itself. |
+| `REACT.EEG_<version>_x64-portable.exe` | **No install.** Save anywhere and double-click. Same data folder (`Documents\REACT EEG`). Needs WebView2, which Windows 10/11 include. |
+| Source code (zip / tar.gz) | Code only, not launchable. |
+
 ---
 
 ## Overview
