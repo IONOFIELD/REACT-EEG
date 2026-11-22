@@ -8,17 +8,18 @@
 // persist to plain files under `Documents/REACT EEG/`, so a desktop install has real,
 // user-visible, backup-able storage with no 5 MB browser cap.
 //
-// Layout under the data dir:
-//   library.json                  — the record index (array)
-//   config.json                   — app config blob
-//   baselines.json                — baseline-comparison map
-//   collections.json              — collection list
-//   notes/<edf-filename>.txt       — per-recording clinical notes
-//   annotations/<edf-filename>.json — per-recording annotation array
+// Layout under the data dir — ONE FOLDER PER RECORDING:
+//   library.json                         — the record index (array)
+//   config.json                          — app config blob
+//   baselines.json                       — baseline-comparison map
+//   collections.json                     — collection list
+//   recordings/<stem>/<stem>.edf         — the EDF itself
+//   recordings/<stem>/annotations.json   — per-recording annotation array
+//   recordings/<stem>/notes.txt          — per-recording clinical notes
+// where <stem> is the EDF filename without its .edf extension.
 //
-// NOTE: raw EDF blobs are still persisted by the frontend in the WebView's IndexedDB (the
-// bridge has no EDF command). That works on desktop too; moving EDFs onto the filesystem is
-// a follow-up that also needs a frontend bridge command.
+// Legacy layout (edf/, notes/, annotations/ as sibling folders) is migrated into
+// recordings/<stem>/ on startup by `initialize_app`; loads also fall back to the legacy path.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use std::fs;
@@ -51,6 +52,88 @@ fn read_string(path: &PathBuf) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+// ── Per-recording folder ─────────────────────────────────────────────────────
+
+/// Folder name for a recording: the EDF filename minus its .edf extension.
+fn record_stem(filename: &str) -> String {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".edf") { filename[..filename.len() - 4].to_string() } else { filename.to_string() }
+}
+
+/// Reject anything that could escape the data dir (path separators, `..`, empty).
+fn check_filename(filename: &str) -> Result<(), String> {
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return Err(format!("invalid recording filename: {filename:?}"));
+    }
+    Ok(())
+}
+
+/// `recordings/<stem>/` for a recording (not created).
+fn record_dir(filename: &str) -> PathBuf {
+    data_dir().join("recordings").join(record_stem(filename))
+}
+
+fn record_edf_path(filename: &str) -> PathBuf { record_dir(filename).join(filename) }
+fn record_annotations_path(filename: &str) -> PathBuf { record_dir(filename).join("annotations.json") }
+fn record_notes_path(filename: &str) -> PathBuf { record_dir(filename).join("notes.txt") }
+
+// Legacy (pre-v20.2) split-folder paths — read-only fallback + migration source.
+fn legacy_edf_path(filename: &str) -> PathBuf { data_dir().join("edf").join(filename) }
+fn legacy_annotations_path(filename: &str) -> PathBuf { data_dir().join("annotations").join(format!("{filename}.json")) }
+fn legacy_notes_path(filename: &str) -> PathBuf { data_dir().join("notes").join(format!("{filename}.txt")) }
+
+/// First path that exists, else the first (new-layout) path.
+fn existing_or_first(paths: [PathBuf; 2]) -> PathBuf {
+    if !paths[0].exists() && paths[1].exists() { paths[1].clone() } else { paths[0].clone() }
+}
+
+/// Move one legacy file into its recording folder. Never overwrites a file already there.
+fn migrate_one(from: &PathBuf, to: &PathBuf) -> Result<(), String> {
+    if !from.exists() || to.exists() { return Ok(()); }
+    if let Some(parent) = to.parent() { ensure_dir(&parent.to_path_buf())?; }
+    if fs::rename(from, to).is_err() {
+        // rename can fail across volumes — copy, then remove the source.
+        fs::copy(from, to).map_err(|e| format!("copy {:?} -> {:?}: {e}", from, to))?;
+        fs::remove_file(from).map_err(|e| format!("remove {:?}: {e}", from))?;
+    }
+    Ok(())
+}
+
+/// Fold edf/, notes/, annotations/ into recordings/<stem>/. Idempotent; removes the legacy
+/// folders only when they end up empty.
+fn migrate_legacy_layout() -> Result<u32, String> {
+    let dir = data_dir();
+    let mut moved = 0u32;
+    // EDFs
+    if let Ok(entries) = fs::read_dir(dir.join("edf")) {
+        for e in entries.flatten() {
+            if !e.path().is_file() { continue; }
+            if let Some(name) = e.file_name().to_str() {
+                if check_filename(name).is_err() { continue; }
+                let to = record_edf_path(name);
+                if !to.exists() { migrate_one(&e.path(), &to)?; moved += 1; }
+            }
+        }
+    }
+    // Sidecars: notes/<file>.txt, annotations/<file>.json
+    for (sub, ext, is_notes) in [("notes", ".txt", true), ("annotations", ".json", false)] {
+        if let Ok(entries) = fs::read_dir(dir.join(sub)) {
+            for e in entries.flatten() {
+                if !e.path().is_file() { continue; }
+                let Some(name) = e.file_name().to_str().map(|s| s.to_string()) else { continue };
+                let Some(filename) = name.strip_suffix(ext) else { continue };
+                if check_filename(filename).is_err() { continue; }
+                let to = if is_notes { record_notes_path(filename) } else { record_annotations_path(filename) };
+                if !to.exists() { migrate_one(&e.path(), &to)?; moved += 1; }
+            }
+        }
+    }
+    for sub in ["edf", "notes", "annotations"] {
+        let _ = fs::remove_dir(dir.join(sub)); // only succeeds if empty
+    }
+    Ok(moved)
+}
+
 fn write_string(path: &PathBuf, contents: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create parent {:?}: {e}", parent))?;
@@ -64,10 +147,13 @@ fn write_string(path: &PathBuf, contents: &str) -> Result<(), String> {
 fn initialize_app() -> Result<String, String> {
     let dir = data_dir();
     ensure_dir(&dir)?;
-    ensure_dir(&dir.join("notes"))?;
-    ensure_dir(&dir.join("annotations"))?;
-    ensure_dir(&dir.join("edf"))?;
-    Ok(format!("Desktop mode — filesystem persistence at {}", dir.display()))
+    ensure_dir(&dir.join("recordings"))?;
+    let note = match migrate_legacy_layout() {
+        Ok(0) => String::new(),
+        Ok(n) => format!(" (migrated {n} legacy file(s) into per-recording folders)"),
+        Err(e) => format!(" (legacy migration incomplete: {e})"),
+    };
+    Ok(format!("Desktop mode — filesystem persistence at {}{note}", dir.display()))
 }
 
 #[tauri::command]
@@ -112,13 +198,14 @@ fn save_library_index(records_json: String) -> Result<(), String> {
 
 #[tauri::command]
 fn save_annotations(filename: String, annotations_json: String) -> Result<(), String> {
-    let p = data_path(&["annotations", &format!("{filename}.json")])?;
-    write_string(&p, &annotations_json)
+    check_filename(&filename)?;
+    write_string(&record_annotations_path(&filename), &annotations_json)
 }
 
 #[tauri::command]
 fn load_annotations(filename: String) -> String {
-    let p = data_dir().join("annotations").join(format!("{filename}.json"));
+    if check_filename(&filename).is_err() { return "[]".to_string(); }
+    let p = existing_or_first([record_annotations_path(&filename), legacy_annotations_path(&filename)]);
     let s = read_string(&p);
     if s.is_empty() { "[]".to_string() } else { s }
 }
@@ -127,14 +214,14 @@ fn load_annotations(filename: String) -> String {
 
 #[tauri::command]
 fn save_clinical_notes(filename: String, notes_text: String) -> Result<(), String> {
-    let p = data_path(&["notes", &format!("{filename}.txt")])?;
-    write_string(&p, &notes_text)
+    check_filename(&filename)?;
+    write_string(&record_notes_path(&filename), &notes_text)
 }
 
 #[tauri::command]
 fn load_clinical_notes(filename: String) -> String {
-    let p = data_dir().join("notes").join(format!("{filename}.txt"));
-    read_string(&p)
+    if check_filename(&filename).is_err() { return String::new(); }
+    read_string(&existing_or_first([record_notes_path(&filename), legacy_notes_path(&filename)]))
 }
 
 // ── Baseline map ─────────────────────────────────────────────────────────────
@@ -175,13 +262,16 @@ fn load_collections() -> String {
 #[tauri::command]
 fn save_edf(filename: String, edf_base64: String) -> Result<(), String> {
     let bytes = STANDARD.decode(edf_base64.as_bytes()).map_err(|e| format!("base64 decode: {e}"))?;
-    let p = data_path(&["edf", &filename])?;
+    check_filename(&filename)?;
+    let p = record_edf_path(&filename);
+    if let Some(parent) = p.parent() { ensure_dir(&parent.to_path_buf())?; }
     fs::write(&p, &bytes).map_err(|e| format!("write {:?}: {e}", p))
 }
 
 #[tauri::command]
 fn load_edf(filename: String) -> String {
-    let p = data_dir().join("edf").join(&filename);
+    if check_filename(&filename).is_err() { return String::new(); }
+    let p = existing_or_first([record_edf_path(&filename), legacy_edf_path(&filename)]);
     match fs::read(&p) {
         Ok(bytes) => STANDARD.encode(bytes),
         Err(_) => String::new(),
@@ -190,13 +280,28 @@ fn load_edf(filename: String) -> String {
 
 #[tauri::command]
 fn list_edfs() -> String {
-    let dir = data_dir().join("edf");
+    // Every *.edf inside recordings/<stem>/, plus any stragglers left in legacy edf/.
     let mut names: Vec<String> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&dir) {
+    if let Ok(folders) = fs::read_dir(data_dir().join("recordings")) {
+        for folder in folders.flatten() {
+            if !folder.path().is_dir() { continue; }
+            if let Ok(files) = fs::read_dir(folder.path()) {
+                for f in files.flatten() {
+                    if !f.path().is_file() { continue; }
+                    if let Some(name) = f.file_name().to_str() {
+                        if name.to_ascii_lowercase().ends_with(".edf") && !names.iter().any(|n| n == name) {
+                            names.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(data_dir().join("edf")) {
         for entry in entries.flatten() {
             if entry.path().is_file() {
                 if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_string());
+                    if !names.iter().any(|n| n == name) { names.push(name.to_string()); }
                 }
             }
         }
@@ -215,8 +320,10 @@ fn open_data_directory() -> Result<(), String> {
 
 #[tauri::command]
 fn show_in_explorer(_study_type: String, filename: String) -> Result<(), String> {
-    // Reveal the EDF file on disk if present; otherwise open the data directory.
-    let edf = data_dir().join("edf").join(&filename);
+    // Reveal the EDF inside its recording folder if present; otherwise open the data directory.
+    let edf = if check_filename(&filename).is_ok() {
+        existing_or_first([record_edf_path(&filename), legacy_edf_path(&filename)])
+    } else { data_dir().join("__invalid__") };
     if edf.exists() {
         #[cfg(target_os = "windows")]
         {
@@ -239,12 +346,14 @@ fn show_in_explorer(_study_type: String, filename: String) -> Result<(), String>
 
 #[tauri::command]
 fn delete_record_files(_study_type: String, filename: String) -> Result<(), String> {
-    // Remove the on-disk sidecars + EDF for a deleted record. The record itself is dropped
-    // from library.json by the next save_library_index.
-    let notes = data_dir().join("notes").join(format!("{filename}.txt"));
-    let anns = data_dir().join("annotations").join(format!("{filename}.json"));
-    let edf = data_dir().join("edf").join(&filename);
-    for p in [notes, anns, edf] {
+    // Remove the recording's folder (EDF + annotations + notes) and any legacy leftovers.
+    // The record itself is dropped from library.json by the next save_library_index.
+    check_filename(&filename)?;
+    let folder = record_dir(&filename);
+    if folder.exists() {
+        fs::remove_dir_all(&folder).map_err(|e| format!("remove {:?}: {e}", folder))?;
+    }
+    for p in [legacy_notes_path(&filename), legacy_annotations_path(&filename), legacy_edf_path(&filename)] {
         if p.exists() {
             fs::remove_file(&p).map_err(|e| format!("remove {:?}: {e}", p))?;
         }

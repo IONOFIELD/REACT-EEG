@@ -60,12 +60,17 @@ runs `npm run build:tauri`, so `node`/`npm` must be on PATH.
 
 ## Data location
 
-`Documents/REACT-EEG/` — `library.json`, `config.json`, `baselines.json`,
-`collections.json`, `notes/<file>.txt`, `annotations/<file>.json`.
+`Documents/REACT EEG/` — `library.json`, `config.json`, `baselines.json`,
+`collections.json`, plus **one folder per recording**:
 
-**Known follow-up:** raw EDF blobs are still stored by the frontend in the WebView's
-IndexedDB (the bridge has no EDF command), so they aren't yet on the filesystem. Moving them
-into the data dir needs a new bridge command (`save_edf`/`load_edf`) on both sides.
+```
+recordings/<stem>/<stem>.edf
+recordings/<stem>/annotations.json
+recordings/<stem>/notes.txt
+```
+
+The older split layout (`edf/`, `notes/`, `annotations/`) is migrated into `recordings/`
+automatically on startup; loads also fall back to the old paths.
 
 ## Signing + auto-update (phase 4, later)
 

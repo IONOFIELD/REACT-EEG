@@ -94,6 +94,10 @@ const debugLog = (...args) => { if (DEBUG) console.log(...args); };
 // Concise list of recent changes. Newest first; each session the user dismisses
 // it via the ENTER button on the splash. Keep entries to ~1 short line each.
 const CHANGELOG = [
+  { version: "v21.3.2", items: [
+    "Review: single-click a trace to annotate; double-click opens channel settings",
+    "Desktop storage: one folder per EEG (EDF + annotations + notes); old layout migrated on first launch",
+  ]},
   { version: "v21.3.1", items: [
     "Maintenance release — patch notes tidied; no functional changes",
   ]},
@@ -2681,7 +2685,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
     measureSel, measureDragRef, containerRef, canvasRef, montage,
     isLiveSimulation, simClipRef,
     handleCanvasMouseMove: onMouseMove, handleCanvasMouseDown: onMouseDown,
-    handleCanvasMouseUp: onMouseUp, handleCanvasClick: onClick,
+    handleCanvasMouseUp: onMouseUp, handleCanvasClick: onClick, handleCanvasDoubleClick: onDoubleClick,
     handleContextMenu: onContextMenu,
   } = eeg;
   const onMouseLeave = () => eeg.setHoveredTime(null);
@@ -3136,7 +3140,7 @@ function WaveformCanvas({ eeg, children, playbackAbsSec = null, isPlaying = fals
   return (
     <div ref={containerRef}
       style={{ flex: 1, position: "relative", cursor: isMeasuring ? "crosshair" : isAddingAnnotation ? "crosshair" : "default" }}
-      onMouseMove={handleMouseMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp} onMouseLeave={handleMouseLeaveLocal} onClick={onClick} onContextMenu={onContextMenu}>
+      onMouseMove={handleMouseMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp} onMouseLeave={handleMouseLeaveLocal} onClick={onClick} onDoubleClick={onDoubleClick} onContextMenu={onContextMenu}>
       <canvas ref={canvasRef} style={{ display: "block" }} />
       <canvas ref={overlayCanvasRef} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none" }} />
       {children}
@@ -6197,18 +6201,32 @@ function useEEGState(totalDuration = 600, edfData = null) {
     if (t1 - t0 < 0.005) return; // too small, ignore
     setMeasureSel({ startTime: t0, endTime: t1, startChIdx: c0, endChIdx: c1 });
   };
+  // Single click on the trace → annotation popup at that time.
+  // Double click → per-channel settings menu for the channel under the cursor.
+  // The single-click action is deferred briefly so a double click never flashes
+  // the annotation popup first.
+  const clickTimerRef = useRef(null);
+  useEffect(() => () => clearTimeout(clickTimerRef.current), []);
   const handleCanvasClick = (e) => {
     if (isMeasuring) return; // handled by mousedown/mouseup
-    // Annotation mode — left-click drops the draft pin
-    if (isAddingAnnotation) {
-      const time = getTimeFromX(e.clientX);
-      if (time === null) return;
-      const cRect = containerRef.current.getBoundingClientRect();
-      setAnnotationDraft({ time: Math.round(time*100)/100, duration: 0.2, x: e.clientX-cRect.left, y: e.clientY-cRect.top });
-      return;
-    }
-    // Default left-click: open the per-channel mini menu for the channel under
-    // the cursor. Same menu the right-click context already opens.
+    if (e.target?.tagName !== "CANVAS") return; // clicks inside popups/overlays bubble here — ignore
+    if (e.detail > 1) return; // second click of a double click — handled by onDoubleClick
+    const time = getTimeFromX(e.clientX);
+    if (time === null) return;
+    const cRect = containerRef.current.getBoundingClientRect();
+    const draft = { time: Math.round(time*100)/100, duration: 0.2, x: e.clientX-cRect.left, y: e.clientY-cRect.top };
+    clearTimeout(clickTimerRef.current);
+    clickTimerRef.current = setTimeout(() => {
+      clickTimerRef.current = null;
+      setContextMenu(null);
+      setAnnotationDraft(draft);
+    }, isAddingAnnotation ? 0 : 220);
+  };
+  const handleCanvasDoubleClick = (e) => {
+    if (isMeasuring) return;
+    if (e.target?.tagName !== "CANVAS") return;
+    clearTimeout(clickTimerRef.current); clickTimerRef.current = null;
+    setAnnotationDraft(null);
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -6340,7 +6358,7 @@ function useEEGState(totalDuration = 600, edfData = null) {
     contextMenu, setContextMenu, handleContextMenu,
     isMeasuring, setIsMeasuring, measureSel, setMeasureSel, measureDragRef,
     waveletDenoise, setWaveletDenoise, icaClean, setIcaClean,
-    handleCanvasMouseMove, handleCanvasMouseDown, handleCanvasMouseUp, handleCanvasClick, confirmAnnotation,
+    handleCanvasMouseMove, handleCanvasMouseDown, handleCanvasMouseUp, handleCanvasClick, handleCanvasDoubleClick, confirmAnnotation,
     // Playback (Wave 7e): real-time scrolling cursor + auto-advance to next epoch
     isPlaying, playbackAbsSec, togglePlayback: () => setIsPlaying(p => !p),
     pausePlayback: () => setIsPlaying(false),
